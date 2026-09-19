@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import re
+
+from typing import Any, Optional
+
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -48,7 +50,7 @@ class MoodleAgent:
     def __init__(
         self,
         base_url: str = "https://moodle.epita.fr",
-        state_path: str = "../moodle_state.json",
+        state_path: Optional[str] = None,
         headless: bool = False,
         timeout_ms: int = 20_000,
         sso_button_selector: str = (
@@ -58,7 +60,10 @@ class MoodleAgent:
         ),
     ) -> None:
         self.base_url = base_url.rstrip("/")
-        self.state_path = Path(state_path)
+        if not state_path:
+            self.state_path = None
+        else:
+            self.state_path = Path(state_path)
         self.headless = headless
         self.timeout_ms = timeout_ms
         self.sso_button_selector = sso_button_selector

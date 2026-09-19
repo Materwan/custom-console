@@ -14,6 +14,7 @@ import re
 
 from typing import Dict, List, Callable, Any, Optional, Tuple, Literal
 
+from .config import *
 from .search_app import find_application, search_path
 
 from rich.console import Console
@@ -25,24 +26,13 @@ from prompt_toolkit import prompt
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import InMemoryHistory
 
-RMAPI_PATH = os.environ.get(
-    "RMAPI_PATH",
-    "C:\\Users\\erwan\\Documents\\Programmation\\Prototype\\terminal\\tools\\rmapi.exe",
-)
-
-CREATE_NEW_CONSOLE = 0x00000010
-DETACHED_PROCESS = 0x00000008
-CREATE_NO_WINDOW = 0x08000000
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-with open(os.path.join(SCRIPT_DIR, "utils.json"), "r") as file:
+with open(COMMANDS_PATH, "r") as file:
     COMMANDS = json.load(file)["commands"]
 
-saved_app_path = os.path.join(SCRIPT_DIR, "saved_app.json")
-if not os.path.exists(saved_app_path):
-    with open(saved_app_path, "w") as file:
+if not os.path.exists(SAVED_APPS_PATH):
+    with open(SAVED_APPS_PATH, "w") as file:
         json.dump({}, file)
-with open(saved_app_path, "r") as file:
+with open(SAVED_APPS_PATH, "r") as file:
     SAVEDAPP = json.load(file)
 
 

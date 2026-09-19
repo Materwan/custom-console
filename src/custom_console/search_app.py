@@ -6,6 +6,8 @@ from pathlib import Path
 
 from typing import Optional
 
+from .config import *
+
 from rich.console import Console
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -187,7 +189,7 @@ def find_application(app_name: str, console: Console, level: Optional[int] = -1)
     if app_name.lower().endswith(".exe"):
         app_name = app_name[:-4]
 
-    with open(os.path.join(SCRIPT_DIR, "saved_app.json"), "r") as file:
+    with open(SAVED_APPS_PATH, "r") as file:
         dic = json.load(file)
         f = dic.get(app_name.lower())
         if f is not None:
@@ -195,7 +197,7 @@ def find_application(app_name: str, console: Console, level: Optional[int] = -1)
                 return dic[app_name.lower()]
             else:
                 dic.pop(app_name)
-                with open(os.path.join(SCRIPT_DIR, "saved_app.json"), "w") as file:
+                with open(SAVED_APPS_PATH, "w") as file:
                     file.write(json.dumps(dic, indent="\t"))
 
     # =========================================================

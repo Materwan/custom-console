@@ -13,14 +13,17 @@ import json
 import os
 import shutil
 import time
+import requests
+
+from typing import Any, Callable, Dict, Generic, List, Literal, Optional, TypeVar
+
+from .moodle_agent import MoodleAgent
+from .config import *
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Generic, List, Literal, Optional, TypeVar
-
-import requests
 
 from rich.console import Console
 from rich.live import Live
@@ -33,131 +36,6 @@ from agno.models.base import Model
 from agno.models.ollama import Ollama
 from agno.db.sqlite import SqliteDb
 
-from agent.moodle_agent import MoodleAgent
-
-# --------------------------------------------------------------------------- #
-# Constantes
-# --------------------------------------------------------------------------- #
-
-PERMISSION_PROMPT = "Accept (Y|n) : "
-RENDER_INTERVAL = 0.08  # secondes entre deux rafraîchissements du Live
-YES_ANSWERS = ("", "y", "yes", "o", "oui")
-
-# Niveau d'autorisation automatique de l'agent.
-#
-# Chaque outil déclare, via `ask_permission(level=...)`, le niveau de risque
-# minimal requis pour son action. Si le niveau d'autorisation automatique de
-# la console (`auto_permission_level`) est supérieur ou égal à ce niveau, la
-# permission est accordée automatiquement, sans interrompre l'utilisateur.
-#
-# Exemple : avec `auto_permission_level=2`, un outil qui ne requiert qu'un
-# niveau 1 (ex: lecture) sera auto-autorisé, tout comme un outil qui requiert
-# un niveau 2 (ex: envoi d'un email). Avec `auto_permission_level=0` (valeur
-# par défaut), rien n'est auto-autorisé : l'utilisateur est toujours consulté.
-PERMISSION_LEVEL_NONE = 0  # Aucune auto-autorisation, on demande toujours.
-PERMISSION_LEVEL_READ = 1  # Actions peu sensibles (lecture, consultation).
-PERMISSION_LEVEL_WRITE = 2  # Actions plus sensibles (écriture, envoi, ...).
-WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
-LOCATION_URL = "https://ipinfo.io/json"
-MAX_FORECAST_DAYS = 16
-
-BASE_PATH = os.environ.get(
-    "BASE_PATH", r"C:\Users\erwan\Documents\Programmation\Prototype\terminal\agent"
-)
-
-LOG_FILE_PATH = os.path.join(
-    BASE_PATH, os.environ.get("AGENT_LOG_FILE", "agent_logs.jsonl")
-)
-
-# Fichier SQLite unique regroupant l'historique des sessions (Storage) et la
-# mémoire utilisateur long terme (Memory) de l'agent. Persiste entre les
-# lancements du script.
-DEFAULT_AGENT_DB_FILE = os.path.join(
-    BASE_PATH, "memory", os.environ.get("DEFAULT_AGENT_DB_FILE", "agent_storage.db")
-)
-
-# Fichier de cache de l'agent
-# Sauvegarde
-AGENT_CACHE_FILE = os.path.join(BASE_PATH, "memory", "cache_file.json")
-
-# La console étant mono-utilisateur, un identifiant fixe suffit à rattacher
-# toutes les mémoires à la même personne d'un lancement à l'autre.
-AGENT_USER_ID = os.environ.get("AGENT_USER_ID", "default_user")
-
-# Un session_id fixe permet de reprendre l'historique de conversation d'une
-# exécution à l'autre. Utiliser une valeur différente (ou None) pour démarrer
-# une session vierge sans perdre les sessions précédentes en base.
-AGENT_SESSION_ID = os.environ.get("AGENT_SESSION_ID", "console_session")
-
-# Cookie de connexion Moodle
-MOODLE_STATE = os.path.join(
-    BASE_PATH, os.environ.get("MOODLE_STATE", "moodle_state.json")
-)
-
-# Dossiers "workspace" librement accessibles à l'agent pour lire/écrire/
-# manipuler des fichiers, sans avoir à demander une permission par chemin
-# comme le reste du système de fichiers :
-# - "result" : sorties destinées à l'utilisateur (documents produits, exports...).
-# - "tmp"    : fichiers de travail temporaires (téléchargements intermédiaires,
-#              brouillons, ...), à considérer comme jetable.
-# Toute opération de fichier de l'agent sur ces dossiers reste néanmoins
-# cantonnée à leur contenu : impossible d'en sortir via "..", un chemin
-# absolu ou un lien symbolique (voir `_resolve_workspace_path`).
-WORKSPACE_ROOTS: Dict[str, str] = {
-    "result": os.environ.get("AGENT_RESULT_DIR", os.path.join(BASE_PATH, "result")),
-    "tmp": os.environ.get("AGENT_TMP_DIR", os.path.join(BASE_PATH, "tmp")),
-}
-
-# Niveau d'autorisation automatique, configurable via la variable
-# d'environnement AGENT_AUTO_PERMISSION_LEVEL (0 = tout demander,
-# 1 = auto-autoriser les actions de lecture, 2 = auto-autoriser aussi
-# les actions plus sensibles comme l'envoi d'email).
-AUTO_AGENT_PREMISSION = os.environ.get("AUTO_AGENT_PERMISSION", "0")
-
-
-DEFAULT_WEATHER_VARIABLES: Dict[str, List[str]] = {
-    "current": [
-        "temperature_2m",
-        "apparent_temperature",
-        "relative_humidity_2m",
-        "wind_speed_10m",
-        "weather_code",
-        "precipitation",
-    ],
-    "hourly": [
-        "temperature_2m",
-        "precipitation_probability",
-        "precipitation",
-        "wind_speed_10m",
-        "weather_code",
-    ],
-    "daily": [
-        "temperature_2m_max",
-        "temperature_2m_min",
-        "precipitation_sum",
-        "weather_code",
-        "wind_speed_10m_max",
-    ],
-}
-
-# Les instructions par défaut que l'agent doit respecter.
-DEFAULT_AGENT_INSTRUCTIONS = instructions = (
-    [
-        "Tu es un assistant personnel et tu dois m'appeler Monsieur.",
-        "Exécute les tâches demandées en utilisant les outils disponibles.",
-        "Tous les outils Python fournis renvoient un objet contenant la "
-        "réussite de l'appel, puis des informations complémentaires.",
-        "Pour Moodle : un cours est toujours identifié par un id "
-        "numérique, jamais par son nom. Avant d'appeler "
-        "moodle_get_course_structure ou tout autre outil nécessitant un "
-        "course_id, appelle d'abord moodle_list_courses pour retrouver "
-        "l'id correspondant au nom du cours demandé par l'utilisateur. "
-        "N'invente jamais un id et ne le devine pas à partir du HTML "
-        "d'une autre page.",
-    ],
-)
-
-
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
@@ -169,10 +47,13 @@ def is_yes(answer: str) -> bool:
 
 
 def _load_cache() -> Dict[str, Any]:
-    if not os.path.exists(AGENT_CACHE_FILE):
+    if not os.path.exists(AGENT_CACHE_PATH):
         return {}
     try:
-        with open(AGENT_CACHE_FILE, "r", encoding="utf-8") as file:
+        if not os.path.exists(AGENT_CACHE_PATH):
+            with open(AGENT_CACHE_PATH, "w") as _:
+                pass
+        with open(AGENT_CACHE_PATH, "r", encoding="utf-8") as file:
             return json.load(file)
     except (OSError, json.JSONDecodeError) as e:
         print(e)
@@ -181,7 +62,7 @@ def _load_cache() -> Dict[str, Any]:
 
 def _save_cache(cache: Dict[str, Any]) -> None:
     try:
-        with open(AGENT_CACHE_FILE, "w", encoding="utf-8") as file:
+        with open(AGENT_CACHE_PATH, "w", encoding="utf-8") as file:
             file.write(json.dumps(cache, indent="\t"))
     except OSError:
         pass
@@ -203,7 +84,7 @@ class JsonlLogger:
     d'un `flush()`, pour ne rien perdre en cas d'interruption du programme.
     """
 
-    def __init__(self, path: str = LOG_FILE_PATH):
+    def __init__(self, path: str = AGENT_LOG_PATH):
         self.path = path
 
     def _write(self, entry: Dict[str, Any]) -> None:
@@ -395,7 +276,7 @@ class AgentConsole:
         agent_model_name: str,
         agent_name: str,
         *,
-        agent_storage: Optional[str] = DEFAULT_AGENT_DB_FILE,
+        agent_storage: Optional[str] = AGENT_DB_PATH,
         agent_instructions: Optional[List[str]] = DEFAULT_AGENT_INSTRUCTIONS,
         markdown: Optional[bool] = True,
         auto_permission_level: Optional[int] = PERMISSION_LEVEL_NONE,
@@ -415,6 +296,12 @@ class AgentConsole:
         self.logger = JsonlLogger()
         self._moodle_agent: Optional[MoodleAgent] = None
         self._moodle_executor: Optional[ThreadPoolExecutor] = None
+
+        if not os.path.exists(agent_storage):
+            agent_storage = None
+            self.console.print(
+                f"Agent is running without memory because {agent_storage} doesn't exist."
+            )
 
         self.agent = Agent(
             model=Ollama(agent_model_name),
@@ -492,7 +379,7 @@ class AgentConsole:
     def _get_moodle_agent(self) -> MoodleAgent:
         """Starts (once) and returns the `MoodleAgent`. Must run on the Moodle thread."""
         if self._moodle_agent is None:
-            moodle_agent = MoodleAgent(state_path=MOODLE_STATE)
+            moodle_agent = MoodleAgent(state_path=MOODLE_COOKIE_PATH)
             moodle_agent.start()
             self._moodle_agent = moodle_agent
         return self._moodle_agent
