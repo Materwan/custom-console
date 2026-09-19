@@ -1,0 +1,56 @@
+{
+    "commands": {
+        "cd": {
+            "args": [],
+            "files": true
+        },
+        "cp": {
+            "args": [],
+            "file": true
+        },
+        "find": {
+            "args": [],
+            "file": true
+        },
+        "stat": {
+            "args": [],
+            "files": true
+        },
+        "echo": {
+            "args": [],
+            "files": false
+        },
+        "cat": {
+            "args": [],
+            "files": true
+        },
+        "exit": {
+            "args": [],
+            "files": false
+        },
+        "ls": {
+            "args": ["-a", "--all"],
+            "files": true
+        },
+        "pwd": {
+            "args": [],
+            "files": false
+        },
+        "clear": {
+            "args": [],
+            "files": false
+        },
+        "launch": {
+            "args": ["-f", "--file", "-sl", "--search_level"],
+            "files": true
+        },
+        "reload": {
+            "args": [],
+            "files": false
+        },
+        "ai": {
+            "args": ["start", "list"],
+            "files": false
+        }
+    }
+}

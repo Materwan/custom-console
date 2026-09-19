@@ -1,0 +1,9 @@
+.dist
+.env
+.pytest_cache
+__pycache__
+
+cookies/
+logs/
+
+*egg-info

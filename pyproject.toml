@@ -1,0 +1,14 @@
+[project]
+name = "custom-console"
+version = "0.1.0"
+description = "A custom terminal with custom command and tools, including a personal AI agent."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+custom_console = "custom_consoles.main:main"
