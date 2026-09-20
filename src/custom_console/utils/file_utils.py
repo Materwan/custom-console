@@ -19,7 +19,7 @@ import tempfile
 
 from typing import Dict, List, Optional, Tuple
 
-from custom_console.config import RMAPI_PATH
+from ..config import RMAPI_PATH
 
 
 class InReMarkableError(Exception):
@@ -210,8 +210,8 @@ class FileManager:
             return f"reMarkable:{self.remarkable.pwd()}"
         return self.local_location
 
-        def get_working_directory(self) -> str:
-            return self.location
+    def get_working_directory(self) -> str:
+        return self.location
 
     # -- Helpers --------------------------------------------------------------- #
 
@@ -257,6 +257,11 @@ class FileManager:
     def _virtual_root_entries(self) -> List[str]:
         return self._list_available_drives() + VIRTUAL_ROOT_STATIC_ENTRIES
 
+    def virtual_root_entries(self) -> List[str]:
+        """Version publique de `_virtual_root_entries`, utilisable depuis
+        l'extérieur (ex: la complétion) indépendamment du mode courant."""
+        return self._virtual_root_entries()
+
     # -- Navigation ---------------------------------------------------------- #
 
     def change_directory(self, path: str) -> None:
@@ -267,6 +272,21 @@ class FileManager:
         if raw in ("/", "\\"):
             self.mode = self.MODE_ROOT
             return
+
+        # Cas 0bis : un chemin virtuel ABSOLU ("/reMarkable/...",
+        # "/wsl-Ubuntu/...", "/C:/...") doit fonctionner depuis n'importe quel
+        # dossier courant, pas seulement depuis la racine virtuelle "/".
+        if raw.startswith("/") or raw.startswith("\\"):
+            stripped = raw.strip("/\\")
+            first_segment = (
+                re.split(r"[/\\]", stripped, maxsplit=1)[0] if stripped else ""
+            )
+            first_lower = first_segment.lower()
+            if first_lower in ("remarkable", "wsl-ubuntu") or re.fullmatch(
+                r"[a-zA-Z]:", first_segment
+            ):
+                self._change_directory_from_root(raw)
+                return
 
         # Cas 1 : "~" ou "~/..." ramène toujours au système de fichiers
         # local (utile même depuis la racine virtuelle ou reMarkable).
@@ -356,7 +376,7 @@ class FileManager:
 
         # -> C:/... (ou n'importe quelle lettre de lecteur détectée)
         if re.fullmatch(r"[a-zA-Z]:", first):
-            drive = first.upper() + ":/"
+            drive = first.upper() + "/"
             target = drive if not rest else posixpath.join(drive, rest)
             if os.path.isfile(target):
                 raise NotADirectoryError(target)

@@ -3,19 +3,14 @@ import sys
 import json
 import shlex
 import subprocess
-import ctypes
-import requests
 import argparse
-import time
 import posixpath
-import shutil
-import tempfile
 import re
 
 from typing import Dict, List, Callable, Any, Optional, Tuple, Literal
 
 from .config import *
-from .search_app import find_application, search_path
+from .utils.search_app import find_application, search_path
 from .utils.file_utils import *
 
 from rich.console import Console
@@ -45,6 +40,20 @@ def check_user_answer(answer: str, expected_answer: List[str]):
 
 def check_yes_no_answer(answer: str):
     return check_user_answer(answer, ["Y", "y", ""])
+
+
+# ─────────────────────────────────────────────────────────────────
+# Palette de couleurs (rich markup), centralisée pour rester
+# cohérente sur toutes les commandes et leurs résultats.
+# ─────────────────────────────────────────────────────────────────
+COLOR_PATH = "yellow"  # emplacement courant (prompt, pwd, stat, ...)
+COLOR_PERM_OK = "green"  # permission accordée (r/w/e)
+COLOR_PERM_KO = "red"  # permission refusée (r/w/e)
+COLOR_DIR = "bold blue"  # dossiers dans les listings (ls)
+COLOR_INFO = "cyan"  # infos neutres (chemins résolus, résultats de find, ...)
+COLOR_WARNING = "yellow"  # avertissements non bloquants
+COLOR_SUCCESS = "green"  # succès / confirmations
+COLOR_ERROR = "bold red"  # erreurs
 
 
 class ShellCompleter(Completer):
@@ -113,66 +122,37 @@ class ShellCompleter(Completer):
         if config.get("files", False):
             yield from self._complete_files(current)
 
-    def _complete_files(self, current):
+    @staticmethod
+    def _resolve_virtual_directory(directory: str):
+        """Si `directory` désigne un chemin virtuel explicite
+        ("/reMarkable[/...]", "/wsl-Ubuntu[/...]", "/C:[/...]"), renvoie
+        un tuple (kind, resolved) :
+          - kind == "remarkable" : resolved est un chemin distant posix
+          - kind == "local"      : resolved est un chemin local réel
+        Sinon renvoie None.
         """
-        Complète les fichiers/dossiers sans parcourir
-        récursivement le système de fichiers.
-        """
+        if not (directory.startswith("/") or directory.startswith("\\")):
+            return None
 
-        # Séparer le dossier du nom actuellement tapé
-        directory, partial = os.path.split(current)
-        partial = partial.lower()
+        stripped = directory.strip("/\\")
+        first, _, rest = stripped.partition("/")
+        first_lower = first.lower()
 
-        if self.console_ref and self.console_ref.in_remarkable:
-            yield from self._complete_remarkable(directory or ".", partial)
-            return
+        if first_lower == "remarkable":
+            return ("remarkable", ("/" + rest) if rest else "/")
 
-        # Complétion d'un chemin explicite vers reMarkable même si on n'y
-        # est pas encore entré, ex: "cd /reMarkable/Epi<TAB>"
-        if self.console_ref and directory:
-            remote_dir = self.console_ref._strip_remote_prefix(directory)
-            if remote_dir is not None:
-                abs_remote_dir = (
-                    remote_dir if remote_dir.startswith("/") else "/" + remote_dir
-                )
-                yield from self._complete_remarkable(abs_remote_dir, partial)
-                return
-
-        if not directory:
-            directory = "."
-            if "remarkable".startswith(partial):
-                yield Completion("/reMarkable/", -len(partial), display="reMarkable")
-            if "wsl".startswith(partial):
-                yield Completion("/wsl-Ubuntu/", -len(partial), display="wsl-Ubuntu")
-
-        # Gérer ~
-        directory = os.path.expanduser(directory)
-
-        # Résoudre le chemin
-        search_dir = os.path.abspath(directory)
-
-        try:
-            entries = os.listdir(search_dir)
-        except (FileNotFoundError, NotADirectoryError, PermissionError):
-            return
-
-        for entry in entries:
-            if not entry.lower().startswith(partial):
-                continue
-
-            full_path = os.path.join(search_dir, entry)
-
-            # On propose fichiers ET dossiers
-            display_name = entry
-            completion = f"'{display_name}'" if " " in display_name else display_name
-
-            # Ajouter / aux dossiers
-            if os.path.isdir(full_path):
-                completion += "/"
-
-            yield Completion(
-                completion, start_position=-len(partial), display=display_name
+        if first_lower == "wsl-ubuntu":
+            target = (
+                WSL_UBUNTU_PATH if not rest else os.path.join(WSL_UBUNTU_PATH, rest)
             )
+            return ("local", target.replace("\\", "/"))
+
+        if re.fullmatch(r"[a-zA-Z]:", first):
+            drive = first.upper() + "/"
+            target = drive if not rest else posixpath.join(drive, rest)
+            return ("local", target)
+
+        return None
 
     def _complete_remarkable(self, directory: str, partial: str):
         """Complétion des fichiers/dossiers distants, via rmapi."""
@@ -203,12 +183,96 @@ class ShellCompleter(Completer):
                     if ext.upper() in [e.upper() for e in pathext]:
                         executables.add(name)
                     elif not ext:
-                        # Certains outils (WSL, git-bash tools) n'ont pas d'extension
                         executables.add(entry)
             except (FileNotFoundError, NotADirectoryError, PermissionError):
                 continue
 
         return executables
+
+    def _complete_local_path(self, search_dir, partial):
+        """Complétion générique d'un dossier local réel (utilisée aussi
+        bien pour le CWD que pour un chemin virtuel résolu comme
+        \\\\wsl$\\Ubuntu\\... ou C:/...)."""
+        try:
+            entries = os.listdir(search_dir)
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            return
+
+        for entry in entries:
+            if not entry.lower().startswith(partial):
+                continue
+
+            full_path = os.path.join(search_dir, entry)
+            display_name = entry
+            completion = f"'{display_name}'" if " " in display_name else display_name
+
+            if os.path.isdir(full_path):
+                completion += "/"
+
+            yield Completion(
+                completion, start_position=-len(partial), display=display_name
+            )
+
+    def _complete_virtual_root(self, partial: str):
+        """Complétion des entrées de la racine virtuelle '/' (C:/, reMarkable/,
+        wsl-Ubuntu/...), quel que soit le mode courant de la console."""
+        if self.console_ref is None:
+            return
+        entries = self.console_ref.file_manager.virtual_root_entries()
+        for entry in entries:
+            if not entry.lower().startswith(partial):
+                continue
+            completion = f"'{entry}'" if " " in entry else entry
+            yield Completion(completion, start_position=-len(partial), display=entry)
+
+    def _complete_files(self, current: str):
+        """Complète le dernier argument (`current`) comme un chemin de fichier,
+        en routant vers la racine virtuelle, reMarkable ou le système de
+        fichiers local selon le chemin tapé (ou le contexte courant de la
+        console)."""
+        normalized = current.replace("\\", "/")
+
+        # Chemin commençant par "/" : c'est toujours relatif à la racine
+        # virtuelle (les chemins locaux absolus s'écrivent "C:/...", jamais
+        # "/...", dans cette application).
+        if normalized.startswith("/"):
+            stripped = normalized.lstrip("/")
+            directory, _, partial = stripped.rpartition("/")
+            partial_lower = partial.lower()
+
+            if not directory:
+                # "cd /<TAB>" ou "cd /C<TAB>" : lister C:/, reMarkable/, ...
+                yield from self._complete_virtual_root(partial_lower)
+                return
+
+            resolved = self._resolve_virtual_directory("/" + directory)
+            if resolved is not None:
+                kind, target = resolved
+                if kind == "remarkable":
+                    yield from self._complete_remarkable(target, partial_lower)
+                else:
+                    yield from self._complete_local_path(target, partial_lower)
+            return
+
+        directory, _, partial = normalized.rpartition("/")
+        partial_lower = partial.lower()
+
+        if not directory:
+            # Pas de dossier explicite dans ce qui est tapé : on complète
+            # dans le dossier courant de la console.
+            if self.console_ref is not None and self.console_ref.in_root:
+                yield from self._complete_virtual_root(partial_lower)
+            elif self.console_ref is not None and self.console_ref.in_remarkable:
+                yield from self._complete_remarkable(".", partial_lower)
+            else:
+                search_dir = self.console_ref.location if self.console_ref else "."
+                yield from self._complete_local_path(search_dir, partial_lower)
+            return
+
+        if self.console_ref is not None and self.console_ref.in_remarkable:
+            yield from self._complete_remarkable(directory, partial_lower)
+        else:
+            yield from self._complete_local_path(directory, partial_lower)
 
 
 class CustomConsole:
@@ -241,8 +305,38 @@ class CustomConsole:
         return self.file_manager.in_remarkable
 
     @property
+    def in_root(self):
+        return self.file_manager.in_root
+
+    @property
     def remarkable(self):
         return self.file_manager.remarkable
+
+    # -- Helpers d'affichage colorés (cohérents sur toutes les commandes) --- #
+
+    def _print_error(self, message: str) -> None:
+        self.console.print(f"[{COLOR_ERROR}]{message}[/{COLOR_ERROR}]")
+
+    def _print_warning(self, message: str) -> None:
+        self.console.print(f"[{COLOR_WARNING}]{message}[/{COLOR_WARNING}]")
+
+    def _print_success(self, message: str) -> None:
+        self.console.print(f"[{COLOR_SUCCESS}]{message}[/{COLOR_SUCCESS}]")
+
+    def _print_info(self, message: str) -> None:
+        self.console.print(f"[{COLOR_INFO}]{message}[/{COLOR_INFO}]")
+
+    @staticmethod
+    def _format_permissions(readable: bool, writable: bool, executable: bool) -> str:
+        """Formate r/w/e avec une couleur cohérente : vert si accordé,
+        rouge (et un tiret) si refusé, plutôt que de simplement l'omettre."""
+
+        def flag(ok: bool, letter: str) -> str:
+            if ok:
+                return f"[{COLOR_PERM_OK}]{letter}[/{COLOR_PERM_OK}]"
+            return f"[{COLOR_PERM_KO}]-[/{COLOR_PERM_KO}]"
+
+        return flag(readable, "r") + flag(writable, "w") + flag(executable, "e")
 
     def cd(self, *args):
         parser = argparse.ArgumentParser(prog="cd", add_help=False, exit_on_error=False)
@@ -252,15 +346,15 @@ class CustomConsole:
             parsed = parser.parse_args(args)
 
         except argparse.ArgumentError as e:
-            self.console.print(f"cd: {e}")
+            self._print_error(f"cd: {e}")
             return
 
         try:
             self.file_manager.change_directory(parsed.path)
         except FileNotFoundError as e:
-            self.console.print(f"cd: {e}: Not found.")
+            self._print_error(f"cd: {e}: Not found.")
         except NotADirectoryError as e:
-            self.console.print(f"cd: {e}: Not as directory")
+            self._print_error(f"cd: {e}: Not as directory")
 
     @staticmethod
     def _strip_remote_prefix(path: str) -> Optional[str]:
@@ -285,15 +379,15 @@ class CustomConsole:
         try:
             parsed = parser.parse_args(args)
         except argparse.ArgumentError as e:
-            self.console.print(f"cp: {e}")
+            self._print_error(f"cp: {e}")
             return
 
         try:
-            self.file_manager.cp(parsed.src, parsed.dst, parsed.recursive)
+            self.file_manager.copy(parsed.src, parsed.dst, parsed.recursive)
         except FileNotFoundError as e:
-            self.console.print(f"cp: {e}: Not found.")
+            self._print_error(f"cp: {e}: Not found.")
         except Exception as e:
-            self.console.print(f"cp: {e}.")
+            self._print_error(f"cp: {e}.")
 
     def stat(self, *args):
         parser = argparse.ArgumentParser(
@@ -305,18 +399,18 @@ class CustomConsole:
             parsed = parser.parse_args(args)
 
         except argparse.ArgumentError as e:
-            self.console.print(f"stat: {e}")
+            self._print_error(f"stat: {e}")
             return
 
         for path in parsed.paths:
             try:
                 res = self.file_manager.stat(path)
+                flags = self._format_permissions(res[0], res[1], res[2])
                 self.console.print(
-                    f"[yellow]{self.location} [green]{"r" if res[0] else ""}"
-                    f"{"w" if res[1] else ""}{"e" if res[2] else ""}"
+                    f"[{COLOR_PATH}]{self.location}[/{COLOR_PATH}] {flags}"
                 )
             except FileNotFoundError as e:
-                self.console.print(f"stat: {e}: Not found.")
+                self._print_error(f"stat: {e}: Not found.")
 
     def find(self, *args) -> str:
         parser = argparse.ArgumentParser(
@@ -330,7 +424,7 @@ class CustomConsole:
         try:
             parsed = parser.parse_args(args)
         except argparse.ArgumentError as e:
-            self.console.print(f"find: {e}")
+            self._print_error(f"find: {e}")
             return
 
         try:
@@ -341,15 +435,15 @@ class CustomConsole:
                     parsed.pattern, parsed.path, parsed.depth, parsed.strict
                 )
                 if res:
-                    self.console.print("\n".join(res))
+                    self._print_info("\n".join(res))
                 else:
-                    self.console.print("Pattern not find.")
+                    self._print_warning("Pattern not find.")
         except NotADirectoryError:
-            self.console.print(f"find: {parsed.path}: Not as directory.")
+            self._print_error(f"find: {parsed.path}: Not as directory.")
         except FileNotFoundError:
-            self.console.print(f"find: {parsed.path}: Not found.")
+            self._print_error(f"find: {parsed.path}: Not found.")
         except Exception as e:
-            self.console.print(e)
+            self._print_error(e)
 
     def echo(self, *args):
         parser = argparse.ArgumentParser(
@@ -361,7 +455,7 @@ class CustomConsole:
             parsed = parser.parse_args(args)
 
         except argparse.ArgumentError as e:
-            self.console.print(f"stat: {e}")
+            self._print_error(f"echo: {e}")
             return
 
         self.console.print(" ".join(parsed.text))
@@ -376,19 +470,19 @@ class CustomConsole:
             parsed = parser.parse_args(args)
 
         except argparse.ArgumentError as e:
-            self.console.print(f"stat: {e}")
+            self._print_error(f"cat: {e}")
             return
 
         for path in parsed.paths:
             try:
-                res = self.file_manager.cat(parsed.paths)
+                res = self.file_manager.cat(path)
                 self.console.print(res)
             except NotAFileError as e:
-                self.console.print(f"cat: {e}: Is a directory.")
+                self._print_error(f"cat: {e}: Is a directory.")
             except FileNotFoundError as e:
-                self.console.print(f"cat: {e}: No such file.")
+                self._print_error(f"cat: {e}: No such file.")
             except PermissionError as e:
-                self.console.print(f"cat: {e}: Permission denied.")
+                self._print_error(f"cat: {e}: Permission denied.")
 
     def exit(self, *args):
         parser = argparse.ArgumentParser(
@@ -399,12 +493,12 @@ class CustomConsole:
             parsed = parser.parse_args(args)
 
         except argparse.ArgumentError as e:
-            self.console.print(f"stat: {e}")
+            self._print_error(f"exit: {e}")
             return
 
         self.running = False
 
-    def ls(self, *args: str) -> int | str:
+    def ls(self, *args: str) -> None:
         parser = argparse.ArgumentParser(prog="ls", add_help=False, exit_on_error=False)
         parser.add_argument("paths", nargs="*", default=["."])
         parser.add_argument("-a", "--all", action="store_true")
@@ -413,19 +507,27 @@ class CustomConsole:
             parsed = parser.parse_args(args)
 
         except argparse.ArgumentError as e:
-            self.console.print(f"stat: {e}")
+            self._print_error(f"ls: {e}")
             return
 
         for path in parsed.paths:
             try:
                 res = self.file_manager.list(path, parsed.all)
-                self.console.print("  ".join(res))
+                colored = [
+                    (
+                        f"[{COLOR_DIR}]{entry}[/{COLOR_DIR}]"
+                        if entry.rstrip("'").endswith("/")
+                        else entry
+                    )
+                    for entry in res
+                ]
+                self.console.print("  ".join(colored))
             except NotADirectoryError as e:
-                self.console.print(f"ls: {e}: Not a directory.")
+                self._print_error(f"ls: {e}: Not a directory.")
             except FileNotFoundError as e:
-                self.console.print(f"ls: {e}: Not found.")
+                self._print_error(f"ls: {e}: Not found.")
             except PermissionError as e:
-                self.console.print(f"ls: {e}: Permission denied.")
+                self._print_error(f"ls: {e}: Permission denied.")
 
     def pwd(self, *args):
         parser = argparse.ArgumentParser(
@@ -436,10 +538,10 @@ class CustomConsole:
             parsed = parser.parse_args(args)
 
         except argparse.ArgumentError as e:
-            self.console.print(f"stat: {e}")
+            self._print_error(f"pwd: {e}")
             return
 
-        self.console.print(self.file_manager.get_working_directory(self))
+        self.console.print(f"[{COLOR_PATH}]{self.file_manager.get_working_directory()}")
 
     def clear(self, *args):
         parser = argparse.ArgumentParser(
@@ -450,7 +552,7 @@ class CustomConsole:
             parsed = parser.parse_args(args)
 
         except argparse.ArgumentError as e:
-            self.console.print(f"stat: {e}")
+            self._print_error(f"clear: {e}")
             return
 
         self.console.clear()
@@ -467,26 +569,26 @@ class CustomConsole:
             parsed = parser.parse_args(args)
 
         except argparse.ArgumentError as e:
-            self.console.print(f"stat: {e}")
+            self._print_error(f"launch: {e}")
             return
 
         if not parsed.file:
 
             search_level = parsed.search_level if parsed.search_level else -1
             if search_level < -1 or search_level > 4:
-                self.console.print(
+                self._print_error(
                     "launch: search level must be a number between -1 and 4"
                 )
                 return
 
             file = find_application(parsed.app, self.console, search_level)
             if not file:
-                self.console.print("launch: executable not found")
+                self._print_error("launch: executable not found")
                 return
         else:
             file = parsed.app
 
-        self.console.print(file)
+        self._print_info(file)
         try:
             subprocess.Popen(
                 [file],
@@ -497,7 +599,21 @@ class CustomConsole:
                 close_fds=True,
             )
         except FileNotFoundError:
-            self.console.print(f"launch: the executable {file} does not exist")
+            self._print_error(f"launch: the executable {file} does not exist")
+        except OSError as e:
+            # WinError 193 : le fichier n'est pas exécutable directement
+            # (raccourci .lnk, .url, document associé, ...). On délègue au
+            # shell Windows, seul capable de le résoudre. On perd le
+            # détachement complet de la console dans ce cas précis, mais ça
+            # ne concerne que les fichiers non-exécutables (pas les .exe
+            # trouvés normalement, qui restent silencieux via Popen).
+            if getattr(e, "winerror", None) == 193:
+                try:
+                    os.startfile(file)
+                except OSError as start_error:
+                    self._print_error(f"launch: unable to start {file}: {start_error}")
+            else:
+                self._print_error(f"launch: unable to start {file}: {e}")
 
     def reload(self, *args):
         parser = argparse.ArgumentParser(
@@ -508,10 +624,10 @@ class CustomConsole:
             parsed = parser.parse_args(args)
 
         except argparse.ArgumentError as e:
-            self.console.print(f"stat: {e}")
+            self._print_error(f"reload: {e}")
             return
 
-        self.console.print("Reloading...")
+        self._print_info("Reloading...")
         subprocess.Popen(
             [sys.executable] + sys.argv,
             creationflags=CREATE_NEW_CONSOLE,
@@ -521,19 +637,19 @@ class CustomConsole:
     def start_model(self, model: str):
 
         import ollama
-        from .ollama_utils import is_running
+        from .utils.ollama_utils import is_running
 
-        with self.console.status(f"Starting [green]{model}"):
+        with self.console.status(f"Starting [{COLOR_SUCCESS}]{model}"):
             if is_running(model):
-                self.console.print(f"ai: [green]{model} [default]already running")
+                self._print_success(f"ai: {model} already running")
                 return
             else:
                 ollama.generate(model=model, prompt="", keep_alive=-1)
-        self.console.print(f"[green]{model} [default]started")
+        self._print_success(f"{model} started")
 
     def ai(self, *args):
 
-        from .ollama_utils import (
+        from .utils.ollama_utils import (
             get_installed_models,
             get_running_models,
             get_model,
@@ -571,7 +687,7 @@ class CustomConsole:
             parsed = parser.parse_args(args)
 
         except argparse.ArgumentError as e:
-            self.console.print(f"stat: {e}")
+            self._print_error(f"ai: {e}")
             return
 
         if parsed.command == "start":
@@ -580,7 +696,7 @@ class CustomConsole:
             else:
                 use_model = get_model(parsed.value)
                 if not use_model:
-                    self.console.print(f"ai: {parsed.value} model does not exist")
+                    self._print_error(f"ai: {parsed.value} model does not exist")
                     return
 
             self.start_model(use_model)
@@ -603,12 +719,18 @@ class CustomConsole:
             if parsed.size:
                 table.add_column("Size", style="blue")
             if parsed.capabilities:
-                capabilites = ["completion", "thinking", "vision", "audio", "tools"]
+                capabilities_list = [
+                    "completion",
+                    "thinking",
+                    "vision",
+                    "audio",
+                    "tools",
+                ]
                 for model in model_list:
                     for cap in model["capabilities"]:
-                        if not cap in capabilites:
-                            capabilites.append(cap)
-                for cap in capabilites:
+                        if cap not in capabilities_list:
+                            capabilities_list.append(cap)
+                for cap in capabilities_list:
                     table.add_column(cap)
 
             for model in model_list:
@@ -616,11 +738,11 @@ class CustomConsole:
                 if parsed.size:
                     row.append(str(model["size"]))
                 if parsed.capabilities:
-                    for cap in capabilites:
+                    for cap in capabilities_list:
                         if cap in model["capabilities"]:
-                            row.append("✓")
+                            row.append(f"[{COLOR_SUCCESS}]\u2713[/{COLOR_SUCCESS}]")
                         else:
-                            row.append("✗")
+                            row.append(f"[{COLOR_ERROR}]\u2717[/{COLOR_ERROR}]")
                 table.add_row(*row)
 
             self.console.print(table)
@@ -631,11 +753,11 @@ class CustomConsole:
 
             use_model = get_model(parsed.model)
             if not use_model:
-                self.console.print(f"ai: {parsed.model} model does not exist")
+                self._print_error(f"ai: {parsed.model} model does not exist")
                 return
 
             if not is_running(use_model):
-                self.console.print(f"ai: {use_model} is not running")
+                self._print_warning(f"ai: {use_model} is not running")
                 answer = prompt("Do you want to start it (Y|N) : ")
                 if not check_yes_no_answer(answer):
                     return
@@ -657,15 +779,16 @@ class CustomConsole:
 
         while self.running:
             if self.in_remarkable:
-                self.console.print(f"[yellow]{self.location}")
+                self.console.print(f"[{COLOR_PATH}]{self.location}")
             else:
                 read, write, execute = (
                     os.access(self.location, os.R_OK),
                     os.access(self.location, os.W_OK),
                     os.access(self.location, os.X_OK),
                 )
+                flags = self._format_permissions(read, write, execute)
                 self.console.print(
-                    f"[yellow]{self.location} [green]{"r" if read else ""}{"w" if write else ""}{"e" if execute else ""}"
+                    f"[{COLOR_PATH}]{self.location}[/{COLOR_PATH}] {flags}"
                 )
             instruction = ""
             try:
@@ -691,7 +814,7 @@ class CustomConsole:
                 if app:
                     subprocess.run([app] + args)
                 else:
-                    self.console.print(f"{command}: command not found")
+                    self._print_error(f"{command}: command not found")
                 ret = None
             else:
                 ret = fn(*args)

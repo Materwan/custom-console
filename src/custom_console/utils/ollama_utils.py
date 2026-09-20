@@ -3,7 +3,7 @@ import requests
 
 from typing import List, Dict, Any
 
-from .config import *
+from custom_console.config import *
 
 
 def get_installed_models(

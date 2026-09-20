@@ -40,7 +40,7 @@ AGENT_DB_PATH = _path(
 
 AGENT_LOG_PATH = _path(
     "AGENT_LOG_PATH",
-    PROJECT_ROOT / "src" / "custom_console" / "data" / "agent_logs.jsonl",
+    PROJECT_ROOT / "src" / "custom_console" / "data" / "logs" / "agent_logs.jsonl",
 )
 
 

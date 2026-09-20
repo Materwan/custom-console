@@ -302,14 +302,22 @@ class AgentConsole:
             self.console.print(
                 f"Agent is running without memory because {agent_storage} doesn't exist."
             )
+            agent_db = None
+            add_history_to_context = False
+            update_memory_on_run = False
+
+        else:
+            agent_db = SqliteDb(agent_storage)
+            add_history_to_context = True
+            update_memory_on_run = True
 
         self.agent = Agent(
             model=Ollama(agent_model_name),
             name=agent_name,
-            db=SqliteDb(db_file=agent_storage),
-            add_history_to_context=True,
+            db=agent_db,
+            add_history_to_context=add_history_to_context,
             num_history_runs=2,
-            update_memory_on_run=True,
+            update_memory_on_run=update_memory_on_run,
             tools=self.get_agent_tools(),
             instructions=agent_instructions,
             markdown=markdown,

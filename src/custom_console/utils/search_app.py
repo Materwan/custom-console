@@ -6,7 +6,7 @@ from pathlib import Path
 
 from typing import Optional
 
-from .config import *
+from custom_console.config import *
 
 from rich.console import Console
 

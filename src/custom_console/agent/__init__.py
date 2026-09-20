@@ -1,4 +1,4 @@
-__all__ = ["main.py", "config.py"]
+__all__ = ["main.py", "moodle_agent.py"]
 
 from . import main
-from . import config
+from . import moodle_agent
