@@ -142,6 +142,8 @@ class ShellCompleter(Completer):
             directory = "."
             if "remarkable".startswith(partial):
                 yield Completion("/reMarkable/", -len(partial), display="reMarkable")
+            if "wsl".startswith(partial):
+                yield Completion("/wsl-Ubuntu/", -len(partial), display="wsl-Ubuntu")
 
         # Gérer ~
         directory = os.path.expanduser(directory)

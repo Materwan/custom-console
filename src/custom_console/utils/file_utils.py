@@ -34,6 +34,21 @@ class RemarkableUnavailableError(RuntimeError):
     """Levée quand reMarkable est demandé mais RMAPI_PATH n'est pas configuré."""
 
 
+class IsVirtualRootError(Exception):
+    """Levée quand une opération (cat, stat, find, cp...) n'a pas de sens
+    car on se trouve sur la racine virtuelle "/" (qui n'est pas un vrai
+    dossier, juste un menu de sélection vers C:/, reMarkable/, wsl-Ubuntu/)."""
+
+
+# Chemin UNC exposé nativement par Windows pour accéder aux fichiers d'une
+# distribution WSL2. Fonctionne directement avec les fonctions standards
+# (os.chdir, os.listdir, open, ...), pas besoin de backend dédié.
+WSL_UBUNTU_PATH = r"\\wsl$\Ubuntu\\"
+
+# Entrées affichées à la racine virtuelle "/".
+VIRTUAL_ROOT_STATIC_ENTRIES = ["reMarkable/", "wsl-Ubuntu/"]
+
+
 class RemarkableBackend:
     """
     Wrapper autour de rmapi.exe en mode "one-shot" (`rmapi.exe <cmd> <args>`),
@@ -157,44 +172,62 @@ class RemarkableBackend:
 class FileManager:
     """Gère la navigation et les opérations fichiers, local + reMarkable."""
 
+    # Modes possibles pour `self.mode`
+    MODE_ROOT = "root"
+    MODE_LOCAL = "local"
+    MODE_REMARKABLE = "remarkable"
+
     def __init__(self) -> None:
         self.local_location: str = os.getcwd().replace("\\", "/")
-        self.in_remarkable: bool = False
+        self.mode: str = self.MODE_LOCAL
 
-        # Distinct de `in_remarkable` : indique si reMarkable est utilisable
-        # du tout (rmapi.exe présent), indépendamment d'où on se trouve.
         self.remarkable: Optional[RemarkableBackend] = (
             RemarkableBackend() if RMAPI_PATH and os.path.isfile(RMAPI_PATH) else None
         )
 
+    # -- Etat / compatibilité ascendante -------------------------------------- #
+
+    @property
+    def in_remarkable(self) -> bool:
+        return self.mode == self.MODE_REMARKABLE
+
+    @in_remarkable.setter
+    def in_remarkable(self, value: bool) -> None:
+        # Conservé pour compatibilité avec du code externe qui écrirait
+        # encore `file_manager.in_remarkable = True/False`.
+        self.mode = self.MODE_REMARKABLE if value else self.MODE_LOCAL
+
+    @property
+    def in_root(self) -> bool:
+        return self.mode == self.MODE_ROOT
+
     @property
     def location(self) -> str:
-        if self.in_remarkable:
+        if self.mode == self.MODE_ROOT:
+            return "/"
+        if self.mode == self.MODE_REMARKABLE:
             assert self.remarkable is not None
             return f"reMarkable:{self.remarkable.pwd()}"
         return self.local_location
 
-    def get_working_directory(self) -> str:
-        return self.location
+        def get_working_directory(self) -> str:
+            return self.location
+
+    # -- Helpers --------------------------------------------------------------- #
 
     @staticmethod
     def _strip_remote_prefix(path: str) -> Optional[str]:
-        """
-        Si `path` désigne un chemin sur reMarkable ('reMarkable:xxx',
-        '/reMarkable/xxx' ou '/reMarkable'), retourne le chemin distant nu
-        (insensible à la casse). Sinon retourne None.
-        """
         lowered = path.lower()
         for prefix in ("remarkable:", "/remarkable/", "/remarkable"):
             if lowered.startswith(prefix):
-                remainder = path[len(prefix):]
+                remainder = path[len(prefix) :]
                 return remainder if remainder else "."
         return None
 
     def _expand_path(self, path: str) -> str:
-        if not self.in_remarkable:
-            return os.path.expanduser(path).replace("\\", "/")
-        return path.replace("\\", "/")
+        if self.mode != self.MODE_LOCAL:
+            return path.replace("\\", "/")
+        return os.path.expanduser(path).replace("\\", "/")
 
     def _require_remarkable(self) -> RemarkableBackend:
         if self.remarkable is None:
@@ -203,13 +236,40 @@ class FileManager:
             )
         return self.remarkable
 
+    def _require_not_root(self, action: str) -> None:
+        if self.mode == self.MODE_ROOT:
+            raise IsVirtualRootError(
+                f"'{action}' n'a pas de sens sur la racine virtuelle '/'. "
+                "Déplace-toi d'abord vers C:/, reMarkable/ ou wsl-Ubuntu/."
+            )
+
+    @staticmethod
+    def _list_available_drives() -> List[str]:
+        """Liste dynamiquement les lettres de lecteurs Windows montés."""
+        import string
+
+        drives = []
+        for letter in string.ascii_uppercase:
+            if os.path.exists(f"{letter}:/"):
+                drives.append(f"{letter}:/")
+        return drives
+
+    def _virtual_root_entries(self) -> List[str]:
+        return self._list_available_drives() + VIRTUAL_ROOT_STATIC_ENTRIES
+
     # -- Navigation ---------------------------------------------------------- #
 
     def change_directory(self, path: str) -> None:
-        raw = path
+        raw = path.strip()
+
+        # Cas 0 : "/" ramène (ou reste) sur la racine virtuelle, quel que
+        # soit l'endroit d'où on part (local, reMarkable, ou déjà root).
+        if raw in ("/", "\\"):
+            self.mode = self.MODE_ROOT
+            return
 
         # Cas 1 : "~" ou "~/..." ramène toujours au système de fichiers
-        # local, même si on est actuellement dans reMarkable.
+        # local (utile même depuis la racine virtuelle ou reMarkable).
         if raw == "~" or raw.startswith("~/") or raw.startswith("~\\"):
             home_target = os.path.expanduser(raw).replace("\\", "/")
             if os.path.isfile(home_target):
@@ -217,35 +277,42 @@ class FileManager:
             if not os.path.isdir(home_target):
                 raise FileNotFoundError(home_target)
             os.chdir(home_target)
-            self.in_remarkable = False
+            self.mode = self.MODE_LOCAL
             self.local_location = os.getcwd().replace("\\", "/")
+            return
+
+        # Cas 2 : on est sur la racine virtuelle -> router vers le bon
+        # système de fichiers en fonction du premier segment du chemin.
+        if self.mode == self.MODE_ROOT:
+            self._change_directory_from_root(raw)
             return
 
         target = self._expand_path(path)
 
-        # Cas 2 : on est en local et on entre dans reMarkable (accepte aussi
-        # "/reMarkable/sous/dossier" en un seul cd).
-        if not self.in_remarkable:
+        # Cas 3 : on est en local et on entre dans reMarkable.
+        if self.mode == self.MODE_LOCAL:
             remote_target = self._strip_remote_prefix(target)
             if remote_target is not None:
                 remarkable = self._require_remarkable()
-                self.in_remarkable = True
+                self.mode = self.MODE_REMARKABLE
                 remarkable.path = "/"
                 if remote_target not in (".", ""):
                     try:
                         remarkable.cd(remote_target)
                     except Exception:
-                        self.in_remarkable = False
+                        self.mode = self.MODE_LOCAL
                         raise
                 return
 
-        # Cas 3 : on est déjà sur la tablette.
-        if self.in_remarkable:
+        # Cas 4 : on est déjà sur la tablette.
+        if self.mode == self.MODE_REMARKABLE:
             remarkable = self._require_remarkable()
             remarkable.cd(target)
             return
 
-        # Cas 4 : navigation locale classique.
+        # Cas 5 : navigation locale classique (fonctionne aussi bien pour
+        # C:/... que pour \\wsl$\Ubuntu\..., ce sont juste des chemins
+        # locaux du point de vue de Windows/Python).
         if os.path.isfile(target):
             raise NotADirectoryError(target)
         if not os.path.isdir(target):
@@ -253,13 +320,61 @@ class FileManager:
         os.chdir(target)
         self.local_location = os.getcwd().replace("\\", "/")
 
+    def _change_directory_from_root(self, raw: str) -> None:
+        """Route un `cd` fait depuis la racine virtuelle "/" vers le bon
+        système de fichiers, en fonction du premier segment du chemin."""
+        first, _, rest = raw.strip("/\\").partition("/")
+        first_lower = first.lower()
+
+        # -> reMarkable/...
+        if first_lower == "remarkable":
+            remarkable = self._require_remarkable()
+            self.mode = self.MODE_REMARKABLE
+            remarkable.path = "/"
+            if rest:
+                try:
+                    remarkable.cd(rest)
+                except Exception:
+                    self.mode = self.MODE_ROOT
+                    raise
+            return
+
+        # -> wsl-Ubuntu/...
+        if first_lower == "wsl-ubuntu":
+            target = WSL_UBUNTU_PATH
+            if rest:
+                target = os.path.join(WSL_UBUNTU_PATH, rest)
+            target = target.replace("\\", "/")
+            if os.path.isfile(target):
+                raise NotADirectoryError(target)
+            if not os.path.isdir(target):
+                raise FileNotFoundError(target)
+            os.chdir(target)
+            self.mode = self.MODE_LOCAL
+            self.local_location = os.getcwd().replace("\\", "/")
+            return
+
+        # -> C:/... (ou n'importe quelle lettre de lecteur détectée)
+        if re.fullmatch(r"[a-zA-Z]:", first):
+            drive = first.upper() + ":/"
+            target = drive if not rest else posixpath.join(drive, rest)
+            if os.path.isfile(target):
+                raise NotADirectoryError(target)
+            if not os.path.isdir(target):
+                raise FileNotFoundError(target)
+            os.chdir(target)
+            self.mode = self.MODE_LOCAL
+            self.local_location = os.getcwd().replace("\\", "/")
+            return
+
+        raise FileNotFoundError(raw)
+
     # -- Copie ---------------------------------------------------------------- #
 
     def copy(self, src: str, dst: str, recursive: bool) -> None:
-        # --- CAS 1 : copie interne à reMarkable ---
-        # rmapi ne supporte pas 'cp' directement : on relaie via un
-        # téléchargement local temporaire, suivi d'un envoi.
-        if self.in_remarkable:
+        self._require_not_root("cp")
+
+        if self.mode == self.MODE_REMARKABLE:
             remarkable = self._require_remarkable()
             tmp_dir = tempfile.mkdtemp(prefix="rmapi_cp_")
             try:
@@ -273,9 +388,6 @@ class FileManager:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             return
 
-        # --- CAS 2 : on est en local ---
-
-        # Sous-cas A : destination = reMarkable
         remote_dst = self._strip_remote_prefix(dst)
         if remote_dst is not None:
             remarkable = self._require_remarkable()
@@ -283,7 +395,6 @@ class FileManager:
             remarkable.put(local_src, remote_dst)
             return
 
-        # Sous-cas B : source = reMarkable
         remote_src = self._strip_remote_prefix(src)
         if remote_src is not None:
             remarkable = self._require_remarkable()
@@ -291,7 +402,6 @@ class FileManager:
             remarkable.get(remote_src, local_dst)
             return
 
-        # Sous-cas C : copie locale classique
         src = self._expand_path(src)
         dst = self._expand_path(dst)
         if os.path.isdir(src):
@@ -306,7 +416,9 @@ class FileManager:
     # -- Stat ------------------------------------------------------------------ #
 
     def stat(self, path: str) -> List[bool]:
-        if self.in_remarkable:
+        self._require_not_root("stat")
+
+        if self.mode == self.MODE_REMARKABLE:
             remarkable = self._require_remarkable()
             found = remarkable.stat_entry(path)
             if not found:
@@ -328,15 +440,14 @@ class FileManager:
     def _find(
         self, pattern: str, path: str, depth: int, dir_only: bool, strict: bool
     ) -> List[str]:
+        # (inchangé)
         if depth == 0:
             return []
 
         res: List[str] = []
         try:
-            # re.IGNORECASE reproduit le comportement "lower()" d'origine.
             regex = re.compile(pattern, re.IGNORECASE)
         except re.error:
-            # Pattern regex invalide : on retombe sur une recherche littérale.
             regex = re.compile(re.escape(pattern), re.IGNORECASE)
 
         try:
@@ -365,18 +476,16 @@ class FileManager:
                 elif not dir_only and is_match:
                     res.append(full_path)
         except PermissionError:
-            pass  # Ignorer les dossiers sans permission
+            pass
 
         return res
 
-    def find(
-        self, pattern: str, path: str, depth: int, strict: bool
-    ) -> List[str]:
+    def find(self, pattern: str, path: str, depth: int, strict: bool) -> List[str]:
+        self._require_not_root("find")
+
         if not pattern:
             raise ValueError("find: pattern must not be empty.")
 
-        # Détection automatique : si le pattern finit par / ou \ on cherche
-        # des dossiers uniquement.
         is_dir_search = pattern[-1] in "/\\"
         search_pattern = pattern[:-1] if is_dir_search else pattern
 
@@ -397,7 +506,9 @@ class FileManager:
     # -- Cat ------------------------------------------------------------------- #
 
     def cat(self, path: str) -> str:
-        if self.in_remarkable:
+        self._require_not_root("cat")
+
+        if self.mode == self.MODE_REMARKABLE:
             raise InReMarkableError(
                 "Impossible d'afficher un fichier reMarkable directement "
                 "(ce sont des notebooks, pas du texte)."
@@ -415,7 +526,19 @@ class FileManager:
     # -- List ------------------------------------------------------------------ #
 
     def list(self, path: str, all: bool) -> List[str]:
-        if self.in_remarkable:
+        # Sur la racine virtuelle, `ls` (sans argument, ou avec "." / "/")
+        # affiche le menu des systèmes de fichiers disponibles plutôt que
+        # de lever une erreur : contrairement aux autres commandes, "ls /"
+        # a un sens ici.
+        if self.mode == self.MODE_ROOT:
+            if path not in (".", "/", "\\", ""):
+                raise IsVirtualRootError(
+                    f"'{path}' n'existe pas sous la racine virtuelle '/'."
+                )
+            entries = self._virtual_root_entries()
+            return [f"'{e}'" if " " in e else e for e in entries]
+
+        if self.mode == self.MODE_REMARKABLE:
             remarkable = self._require_remarkable()
             entries = remarkable.listdir(path)
             if not all:
