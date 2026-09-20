@@ -3,9 +3,7 @@ import requests
 
 from typing import List, Dict, Any
 
-print("Ollama")
-
-OLLAMA_BASE_URL = "http://localhost:11434"
+from .config import *
 
 
 def get_installed_models(

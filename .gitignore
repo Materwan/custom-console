@@ -2,6 +2,7 @@
 .env
 .pytest_cache
 __pycache__
+saved_app.json
 
 cookies/
 logs/

@@ -189,7 +189,7 @@ def find_application(app_name: str, console: Console, level: Optional[int] = -1)
     if app_name.lower().endswith(".exe"):
         app_name = app_name[:-4]
 
-    with open(SAVED_APPS_PATH, "r") as file:
+    with open(SAVED_APP_PATH, "r") as file:
         dic = json.load(file)
         f = dic.get(app_name.lower())
         if f is not None:
@@ -197,7 +197,7 @@ def find_application(app_name: str, console: Console, level: Optional[int] = -1)
                 return dic[app_name.lower()]
             else:
                 dic.pop(app_name)
-                with open(SAVED_APPS_PATH, "w") as file:
+                with open(SAVED_APP_PATH, "w") as file:
                     file.write(json.dumps(dic, indent="\t"))
 
     # =========================================================

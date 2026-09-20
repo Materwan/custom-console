@@ -18,7 +18,7 @@ import requests
 from typing import Any, Callable, Dict, Generic, List, Literal, Optional, TypeVar
 
 from .moodle_agent import MoodleAgent
-from .config import *
+from custom_console.config import *
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
