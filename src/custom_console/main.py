@@ -355,6 +355,8 @@ class CustomConsole:
             self._print_error(f"cd: {e}: Not found.")
         except NotADirectoryError as e:
             self._print_error(f"cd: {e}: Not as directory")
+        except Exception as e:
+            self._print_error(f"cd: {e}.")
 
     @staticmethod
     def _strip_remote_prefix(path: str) -> Optional[str]:
@@ -411,6 +413,8 @@ class CustomConsole:
                 )
             except FileNotFoundError as e:
                 self._print_error(f"stat: {e}: Not found.")
+            except Exception as e:
+                self._print_error(f"cd: {e}.")
 
     def find(self, *args) -> str:
         parser = argparse.ArgumentParser(
@@ -483,6 +487,8 @@ class CustomConsole:
                 self._print_error(f"cat: {e}: No such file.")
             except PermissionError as e:
                 self._print_error(f"cat: {e}: Permission denied.")
+            except Exception as e:
+                self._print_error(f"cd: {e}.")
 
     def exit(self, *args):
         parser = argparse.ArgumentParser(
@@ -528,6 +534,8 @@ class CustomConsole:
                 self._print_error(f"ls: {e}: Not found.")
             except PermissionError as e:
                 self._print_error(f"ls: {e}: Permission denied.")
+            except Exception as e:
+                self._print_error(f"cd: {e}.")
 
     def pwd(self, *args):
         parser = argparse.ArgumentParser(

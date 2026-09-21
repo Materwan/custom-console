@@ -24,6 +24,12 @@ SAVED_APP_PATH = _path(
     "SAVED_APP_PATH",
     PROJECT_ROOT / "src" / "custom_console" / "data" / "saved_app.json",
 )
+
+REMARKABLE_SYNC_PATH = _path(
+    "REMARKABLE_SYNC_PATH",
+    PROJECT_ROOT / "src" / "custom_console" / "data" / "reMarkable_sync",
+)
+
 # Fichier SQLite unique regroupant l'historique des sessions (Storage) et la
 # mémoire utilisateur long terme (Memory) de l'agent. Persiste entre les
 # lancements du script.

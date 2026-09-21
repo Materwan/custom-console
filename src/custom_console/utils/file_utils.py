@@ -16,10 +16,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import unicodedata
+import time
 
 from typing import Dict, List, Optional, Tuple
 
-from ..config import RMAPI_PATH
+from ..config import RMAPI_PATH, REMARKABLE_SYNC_PATH
 
 
 class InReMarkableError(Exception):
@@ -63,18 +65,45 @@ class RemarkableBackend:
     chaque commande.
     """
 
+    # Délai minimal (s) entre deux invocations successives de rmapi.exe :
+    # chaque appel one-shot recrée un token d'authentification côté cloud
+    # reMarkable, et un enchaînement trop rapide déclenche un 429.
+    MIN_CALL_INTERVAL = 0.3
+    MAX_RETRY_ATTEMPTS = 6
+    INITIAL_RETRY_DELAY = 2.0
+
     def __init__(self, exe_path: str = RMAPI_PATH):
         self.exe_path = exe_path
         self.path = "/"  # dossier distant courant, à la manière d'un chemin posix
+        self._last_call_at = 0.0
 
-    def _run(self, *args: str) -> str:
-        proc = subprocess.run(
-            [self.exe_path, *args],
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        return proc.stdout + proc.stderr
+    def _run(self, *args: str, cwd: Optional[str] = None) -> str:
+        delay = self.INITIAL_RETRY_DELAY
+        output = ""
+        for attempt in range(1, self.MAX_RETRY_ATTEMPTS + 1):
+            wait = self.MIN_CALL_INTERVAL - (time.monotonic() - self._last_call_at)
+            if wait > 0:
+                time.sleep(wait)
+
+            proc = subprocess.run(
+                [self.exe_path, *args],
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                cwd=cwd,
+            )
+            self._last_call_at = time.monotonic()
+            output = proc.stdout + proc.stderr
+
+            # 429 = rate limit côté cloud reMarkable (trop de créations de
+            # token en peu de temps) : on réessaie avec un backoff
+            # exponentiel plutôt que de remonter une erreur immédiatement.
+            if "429" in output and attempt < self.MAX_RETRY_ATTEMPTS:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            return output
+        return output
 
     def _resolve(self, subpath: str) -> str:
         """Combine le dossier courant et le chemin demandé (gère '.', '..', '/abs')."""
@@ -94,29 +123,34 @@ class RemarkableBackend:
             [d]     NomDuDossier
         """
         entries: List[str] = []
-        for line in output.splitlines():
-            line = line.rstrip()
-            if not line:
+        for raw_line in output.splitlines():
+            # On ne retire QUE les caractères de fin de ligne : certains
+            # noms de documents se terminent par un espace, et un simple
+            # `.rstrip()` (sans argument) le supprimerait, faisant échouer
+            # `get`/`put` ensuite ("file doesn't exist") puisque le nom
+            # envoyé à rmapi ne correspondrait plus au nom réel distant.
+            line = raw_line.rstrip("\r\n")
+            if not line.strip():
                 continue
             parts = line.split(maxsplit=1)
             if len(parts) == 2:
                 if parts[0] == "[f]":
-                    entries.append(parts[1].strip())
+                    entries.append(parts[1])
                 elif parts[0] == "[d]":
-                    entries.append(parts[1].strip() + "/")
+                    entries.append(parts[1] + "/")
         return entries
 
     @staticmethod
     def _parse_ls_typed(output: str) -> List[Tuple[str, bool]]:
         """Comme _parse_ls mais retourne (nom, est_dossier)."""
         entries: List[Tuple[str, bool]] = []
-        for line in output.splitlines():
-            line = line.rstrip()
-            if not line:
+        for raw_line in output.splitlines():
+            line = raw_line.rstrip("\r\n")  # cf. commentaire dans _parse_ls
+            if not line.strip():
                 continue
             parts = line.split(maxsplit=1)
             if len(parts) == 2 and parts[0] in ("[f]", "[d]"):
-                entries.append((parts[1].strip(), parts[0] == "[d]"))
+                entries.append((parts[1], parts[0] == "[d]"))
         return entries
 
     def listdir(self, subpath: str = ".") -> List[str]:
@@ -148,7 +182,13 @@ class RemarkableBackend:
 
     def get(self, filename: str, dest: str = ".") -> None:
         target = self._resolve(filename)
-        output = self._run("get", target, dest)
+        # rmapi ne prend pas de dossier de destination en argument : `get`
+        # télécharge toujours dans le cwd du processus. On change donc le
+        # cwd du sous-processus plutôt que de passer `dest` en argument
+        # (sinon `dest` est silencieusement ignoré par rmapi, et le fichier
+        # atterrit dans le cwd de *ce* processus Python).
+        os.makedirs(dest, exist_ok=True)
+        output = self._run("get", target, cwd=dest)
         if "ERROR" in output:
             raise FileNotFoundError(target)
 
@@ -165,8 +205,48 @@ class RemarkableBackend:
         entries = self.listdir(".")
         return name if name in entries else None
 
+    def is_dir(self, subpath: str) -> bool:
+        """Indique si `subpath` désigne un dossier distant (par opposition à
+        un fichier). Lève FileNotFoundError si l'entrée n'existe pas."""
+        target = self._resolve(subpath)
+        if target == "/":
+            return True
+        parent = posixpath.dirname(target) or "/"
+        basename = posixpath.basename(target)
+        for name, is_dir in self.listdir_typed(parent):
+            if name == basename:
+                return is_dir
+        raise FileNotFoundError(target)
+
     def pwd(self) -> str:
         return self.path
+
+    def sync(self, dest: str = REMARKABLE_SYNC_PATH) -> None:
+        """Copie récursivement l'ensemble des fichiers et dossiers de la
+        tablette (depuis la racine distante "/") vers le dossier local
+        `dest`, en reconstituant l'arborescence.
+
+        Ne modifie pas `self.path` (le "dossier distant courant" n'est pas
+        affecté par l'opération) : les chemins distants sont résolus de
+        façon absolue tout au long de la synchronisation.
+        """
+        os.makedirs(dest, exist_ok=True)
+        self._sync_dir("/", dest)
+
+    def _sync_dir(self, remote_path: str, local_path: str) -> None:
+        for name, is_dir in self.listdir_typed(remote_path):
+            remote_entry = posixpath.join(remote_path, name)
+            local_entry = os.path.join(local_path, name)
+            if is_dir:
+                os.makedirs(local_entry, exist_ok=True)
+                self._sync_dir(remote_entry, local_path=local_entry)
+            else:
+                try:
+                    print(f"Dowloading: '{remote_entry}'")
+                    time.sleep(0.1)
+                    self.get(remote_entry, dest=local_path)
+                except FileNotFoundError as e:
+                    print(f"Skipped: {e}.")
 
 
 class FileManager:
@@ -232,7 +312,7 @@ class FileManager:
     def _require_remarkable(self) -> RemarkableBackend:
         if self.remarkable is None:
             raise RemarkableUnavailableError(
-                "reMarkable n'est pas configuré (RMAPI_PATH manquant ou invalide)."
+                "reMarkable n'est pas configuré (RMAPI_PATH manquant ou invalide)"
             )
         return self.remarkable
 
@@ -396,6 +476,13 @@ class FileManager:
 
         if self.mode == self.MODE_REMARKABLE:
             remarkable = self._require_remarkable()
+            if remarkable.is_dir(src):
+                raise ValueError(
+                    "Copie de dossier à dossier au sein de la tablette non "
+                    "supportée (rmapi ne sait ni télécharger, ni envoyer un "
+                    "dossier entier) ; utilisez `sync` pour exporter un "
+                    "dossier reMarkable en local."
+                )
             tmp_dir = tempfile.mkdtemp(prefix="rmapi_cp_")
             try:
                 remarkable.get(src, tmp_dir)
@@ -419,7 +506,22 @@ class FileManager:
         if remote_src is not None:
             remarkable = self._require_remarkable()
             local_dst = self._expand_path(dst)
-            remarkable.get(remote_src, local_dst)
+            if remarkable.is_dir(remote_src):
+                if not recursive:
+                    raise ValueError(f"-r not specified; omitting directory '{src}'")
+                remote_target = remarkable._resolve(remote_src)
+                # Si `local_dst` est un dossier existant, on y crée un
+                # sous-dossier portant le nom de la source (comme `cp -r`) ;
+                # sinon `local_dst` désigne directement le dossier cible.
+                if os.path.isdir(local_dst):
+                    dir_name = (
+                        posixpath.basename(remote_target.rstrip("/")) or "reMarkable"
+                    )
+                    local_dst = os.path.join(local_dst, dir_name)
+                os.makedirs(local_dst, exist_ok=True)
+                remarkable._sync_dir(remote_target, local_dst)
+            else:
+                remarkable.get(remote_src, local_dst)
             return
 
         src = self._expand_path(src)

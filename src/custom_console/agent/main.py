@@ -331,7 +331,6 @@ class AgentConsole:
             self.get_weather,
             self.read_file,
             self.list_files,
-            self.workspace_file_op,
             self.moodle_get_page_content,
             self.moodle_click_element,
             self.moodle_input_text,

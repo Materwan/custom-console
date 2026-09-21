@@ -7,5 +7,6 @@ saved_app.json
 cookies/
 logs/
 agent_storage/
+reMarkable_sync/
 
 *egg-info
