@@ -1,56 +1,44 @@
 {
-    "commands": {
-        "cd": {
-            "args": [],
-            "files": true
-        },
-        "cp": {
-            "args": [],
-            "file": true
-        },
-        "find": {
-            "args": [],
-            "file": true
-        },
-        "stat": {
-            "args": [],
-            "files": true
-        },
-        "echo": {
-            "args": [],
-            "files": false
-        },
-        "cat": {
-            "args": [],
-            "files": true
-        },
-        "exit": {
-            "args": [],
-            "files": false
-        },
-        "ls": {
-            "args": ["-a", "--all"],
-            "files": true
-        },
-        "pwd": {
-            "args": [],
-            "files": false
-        },
-        "clear": {
-            "args": [],
-            "files": false
-        },
-        "launch": {
-            "args": ["-f", "--file", "-sl", "--search_level"],
-            "files": true
-        },
-        "reload": {
-            "args": [],
-            "files": false
-        },
-        "ai": {
-            "args": ["start", "list"],
-            "files": false
-        }
-    }
+  "commands": {
+    "cp": {
+      "flags": [
+        {"names": ["-r", "--recursive"]}
+      ],
+      "files": {"count": 2}
+    },
+    "find": {
+      "flags": [
+        {"names": ["-d", "--depth"], "takes_value": true},
+        {"names": ["-s", "--strict"]}
+      ],
+      "files": {"count": 1}
+    },
+    "stat":  {"flags": [], "files": {"count": "*"}},
+    "cat":   {"flags": [], "files": {"count": "*"}},
+    "cd":    {"flags": [], "files": {"count": 1}},
+    "echo":  {"flags": [], "files": null},
+    "exit":  {"flags": [], "files": null},
+    "ls":    {"flags": [{"names": ["-a", "--all"]}], "files": {"count": "*"}},
+    "rm": {
+      "flags": [{"names": ["-r", "--recursive"]}],
+      "files": {"count": 1}
+    },
+    "tree": {
+      "flags": [
+        {"names": ["-a", "--all"]},
+        {"names": ["-d", "--depth"], "takes_value": true}
+      ],
+      "files": {"count": "*"}},
+    "pwd":   {"flags": [], "files": null},
+    "clear": {"flags": [], "files": null},
+    "launch": {
+      "flags": [
+        {"names": ["-f", "--file"]},
+        {"names": ["-sl", "--search_level"], "takes_value": true}
+      ],
+      "files": {"count": 1}
+    },
+    "reload": {"flags": [], "files": null},
+    "ai": {"flags": [], "files": null}
+  }
 }

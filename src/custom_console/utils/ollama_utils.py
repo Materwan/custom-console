@@ -1,5 +1,6 @@
 import sys
 import requests
+import ollama
 
 from typing import List, Dict, Any
 
@@ -56,7 +57,7 @@ def _search_model(model_name: str, model_list: List[Dict[str, Any]]) -> str:
                 return m["name"]
 
 
-def get_model(model_name: str) -> bool:
+def get_model(model_name: str) -> str:
     """Vérifie si le modèle est dans la liste des modèles installés."""
     installed = get_installed_models()
 
@@ -71,6 +72,4 @@ def is_running(model_name: str) -> bool:
 
 if __name__ == "__main__":
 
-    print(get_running_models())
-
-    print(get_model("qwen3.5"))
+    print(requests.get(f"{OLLAMA_BASE_URL}/api/chat"))

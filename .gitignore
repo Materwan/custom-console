@@ -3,6 +3,7 @@
 .pytest_cache
 __pycache__
 saved_app.json
+agent_instruction.txt
 
 cookies/
 logs/

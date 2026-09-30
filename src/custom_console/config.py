@@ -145,21 +145,11 @@ DEFAULT_WEATHER_VARIABLES: Dict[str, List[str]] = {
 }
 
 # Les instructions par défaut que l'agent doit respecter.
-DEFAULT_AGENT_INSTRUCTIONS = instructions = (
-    [
-        "Tu es un assistant personnel et tu dois m'appeler Monsieur.",
-        "Exécute les tâches demandées en utilisant les outils disponibles.",
-        "Tous les outils Python fournis renvoient un objet contenant la "
-        "réussite de l'appel, puis des informations complémentaires.",
-        "Pour Moodle : un cours est toujours identifié par un id "
-        "numérique, jamais par son nom. Avant d'appeler "
-        "moodle_get_course_structure ou tout autre outil nécessitant un "
-        "course_id, appelle d'abord moodle_list_courses pour retrouver "
-        "l'id correspondant au nom du cours demandé par l'utilisateur. "
-        "N'invente jamais un id et ne le devine pas à partir du HTML "
-        "d'une autre page.",
-    ],
+AGENT_INSTRUCTIONS_PATH = _path(
+    "AGENT_INSTRUCTIONS_PATH", PROJECT_ROOT / "config" / "agent_instruction.txt"
 )
+with open(AGENT_INSTRUCTIONS_PATH, "r") as file:
+    AGENT_INSTRUCTIONS = file.read()
 
 
 def check_required_paths() -> None:

@@ -19,7 +19,7 @@ import tempfile
 import unicodedata
 import time
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Iterator, Generator
 
 from ..config import RMAPI_PATH, REMARKABLE_SYNC_PATH
 
@@ -192,6 +192,51 @@ class RemarkableBackend:
         if "ERROR" in output:
             raise FileNotFoundError(target)
 
+    def remove(self, subpath, recursive=False):
+        """
+        Supprime un fichier ou un dossier sur la tablette.
+        """
+        if not recursive:
+            # Suppression simple (fichier ou dossier vide)
+            return self._do_rm(subpath)
+
+        # Si c'est récursif, on vérifie si c'est un dossier
+        if self.is_dir(subpath):
+            return self._remove_recursive(subpath)
+        else:
+            return self._do_rm(subpath)
+
+    def _do_rm(self, subpath):
+        """Primitive de suppression simple via CLI"""
+        target = self._resolve(subpath)
+        output = self._run("rm", target)
+        if "ERROR" in output:
+            raise InReMarkableError(
+                f"Impossible de supprimer {target} : {output.strip()}"
+            )
+        return True
+
+    def _remove_recursive(self, subpath):
+        """Implémentation manuelle de la suppression récursive"""
+        # 1. Lister le contenu du dossier
+        entries = self.listdir_typed(
+            subpath
+        )  # Utilise votre méthode existante qui renvoie le type
+
+        for name, is_dir in entries:
+            # On reconstruit le chemin complet
+            full_path = posixpath.join(subpath, name)
+
+            if is_dir:
+                # Appel récursif pour les sous-dossiers
+                self._remove_recursive(full_path)
+            else:
+                # Suppression du fichier
+                self._do_rm(full_path)
+
+        # 2. Une fois le dossier vidé, on peut le supprimer lui-même
+        return self._do_rm(subpath)
+
     def put(self, local_path: str, remote_path: str = ".") -> None:
         """Envoie un fichier local vers la tablette."""
         target = self._resolve(remote_path)
@@ -221,32 +266,30 @@ class RemarkableBackend:
     def pwd(self) -> str:
         return self.path
 
-    def sync(self, dest: str = REMARKABLE_SYNC_PATH) -> None:
-        """Copie récursivement l'ensemble des fichiers et dossiers de la
-        tablette (depuis la racine distante "/") vers le dossier local
-        `dest`, en reconstituant l'arborescence.
-
-        Ne modifie pas `self.path` (le "dossier distant courant" n'est pas
-        affecté par l'opération) : les chemins distants sont résolus de
-        façon absolue tout au long de la synchronisation.
-        """
-        os.makedirs(dest, exist_ok=True)
-        self._sync_dir("/", dest)
-
-    def _sync_dir(self, remote_path: str, local_path: str) -> None:
+    def _sync_dir(self, remote_path: str, local_path: str):
+        """Copie récursivement `remote_path` vers `local_path`, en yieldant le
+        chemin distant de chaque fichier au fur et à mesure qu'il est copié."""
         for name, is_dir in self.listdir_typed(remote_path):
             remote_entry = posixpath.join(remote_path, name)
             local_entry = os.path.join(local_path, name)
             if is_dir:
                 os.makedirs(local_entry, exist_ok=True)
-                self._sync_dir(remote_entry, local_path=local_entry)
+                yield from self._sync_dir(remote_entry, local_path=local_entry)
             else:
                 try:
-                    print(f"Dowloading: '{remote_entry}'")
                     time.sleep(0.1)
                     self.get(remote_entry, dest=local_path)
+                    yield remote_entry
                 except FileNotFoundError as e:
                     print(f"Skipped: {e}.")
+
+    def sync(self, dest: str = REMARKABLE_SYNC_PATH) -> Iterator[str]:
+        """Copie récursivement l'ensemble des fichiers et dossiers de la
+        tablette vers `dest`. Consomme le générateur `_sync_dir` en interne
+        (usage non-interactif) ; utilise `_sync_dir` directement si tu veux
+        itérer sur la progression."""
+        os.makedirs(dest, exist_ok=True)
+        yield from self._sync_dir("/", dest)
 
 
 class FileManager:
@@ -294,6 +337,76 @@ class FileManager:
         return self.location
 
     # -- Helpers --------------------------------------------------------------- #
+
+    def _resolve_backend_path(self, path: str):
+        raw = path.strip()
+
+        if raw in ("", "."):
+            if self.mode == self.MODE_ROOT:
+                return "root", "/"
+            if self.mode == self.MODE_REMARKABLE:
+                return "remarkable", self._require_remarkable().pwd()
+            return "local", self._expand_path(".")
+
+        if raw in ("/", "\\"):
+            return "root", "/"
+
+        # Chemins virtuels absolus.
+        if raw.startswith(("/", "\\")):
+            stripped = raw.strip("/\\")
+            parts = re.split(r"[/\\]", stripped, maxsplit=1)
+            first = parts[0] if parts else ""
+            rest = parts[1] if len(parts) > 1 else ""
+
+            if first.lower() == "remarkable":
+                remote = "/" if not rest else "/" + rest
+                return "remarkable", posixpath.normpath(remote)
+
+            if first.lower() == "wsl-ubuntu":
+                target = WSL_UBUNTU_PATH
+                if rest:
+                    target = os.path.join(target, rest)
+                return "local", target.replace("\\", "/")
+
+            if re.fullmatch(r"[a-zA-Z]:", first):
+                drive = first.upper() + "/"
+                target = drive if not rest else posixpath.join(drive, rest)
+                return "local", target
+
+        # Préfixe reMarkable explicite.
+        remote = self._strip_remote_prefix(raw)
+        if remote is not None:
+            remarkable = self._require_remarkable()
+            return "remarkable", remarkable._resolve(remote)
+
+        # Chemin relatif au backend courant.
+        if self.mode == self.MODE_REMARKABLE:
+            remarkable = self._require_remarkable()
+            return "remarkable", remarkable._resolve(raw)
+
+        if self.mode == self.MODE_ROOT:
+            first, _, rest = raw.replace("\\", "/").partition("/")
+            first_lower = first.lower()
+
+            if first_lower == "remarkable":
+                remarkable = self._require_remarkable()
+                remote = "/" if not rest else "/" + rest
+                return "remarkable", posixpath.normpath(remote)
+
+            if first_lower == "wsl-ubuntu":
+                target = WSL_UBUNTU_PATH
+                if rest:
+                    target = os.path.join(target, rest)
+                return "local", target.replace("\\", "/")
+
+            if re.fullmatch(r"[a-zA-Z]:", first):
+                drive = first.upper() + "/"
+                target = drive if not rest else posixpath.join(drive, rest)
+                return "local", target
+
+            raise FileNotFoundError(raw)
+
+        return "local", self._expand_path(raw)
 
     @staticmethod
     def _strip_remote_prefix(path: str) -> Optional[str]:
@@ -471,7 +584,11 @@ class FileManager:
 
     # -- Copie ---------------------------------------------------------------- #
 
-    def copy(self, src: str, dst: str, recursive: bool) -> None:
+    def copy(self, src: str, dst: str, recursive: bool) -> Generator[str]:
+        """Copie `src` vers `dst`. Générateur : yield le chemin de chaque
+        fichier au fur et à mesure qu'il est copié (un seul yield pour une
+        copie de fichier unique, plusieurs pour un dossier)."""
+        print(src, dst, recursive)
         self._require_not_root("cp")
 
         if self.mode == self.MODE_REMARKABLE:
@@ -493,6 +610,7 @@ class FileManager:
                 remarkable.put(local_tmp_file, dst)
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
+            yield src
             return
 
         remote_dst = self._strip_remote_prefix(dst)
@@ -500,6 +618,7 @@ class FileManager:
             remarkable = self._require_remarkable()
             local_src = self._expand_path(src)
             remarkable.put(local_src, remote_dst)
+            yield local_src
             return
 
         remote_src = self._strip_remote_prefix(src)
@@ -510,18 +629,16 @@ class FileManager:
                 if not recursive:
                     raise ValueError(f"-r not specified; omitting directory '{src}'")
                 remote_target = remarkable._resolve(remote_src)
-                # Si `local_dst` est un dossier existant, on y crée un
-                # sous-dossier portant le nom de la source (comme `cp -r`) ;
-                # sinon `local_dst` désigne directement le dossier cible.
                 if os.path.isdir(local_dst):
                     dir_name = (
                         posixpath.basename(remote_target.rstrip("/")) or "reMarkable"
                     )
                     local_dst = os.path.join(local_dst, dir_name)
                 os.makedirs(local_dst, exist_ok=True)
-                remarkable._sync_dir(remote_target, local_dst)
+                yield from remarkable._sync_dir(remote_target, local_dst)
             else:
                 remarkable.get(remote_src, local_dst)
+                yield remote_src
             return
 
         src = self._expand_path(src)
@@ -529,11 +646,27 @@ class FileManager:
         if os.path.isdir(src):
             if not recursive:
                 raise ValueError(f"-r not specified; omitting directory '{src}'")
-            shutil.copytree(src, dst, dirs_exist_ok=True)
+            yield from self._iter_copy_tree(src, dst)
         elif os.path.isfile(src):
             shutil.copy2(src, dst)
+            yield src
         else:
             raise FileNotFoundError(src)
+
+    @staticmethod
+    def _iter_copy_tree(src: str, dst: str) -> Generator[str]:
+        """Equivalent de `shutil.copytree(src, dst, dirs_exist_ok=True)`, mais
+        fichier par fichier, pour pouvoir yield la progression au fur et à
+        mesure plutôt qu'attendre la fin de toute la copie."""
+        os.makedirs(dst, exist_ok=True)
+        for root, _dirs, files in os.walk(src):
+            rel = os.path.relpath(root, src)
+            target_root = dst if rel == "." else os.path.join(dst, rel)
+            os.makedirs(target_root, exist_ok=True)
+            for name in files:
+                source_file = os.path.join(root, name)
+                shutil.copy2(source_file, os.path.join(target_root, name))
+                yield source_file
 
     # -- Stat ------------------------------------------------------------------ #
 
@@ -559,71 +692,160 @@ class FileManager:
 
     # -- Find ------------------------------------------------------------------ #
 
-    def _find(
-        self, pattern: str, path: str, depth: int, dir_only: bool, strict: bool
+    def _find_local(
+        self,
+        pattern: str,
+        path: str,
+        depth: int,
+        dir_only: bool,
+        strict: bool,
     ) -> List[str]:
-        # (inchangé)
         if depth == 0:
             return []
 
-        res: List[str] = []
         try:
             regex = re.compile(pattern, re.IGNORECASE)
         except re.error:
             regex = re.compile(re.escape(pattern), re.IGNORECASE)
 
+        res: List[str] = []
+
         try:
             for entry in os.listdir(path):
                 full_path = os.path.join(path, entry)
+
                 is_match = bool(
                     regex.fullmatch(entry) if strict else regex.search(entry)
                 )
 
                 if os.path.isdir(full_path):
-                    if dir_only:
-                        if is_match:
+                    if is_match:
+                        if dir_only:
                             res.append(full_path)
-                    else:
-                        if is_match:
+                        else:
                             res.append(full_path)
-                        res.extend(
-                            self._find(
-                                pattern=pattern,
-                                path=full_path,
-                                depth=depth - 1,
-                                dir_only=dir_only,
-                                strict=strict,
-                            )
+
+                    res.extend(
+                        self._find_local(
+                            pattern,
+                            full_path,
+                            depth - 1,
+                            dir_only,
+                            strict,
                         )
+                    )
+
                 elif not dir_only and is_match:
                     res.append(full_path)
+
         except PermissionError:
             pass
 
         return res
 
-    def find(self, pattern: str, path: str, depth: int, strict: bool) -> List[str]:
-        self._require_not_root("find")
+    def _find_remarkable(
+        self,
+        pattern: str,
+        path: str,
+        depth: int,
+        dir_only: bool,
+        strict: bool,
+    ) -> List[str]:
+        if depth == 0:
+            return []
 
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error:
+            regex = re.compile(re.escape(pattern), re.IGNORECASE)
+
+        remarkable = self._require_remarkable()
+        res: List[str] = []
+
+        for name, is_dir in remarkable.listdir_typed(path):
+            full_path = posixpath.join(path, name)
+
+            is_match = bool(regex.fullmatch(name) if strict else regex.search(name))
+
+            if is_dir:
+                if is_match:
+                    if dir_only:
+                        res.append(full_path)
+                    else:
+                        res.append(full_path)
+
+                res.extend(
+                    self._find_remarkable(
+                        pattern,
+                        full_path,
+                        depth - 1,
+                        dir_only,
+                        strict,
+                    )
+                )
+
+            elif not dir_only and is_match:
+                res.append(full_path)
+
+        return res
+
+    def find(
+        self,
+        pattern: str,
+        path: str = ".",
+        depth: int = 10,
+        strict: bool = False,
+    ) -> List[str]:
         if not pattern:
             raise ValueError("find: pattern must not be empty.")
 
         is_dir_search = pattern[-1] in "/\\"
         search_pattern = pattern[:-1] if is_dir_search else pattern
 
-        if os.path.isfile(path):
-            raise NotADirectoryError(path)
-        if not os.path.isdir(path):
-            raise FileNotFoundError(path)
+        backend, target = self._resolve_backend_path(path)
 
-        res = self._find(
-            pattern=search_pattern,
-            path=path,
-            depth=depth,
-            dir_only=is_dir_search,
-            strict=strict,
+        # Racine virtuelle
+        if backend == "root":
+            return self._find_virtual_root(
+                pattern=search_pattern,
+                depth=depth,
+                dir_only=is_dir_search,
+                strict=strict,
+            )
+
+        # reMarkable
+        if backend == "remarkable":
+            remarkable = self._require_remarkable()
+
+            if not remarkable.is_dir(target):
+                raise NotADirectoryError(target)
+
+            return sorted(
+                self._find_remarkable(
+                    pattern=search_pattern,
+                    path=target,
+                    depth=depth,
+                    dir_only=is_dir_search,
+                    strict=strict,
+                )
+            )
+
+        # Local / WSL
+        if os.path.isfile(target):
+            raise NotADirectoryError(target)
+
+        if not os.path.isdir(target):
+            raise FileNotFoundError(target)
+
+        return sorted(
+            self._find_local(
+                pattern=search_pattern,
+                path=target,
+                depth=depth,
+                dir_only=is_dir_search,
+                strict=strict,
+            )
         )
-        return sorted(res)
 
     # -- Cat ------------------------------------------------------------------- #
 
@@ -648,38 +870,118 @@ class FileManager:
     # -- List ------------------------------------------------------------------ #
 
     def list(self, path: str, all: bool) -> List[str]:
-        # Sur la racine virtuelle, `ls` (sans argument, ou avec "." / "/")
-        # affiche le menu des systèmes de fichiers disponibles plutôt que
-        # de lever une erreur : contrairement aux autres commandes, "ls /"
-        # a un sens ici.
-        if self.mode == self.MODE_ROOT:
-            if path not in (".", "/", "\\", ""):
-                raise IsVirtualRootError(
-                    f"'{path}' n'existe pas sous la racine virtuelle '/'."
-                )
+        backend, target = self._resolve_backend_path(path)
+
+        # Racine virtuelle
+        if backend == "root":
             entries = self._virtual_root_entries()
             return [f"'{e}'" if " " in e else e for e in entries]
 
-        if self.mode == self.MODE_REMARKABLE:
+        # reMarkable
+        if backend == "remarkable":
             remarkable = self._require_remarkable()
-            entries = remarkable.listdir(path)
+
+            entries = remarkable.listdir(target)
+
             if not all:
                 entries = [e for e in entries if not e.startswith(".")]
+
             return [f"'{e}'" if " " in e else e for e in entries]
 
-        folder_expanded = self._expand_path(path)
-        if os.path.isfile(folder_expanded):
-            raise NotADirectoryError(folder_expanded)
-        if not os.path.isdir(folder_expanded):
-            raise FileNotFoundError(folder_expanded)
+        # Local / WSL
+        if os.path.isfile(target):
+            raise NotADirectoryError(target)
 
-        if all:
-            entries = os.listdir(folder_expanded)
-        else:
-            entries = [d for d in os.listdir(folder_expanded) if not d.startswith(".")]
+        if not os.path.isdir(target):
+            raise FileNotFoundError(target)
+
+        entries = os.listdir(target)
+
+        if not all:
+            entries = [e for e in entries if not e.startswith(".")]
 
         entries = [
-            e + "/" if os.path.isdir(os.path.join(folder_expanded, e)) else e
-            for e in entries
+            e + "/" if os.path.isdir(os.path.join(target, e)) else e for e in entries
         ]
+
         return [f"'{e}'" if " " in e else e for e in entries]
+
+    def tree(
+        self, folder_path: str, depth: int, all: bool
+    ) -> Generator[str, None, None]:
+        """
+        Parcourt récursivement le dossier et yield chaque ligne de l'arborescence.
+        """
+        normalized_path = folder_path.replace("\\", "/")
+        base_depth = normalized_path.rstrip("/").count("/")
+        if depth == -1:
+            depth = float("inf")
+
+        for root, dirs, files in os.walk(folder_path):
+            current_root = root.replace("\\", "/")
+            current_depth = current_root.count("/") - base_depth
+
+            # 1. Gestion de la profondeur max
+            if current_depth > depth:
+                dirs[:] = []
+                continue
+
+            # 2. Filtrage des dossiers cachés (modifie os.walk pour les itérations suivantes)
+            if not all:
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+
+            indent = "    " * current_depth
+            folder_name = os.path.basename(root) or folder_path
+            yield f"{indent}{folder_name}/"
+
+            # 3. Affichage du contenu
+            sub_indent = "    " * (current_depth + 1)
+            files_to_show = (
+                files if all else [f for f in files if not f.startswith(".")]
+            )
+
+            # Si on est à la limite de profondeur, on vérifie s'il y a du contenu tronqué
+            if current_depth == depth:
+                has_hidden_content = len(dirs) > 0 or len(files_to_show) > 0
+                if has_hidden_content:
+                    yield f"{sub_indent}..."
+                    dirs[:] = []  # Stop la descente
+                    continue
+
+            # Listing des fichiers
+            for f in sorted(files_to_show):
+                yield f"{sub_indent}{f}"
+
+    def remove(self, path, recursive=False):
+        """
+        Supprime un fichier ou un répertoire, localement ou sur la tablette.
+        """
+        backend, target = self._resolve_backend_path(path)
+
+        # Racine virtuelle
+        if backend == "root":
+            raise IsVirtualRootError(
+                "'remove' n'a pas de sens sur la racine virtuelle '/'."
+            )
+
+        # reMarkable
+        if backend == "remarkable":
+            remarkable = self._require_remarkable()
+            # Le backend gère maintenant la récursion manuellement
+            return remarkable.remove(target, recursive=recursive)
+
+        if not os.path.exists(target):
+            raise FileNotFoundError(target)
+
+        # Local / WSL
+        try:
+            if os.path.isdir(target):
+                if recursive:
+                    shutil.rmtree(target)
+                else:
+                    os.rmdir(target)
+            else:
+                os.remove(target)
+            return True
+        except OSError as e:
+            raise NotAFileError(target)

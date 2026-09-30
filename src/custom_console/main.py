@@ -54,6 +54,7 @@ COLOR_INFO = "cyan"  # infos neutres (chemins résolus, résultats de find, ...)
 COLOR_WARNING = "yellow"  # avertissements non bloquants
 COLOR_SUCCESS = "green"  # succès / confirmations
 COLOR_ERROR = "bold red"  # erreurs
+COLOR_OTHER = "dim italic"
 
 
 class ShellCompleter(Completer):
@@ -66,61 +67,71 @@ class ShellCompleter(Completer):
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
 
-        # ─────────────────────────────────────────
-        # 1. Complétion du nom de commande
-        # ─────────────────────────────────────────
-
         if " " not in text:
             seen = set()
             for command in self.commands:
                 if command.startswith(text):
                     seen.add(command)
                     yield Completion(command, start_position=-len(text))
-
             for exe in self.path_executables:
                 if exe.startswith(text) and exe not in seen:
                     yield Completion(exe, start_position=-len(text))
             return
 
-        # ─────────────────────────────────────────
-        # 2. Analyse de la commande
-        # ─────────────────────────────────────────
-
         try:
             parts = shlex.split(text)
         except ValueError:
             return
-
         if not parts:
             return
 
         command = parts[0]
         config = self.commands.get(command)
-
         if config is None:
             return
 
-        # Ce qui est actuellement en train d'être complété
-        current = parts[-1] if len(parts) > 1 else ""
+        # Fix trailing-space : si le texte se termine par un espace,
+        # on complète un nouveau token vide, pas le dernier mot.
+        ends_with_space = text[-1].isspace()
+        current = "" if ends_with_space else (parts[-1] if len(parts) > 1 else "")
+        tokens = parts[1:] if ends_with_space else parts[1:-1]
 
-        # ─────────────────────────────────────────
-        # 3. Arguments définis dans le JSON
-        # ─────────────────────────────────────────
+        # Construit la table des noms de flags -> spec
+        flag_specs = {}
+        for flag in config.get("flags", []):
+            for name in flag["names"]:
+                flag_specs[name] = flag
 
-        for arg in config.get("args", []):
-            if arg.startswith(current):
-                yield Completion(arg, start_position=-len(current))
+        # Parcourt les tokens déjà tapés pour compter les positionnels
+        # (fichiers) et savoir si on est juste après un flag "takes_value"
+        positional_count = 0
+        expecting_flag_value = False
+        for tok in tokens:
+            if expecting_flag_value:
+                expecting_flag_value = False
+                continue
+            spec = flag_specs.get(tok)
+            if spec is not None:
+                expecting_flag_value = spec.get("takes_value", False)
+            else:
+                positional_count += 1
+
+        # --- Complétion des flags ---
+        if not expecting_flag_value:
+            for name in flag_specs:
+                if name.startswith(current):
+                    yield Completion(name, start_position=-len(current))
 
         if command == "launch":
             for key in SAVEDAPP:
                 yield Completion(key, start_position=-len(current))
 
-        # ─────────────────────────────────────────
-        # 4. Complétion des fichiers
-        # ─────────────────────────────────────────
-
-        if config.get("files", False):
-            yield from self._complete_files(current)
+        # --- Complétion des fichiers ---
+        files_cfg = config.get("files")
+        if files_cfg and not expecting_flag_value:
+            count = files_cfg.get("count", 0)
+            if count == "*" or positional_count < count:
+                yield from self._complete_files(current)
 
     @staticmethod
     def _resolve_virtual_directory(directory: str):
@@ -385,7 +396,11 @@ class CustomConsole:
             return
 
         try:
-            self.file_manager.copy(parsed.src, parsed.dst, parsed.recursive)
+            with self.console.status("Starting: ...") as s:
+                for file in self.file_manager.copy(
+                    parsed.src, parsed.dst, parsed.recursive
+                ):
+                    s.update(f"Copied: {file}")
         except FileNotFoundError as e:
             self._print_error(f"cp: {e}: Not found.")
         except Exception as e:
@@ -408,6 +423,8 @@ class CustomConsole:
             try:
                 res = self.file_manager.stat(path)
                 flags = self._format_permissions(res[0], res[1], res[2])
+                if len(parsed.paths) > 1:
+                    self.console.print(f"{path}:")
                 self.console.print(
                     f"[{COLOR_PATH}]{self.location}[/{COLOR_PATH}] {flags}"
                 )
@@ -416,7 +433,7 @@ class CustomConsole:
             except Exception as e:
                 self._print_error(f"cd: {e}.")
 
-    def find(self, *args) -> str:
+    def find(self, *args):
         parser = argparse.ArgumentParser(
             prog="find", add_help=False, exit_on_error=False
         )
@@ -480,6 +497,8 @@ class CustomConsole:
         for path in parsed.paths:
             try:
                 res = self.file_manager.cat(path)
+                if len(parsed.paths) > 1:
+                    self.console.print(f"{path}:")
                 self.console.print(res)
             except NotAFileError as e:
                 self._print_error(f"cat: {e}: Is a directory.")
@@ -504,7 +523,7 @@ class CustomConsole:
 
         self.running = False
 
-    def ls(self, *args: str) -> None:
+    def ls(self, *args):
         parser = argparse.ArgumentParser(prog="ls", add_help=False, exit_on_error=False)
         parser.add_argument("paths", nargs="*", default=["."])
         parser.add_argument("-a", "--all", action="store_true")
@@ -527,7 +546,63 @@ class CustomConsole:
                     )
                     for entry in res
                 ]
+                if len(parsed.paths) > 1:
+                    self.console.print(f"{path}:")
                 self.console.print("  ".join(colored))
+            except NotADirectoryError as e:
+                self._print_error(f"ls: {e}: Not a directory.")
+            except FileNotFoundError as e:
+                self._print_error(f"ls: {e}: Not found.")
+            except PermissionError as e:
+                self._print_error(f"ls: {e}: Permission denied.")
+            except Exception as e:
+                self._print_error(f"cd: {e}.")
+
+    def rm(self, *args):
+        parser = argparse.ArgumentParser(prog="rm", add_help=False, exit_on_error=False)
+        parser.add_argument("path", nargs="?", default=["."])
+        parser.add_argument("-r", "--recursive", action="store_true")
+
+        try:
+            parsed = parser.parse_args(args)
+
+        except argparse.ArgumentError as e:
+            self._print_error(f"ls: {e}")
+            return
+
+        try:
+            self.file_manager.remove(parsed.path, parsed.recursive)
+        except FileNotFoundError as e:
+            self.console.print(f"rm: {e} doesn't exist")
+        except NotAFileError as e:
+            self.console.print(f"rm: {e} cannot be access")
+
+    def tree(self, *args):
+        parser = argparse.ArgumentParser(
+            prog="tree", add_help=False, exit_on_error=False
+        )
+        parser.add_argument("paths", nargs="*", default=["."])
+        parser.add_argument("-a", "--all", action="store_true")
+        parser.add_argument("-d", "--depth", default=3, type=int)
+
+        try:
+            parsed = parser.parse_args(args)
+
+        except argparse.ArgumentError as e:
+            self._print_error(f"ls: {e}")
+            return
+
+        for path in parsed.paths:
+            try:
+                if len(parsed.paths) > 1:
+                    self.console.print(f"{path}:")
+                for line in self.file_manager.tree(path, parsed.depth, parsed.all):
+                    if line.endswith("/"):
+                        self.console.print(line, style=COLOR_DIR)
+                    elif line.strip() == "...":
+                        self.console.print(line, style=COLOR_OTHER)
+                    else:
+                        self.console.print(line)
             except NotADirectoryError as e:
                 self._print_error(f"ls: {e}: Not a directory.")
             except FileNotFoundError as e:
@@ -764,7 +839,7 @@ class CustomConsole:
                 self._print_error(f"ai: {parsed.model} model does not exist")
                 return
 
-            if not is_running(use_model):
+            if not is_running(use_model) and not use_model.endswith("cloud"):
                 self._print_warning(f"ai: {use_model} is not running")
                 answer = prompt("Do you want to start it (Y|N) : ")
                 if not check_yes_no_answer(answer):
@@ -774,7 +849,6 @@ class CustomConsole:
 
             agent_console = AgentConsole(
                 self.console,
-                self.location,
                 use_model,
                 parsed.name,
                 auto_permission_level=parsed.permissions,
