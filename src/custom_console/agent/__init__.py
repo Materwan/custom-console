@@ -1,5 +1,5 @@
-__all__ = ["main.py", "moodle_agent.py", "tools.py"]
+"""The AI agent: tools, permissions, terminal UI.
 
-from . import main
-from . import moodle_agent
-from . import tools
+Import ``custom_console.agent.console.AgentConsole`` to run it; nothing heavy
+(agno, Playwright) is imported by this package itself.
+"""

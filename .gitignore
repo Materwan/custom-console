@@ -1,13 +1,20 @@
-.dist
+# Secrets / local configuration
 .env
-.pytest_cache
-__pycache__
-saved_app.json
-agent_instruction.txt
 
-cookies/
-logs/
-agent_storage/
-reMarkable_sync/
+# Runtime data (logs, agent memory, workspaces, downloaded files, cookies)
+data/
+config/cookies/
 
-*egg-info
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Editors / scratch
+.vscode/
+*.rmdoc

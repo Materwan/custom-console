@@ -1,9 +1,3 @@
-__all__ = [
-    "main.py",
-    "config.py",
-    "file_utils.py",
-]
+"""Custom console: a shell with custom commands and a personal AI agent."""
 
-from . import main
-from . import config
-from .utils import file_utils
+__version__ = "0.2.0"
