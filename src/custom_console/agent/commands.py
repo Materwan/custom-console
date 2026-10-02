@@ -1,10 +1,11 @@
-"""The agent's slash commands: /model /provider /usage /context /compact /clear /undo /init
-/todo /permissions, plus the file commands of the shell (/ls /cd /cat ...). /model and /provider
+"""The agent's slash commands: /model /provider /remind /reminders /unremind /usage /context /compact
+/clear /undo /init /todo /permissions, plus the file commands of the shell (/ls /cd /cat ...). /model and /provider
 are the Clara server's own commands, run there."""
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from typing import TYPE_CHECKING, Iterable, Iterator, List, Optional
 
 from prompt_toolkit.completion import Completion
@@ -18,6 +19,7 @@ from ..shell.commands import build_file_registry
 from ..shell.printer import QuietPrinter
 from ..shell.repl import Shell
 from .permissions import PermissionLevel, permission_label
+from .reminders import REPEATS, local_time, parse_remind
 from .render import turn_renderables
 from .sessions import ago
 from .slash import CommandResult, SlashCommand, SlashRegistry
@@ -98,6 +100,9 @@ class AgentCommands:
                 self._complete_on_server("provider"),
             )
         )
+        add(SlashCommand("remind", "remind EVERY connected Clara client at a time", self.remind, "[daily|weekly|monthly] WHEN TEXT", self.complete_remind))
+        add(SlashCommand("reminders", "your reminders that have not fired yet", self.reminders))
+        add(SlashCommand("unremind", "cancel one of your reminders", self.unremind, "ID", self.complete_unremind))
         add(SlashCommand("usage", "tokens used: this session and in total", self.usage))
         add(SlashCommand("context", "how full the context window is", self.context))
         add(SlashCommand("compact", "summarise the conversation to free context", self.compact, "[FOCUS]"))
@@ -186,6 +191,71 @@ class AgentCommands:
                             yield Completion(choice, start_position=-len(arguments))
 
         return completer
+
+    # -- /remind, /reminders, /unremind: shown on every connected client ----------------------- #
+
+    def remind(self, arguments: str) -> CommandResult:
+        try:
+            due, repeat, text = parse_remind(arguments, datetime.now().astimezone())
+            reminder = self.app.client.add_reminder(due.isoformat(timespec="seconds"), text, repeat)
+        except (ValueError, ClaraError) as error:
+            return self._error(str(error))
+        when = local_time(reminder["due_at"])
+        again = f", then {reminder['repeat']}" if reminder["repeat"] else ""
+        return CommandResult(
+            self.renderer.text(
+                f"Reminder {reminder['id']} set for {when}{again}: every connected client will see it.", "green"
+            )
+        )
+
+    def reminders(self, arguments: str) -> CommandResult:
+        try:
+            found = self.app.client.reminders()
+        except ClaraError as error:
+            return self._error(str(error))
+        if not found:
+            return self._info("No reminder waiting.")
+        table = Table(title="Reminders", title_justify="left")
+        table.add_column("#", justify="right")
+        table.add_column("When")
+        table.add_column("Repeat")
+        table.add_column("Text", overflow="fold")
+        for reminder in found:
+            table.add_row(str(reminder["id"]), local_time(reminder["due_at"]), reminder["repeat"], reminder["text"])
+        return CommandResult(self.renderer.render(table))
+
+    def unremind(self, arguments: str) -> CommandResult:
+        if not arguments.strip().isdigit():
+            return self._error("Usage: /unremind ID   (the number shown by /reminders)")
+        try:
+            self.app.client.cancel_reminder(int(arguments))
+        except ClaraError as error:
+            return self._error(str(error))
+        return CommandResult(self.renderer.text("Reminder cancelled.", "green"))
+
+    def complete_remind(self, arguments: str) -> Iterator[Completion]:
+        words = arguments.split(" ")
+        after_repeat = len(words) == 2 and words[0].lower() in REPEATS
+        if len(words) > 2 or (len(words) == 2 and not after_repeat):
+            return
+        last = words[-1].lower()
+        options = {"tomorrow": "tomorrow at HH:MM"}
+        if not after_repeat:
+            options = {"daily": "every day", "weekly": "every week", "monthly": "every month", **options}
+        for word, meta in options.items():
+            if word.startswith(last):
+                yield Completion(word, start_position=-len(last), display_meta=meta)
+
+    def complete_unremind(self, arguments: str) -> Iterator[Completion]:
+        if " " in arguments:
+            return
+        try:
+            found = self.app.client.reminders()
+        except ClaraError:
+            return
+        for reminder in found:
+            if str(reminder["id"]).startswith(arguments):
+                yield Completion(str(reminder["id"]), start_position=-len(arguments), display_meta=reminder["text"][:60])
 
     # -- /usage, /context ------------------------------------------------------------------ #
 

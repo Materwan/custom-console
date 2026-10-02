@@ -173,6 +173,8 @@ Typing `/` lists them above the input, with what they do.
 |---|---|
 | `/model [NAME]` | the server's `/model`: list the models of its provider, or switch (needs `CLARA_ADMIN_TOKEN`) |
 | `/provider [local\|cloud]` | the server's `/provider`: show where it runs the model, or switch (needs `CLARA_ADMIN_TOKEN`) |
+| `/remind [daily\|weekly\|monthly] WHEN TEXT` | a reminder shown on **every** connected Clara client at that time (see below) |
+| `/reminders` `/unremind ID` | your reminders that have not fired yet; cancel one |
 | `/usage` | tokens used by this session, today, the last 7 days and in total, per model |
 | `/context` | how full the context window is: system prompt, tools, project file, summary, messages |
 | `/compact [FOCUS]` | have the server replace the older messages by a summary written by the model |
@@ -188,6 +190,34 @@ Typing `/` lists them above the input, with what they do.
 | `/cd /pwd /ls /tree /cat /stat /find /cp /rm` | the shell's file commands, working on the agent's current directory (so `/cd` moves the agent too) |
 | `/rmdoc FILE [PDF]` (or `/rmdoc2pdf`) | convert a reMarkable `.rmdoc` to PDF (same options as the shell command) |
 | `/help` `/bye` | help / leave |
+
+### Reminders
+
+`/remind` gives the Clara server a text and a moment; at that moment the server announces it to
+**every client connected to it**: this console, `clara-chat`, whoever else. It is shown above the
+input line with a bell (`⏰ Dentist (set by Erwan)`), even while the agent is working.
+
+```
+/remind +30m Tea                     in 30 minutes   (+2h, +3d work too)
+/remind 09:30 Stand-up               at the next 09:30 (tomorrow if it is past)
+/remind tomorrow 14:00 Dentist
+/remind 2026-12-24 20:00 Gifts
+/remind daily 09:00 Stand-up         also weekly, monthly (same time, same day of the month)
+```
+
+What is shown is **the message Clara wrote** for the reminder (its own text if she could not). The
+console also says when the server is stopping, gone or back (`● Clara is stopping: she finishes what is
+running and takes nothing new.`, `● Clara is not running.`, `● Clara is running again.`); while it
+stops, new questions are refused but the turn you are running finishes.
+
+The server keeps the reminders, so they fire while this console is closed. A client that was away
+receives what it missed the next time it connects, marked `(missed, it was due …)`; a client that
+has never connected starts from now. The console listens in a background thread and reconnects
+by itself when the server restarts. A repeating reminder that was missed several times fires once.
+You can also just ask Clara ("remind everyone tomorrow at 9 about the meeting").
+
+The time you type is your computer's local time; a repeating reminder keeps the UTC offset it was
+set with, so it does not follow daylight-saving changes.
 
 ### The free zone and permissions
 
@@ -347,6 +377,7 @@ src/custom_console/
     questions.py                 ask_user's options and answers
     slash.py  commands.py        slash commands: registry, completion, /compact /usage /undo...
     clara.py  remote.py          the Clara server: HTTP client, and a turn with tools run here
+    reminders.py                 /remind parsing, the notice, the background listener
     schema.py                    the JSON description of each tool, from its signature
     session.py                   a turn: streaming, tool hook, journal, usage
     subagent.py                  sub-agents run by the `task` tool (ephemeral jobs on the server)

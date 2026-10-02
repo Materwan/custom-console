@@ -96,6 +96,11 @@ class ClaraClient:
         """The events of one turn. Closing the generator closes the connection, which makes
         the server give the turn up."""
         response = self._request("POST", "/v1/chat/stream", json=body, stream=True)
+        yield from self._events(response)
+
+    @staticmethod
+    def _events(response: requests.Response) -> Iterator[Dict[str, Any]]:
+        """The Server-Sent Events of a streaming response; closes it when done or abandoned."""
         try:
             # Line by line, as soon as each arrives: `iter_lines` would wait for a full 512-byte
             # chunk, which delays every event of a server that does not send chunked responses.
@@ -131,6 +136,35 @@ class ClaraClient:
 
     def forget(self, conversation: str) -> None:
         self._request("DELETE", f"/v1/conversations/{conversation}")
+
+    # -- reminders ------------------------------------------------------------------------------ #
+
+    def _identity(self) -> Dict[str, str]:
+        return {"surface": self.surface, "user_id": self.user_id}
+
+    def add_reminder(self, at: str, text: str, repeat: str = "") -> Dict[str, Any]:
+        """Set a reminder every connected client will be shown. `at` is ISO 8601 with its offset.
+        Returns `{"id", "text", "due_at", "repeat"}`."""
+        body: Dict[str, Any] = {**self._identity(), "text": text, "at": at, "repeat": repeat}
+        if self.user_name:
+            body["user_name"] = self.user_name
+        return self._request("POST", "/v1/reminders", json=body).json()
+
+    def reminders(self) -> List[Dict[str, Any]]:
+        """This user's reminders that have not fired yet."""
+        return self._request("GET", "/v1/reminders", params=self._identity()).json()["reminders"]
+
+    def cancel_reminder(self, reminder_id: int) -> None:
+        self._request("DELETE", f"/v1/reminders/{reminder_id}", params=self._identity())
+
+    def reminder_events(self) -> Iterator[Dict[str, Any]]:
+        """What the server announces, for as long as the connection holds: ``reminder`` events (what
+        fired while this client was away first) and ``server`` events (``state``: running, stopping or
+        stopped). Closing the generator closes the connection."""
+        response = self._request("GET", "/v1/reminders/stream", stream=True)
+        for event in self._events(response):
+            if event.get("type") in ("reminder", "server"):
+                yield event
 
     # -- the server itself ----------------------------------------------------------------- #
 

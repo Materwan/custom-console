@@ -6,6 +6,7 @@ import io
 import json
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fake_clara import FakeClara, ask_tools, say
@@ -13,6 +14,7 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
+from custom_console.agent import reminders
 from custom_console.agent.clara import ClaraError
 from custom_console.agent.console import AgentConsole, permission_label
 from custom_console.fs import FileManager
@@ -715,6 +717,151 @@ class TestRmdocCommand:
 
         session.run(driver)
         assert (work / "Course.pdf").read_bytes().startswith(b"%PDF") and (work / "out.pdf").exists()
+
+
+class TestReminders:
+    def announced(self, text, **fields):
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return {"type": "reminder", "id": 1, "text": text, "due_at": now, "fired_at": now, "from": "Alice", **fields}
+
+    def test_remind_sets_one_on_the_server_for_every_client(self, tmp_path):
+        session = Session(tmp_path)
+
+        def driver(s):
+            s.send("/remind weekly +2h Water the plants")
+            s.wait_output("every connected client will see it")
+
+        out = session.run(driver)
+        [reminder] = session.clara.reminder_list
+        assert (reminder["text"], reminder["repeat"]) == ("Water the plants", "weekly")
+        due = datetime.fromisoformat(reminder["due_at"])
+        assert due.tzinfo is not None  # the console's own offset travels with the time
+        assert timedelta(hours=1, minutes=59) < due - datetime.now().astimezone() < timedelta(hours=2, minutes=1)
+        assert "Reminder 1 set for" in out and ", then weekly" in out
+
+    def test_remind_explains_what_it_cannot_read(self, tmp_path):
+        session = Session(tmp_path)
+
+        def driver(s):
+            s.send("/remind someday Tea")
+            s.wait_output("Cannot read the time")
+            s.send("/remind +5m")
+            s.wait_output("needs a text")
+
+        session.run(driver)
+        assert session.clara.reminder_list == []
+
+    def test_remind_shows_the_servers_refusal(self, tmp_path):
+        session = Session(tmp_path)
+
+        def driver(s):
+            session.clara.down = True  # the server goes away after startup
+            s.send("/remind +5m Tea")
+            s.wait_output("Cannot reach the Clara server")
+
+        session.run(driver)
+        assert session.clara.reminder_list == []
+
+    def test_reminders_are_listed_and_cancelled(self, tmp_path):
+        session = Session(tmp_path)
+        session.clara.add_reminder("2026-10-05T09:00:00+02:00", "Dentist")
+        session.clara.add_reminder("2026-10-06T09:00:00+02:00", "Bins", "weekly")
+
+        def driver(s):
+            s.send("/reminders")
+            s.wait_output("Bins")
+            s.send("/unremind 1")
+            s.wait_output("Reminder cancelled")
+            s.send("/unremind 99")
+            s.wait_output("No such reminder")
+            s.send("/unremind soon")
+            s.wait_output("Usage: /unremind")
+
+        out = session.run(driver)
+        assert "Dentist" in out and "weekly" in out
+        assert [r["text"] for r in session.clara.reminder_list] == ["Bins"]
+
+    def test_a_reminder_waiting_at_startup_is_shown_above_the_prompt(self, tmp_path):
+        session = Session(tmp_path)
+        session.clara.announced.append(self.announced("Dentist at 9"))  # came due while the console was closed
+
+        def driver(s):
+            s.wait_output("Dentist at 9")
+
+        out = session.run(driver)
+        assert "⏰ Dentist at 9" in out and "set by Alice" in out
+
+    def test_a_reminder_that_comes_due_while_the_console_runs_is_shown(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(reminders, "RECONNECT_SECONDS", 0.05)
+        session = Session(tmp_path)
+
+        def driver(s):
+            session.clara.announced.append(self.announced("Meeting now"))
+            s.wait_output("Meeting now")
+
+        assert "⏰ Meeting now" in session.run(driver)
+
+    def test_a_reminder_is_shown_even_while_the_agent_is_working(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(reminders, "RECONNECT_SECONDS", 0.05)
+        release = threading.Event()
+
+        def respond(body):
+            release.wait(5)
+            return say("finished")
+
+        session = Session(tmp_path, clara=FakeClara(respond))
+
+        def driver(s):
+            s.send("work")
+            wait_for(lambda: s.console_.screen._busy)
+            session.clara.announced.append(self.announced("During the turn"))
+            wait_for(lambda: "During the turn" in session.out.file.getvalue())
+            release.set()
+            s.wait_output("finished")
+
+        session.run(driver)
+
+    def test_the_message_clara_wrote_is_shown(self, tmp_path):
+        session = Session(tmp_path)
+        session.clara.announced.append(self.announced("Dentist at 9", message="Alice, your dentist is waiting!"))
+
+        def driver(s):
+            s.wait_output("your dentist is waiting")
+
+        out = session.run(driver)
+        assert "⏰ Alice, your dentist is waiting!" in out
+
+    def test_the_state_of_the_server_is_shown_when_it_changes(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(reminders, "RECONNECT_SECONDS", 0.05)
+        session = Session(tmp_path)
+        session.clara.announced.extend(
+            [{"type": "server", "state": "running"}, {"type": "server", "state": "stopping"}, {"type": "server", "state": "stopped"}]
+        )
+
+        def driver(s):
+            s.wait_output("Clara is not running.")
+
+        out = session.run(driver)
+        assert "● Clara is stopping" in out and "● Clara is not running." in out
+
+    def test_remind_arguments_are_completed(self, tmp_path):
+        from prompt_toolkit.document import Document
+
+        from custom_console.agent.slash import SlashCompleter
+
+        session = Session(tmp_path)
+        session.clara.add_reminder("2026-10-05T09:00:00+02:00", "Dentist")
+        completer = SlashCompleter(session.console_.screen.commands)
+
+        def complete(text):
+            return [c.text for c in completer.get_completions(Document(text), None)]
+
+        assert complete("/remind d") == ["daily"]
+        assert complete("/remind ") == ["daily", "weekly", "monthly", "tomorrow"]
+        assert complete("/remind daily t") == ["tomorrow"]
+        assert complete("/remind +2h ") == []
+        assert complete("/unremind ") == ["1"]
+        session.pipe_ctx.__exit__(None, None, None)
 
 
 def test_permission_labels():

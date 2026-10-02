@@ -334,6 +334,8 @@ class AgentScreen:
         self._flash: Tuple[str, float] = ("", 0.0)  # a short message in the header, until a time
         self._peak = 0  # tallest the layout above the header has been (see module docstring)
         self._finished: List[TurnView] = []  # this screen's turns (the default transcript)
+        self._notices: List[str] = []  # shown once the screen runs (see `notify`)
+        self._notices_lock = threading.Lock()
         self.viewer = None  # the transcript viewer, while it is open
         self._transcript = transcript or (lambda: list(self._finished))
 
@@ -992,6 +994,24 @@ class AgentScreen:
 
         await run_in_terminal(work)
 
+    def notify(self, text: str) -> None:
+        """Print `text` (already rendered) above the input line, whatever the screen is doing.
+        Safe from any thread; before the screen runs the text waits for it."""
+        with self._notices_lock:
+            loop = self._loop
+            if loop is None:
+                self._notices.append(text)
+                return
+        try:
+            asyncio.run_coroutine_threadsafe(self._print_notice(text), loop)
+        except RuntimeError:  # the loop is closed: the console is shutting down
+            pass
+
+    async def _print_notice(self, text: str) -> None:
+        while not self._app.is_running:  # notices that waited for the screen
+            await asyncio.sleep(0.02)
+        await self._print_above(lambda: text)
+
     def _reset_screen(self) -> None:
         """Clear the terminal, show the banner and push the input to the bottom."""
         self.console.clear()
@@ -1190,8 +1210,12 @@ class AgentScreen:
     # ------------------------------------------------------------------ #
 
     async def run_async(self) -> None:
-        self._loop = asyncio.get_running_loop()
         self._reset_screen()
+        with self._notices_lock:  # from here on `notify` goes straight to the loop
+            self._loop = asyncio.get_running_loop()
+            waiting, self._notices = self._notices, []
+        for text in waiting:
+            self._spawn(self._print_notice(text))
         await self._app.run_async()
 
     def run(self) -> None:

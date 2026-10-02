@@ -24,6 +24,7 @@ class State:
         self.admin_lines = []
         self.deleted = []
         self.closed_early = threading.Event()
+        self.reminder_bodies = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -65,6 +66,21 @@ class Handler(BaseHTTPRequestHandler):
             if not self.allowed(CHAT):
                 return
             return self.reply(200, {"tokens": 100, "window": 1000, "percent": 10.0, "summary": "", "messages": 2})
+        if self.path.startswith("/v1/reminders/stream"):
+            if not self.allowed(CHAT):
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b": keepalive\n\n")
+            self.event({"type": "reminder", "id": 1, "text": "Dentist é", "due_at": "2026-10-02T10:00:00+00:00",
+                        "fired_at": "2026-10-02T10:00:00+00:00", "from": "Erwan"})
+            self.event({"type": "server", "state": "stopping", "message": "Clara is stopping"})
+            return self.event({"type": "something-else"})
+        if self.path.startswith("/v1/reminders"):
+            if self.allowed(CHAT):
+                self.reply(200, {"reminders": [{"id": 3, "text": "Bins", "due_at": "2026-10-05T07:00:00+00:00", "repeat": "weekly"}]})
+            return
         self.reply(404, {"detail": "no such route"})
 
     def do_DELETE(self):
@@ -88,6 +104,13 @@ class Handler(BaseHTTPRequestHandler):
             if "/empty/" in self.path:
                 return self.reply(409, {"detail": "the conversation is empty: nothing to compact"})
             return self.reply(200, {"before_percent": 80.0, "after_percent": 5.0, "summary": "short"})
+        if self.path == "/v1/reminders":
+            if not self.allowed(CHAT):
+                return
+            self.state.reminder_bodies.append(self.body)
+            if self.body["text"] == "past":
+                return self.reply(422, {"detail": "That moment is already past."})
+            return self.reply(201, {"id": 7, "text": self.body["text"], "due_at": self.body["at"], "repeat": self.body["repeat"]})
         if self.path == "/v1/admin/command":
             if self.allowed(ADMIN):
                 line = self.body["line"]
@@ -308,3 +331,37 @@ class TestOtherCalls:
         with pytest.raises(ClaraError, match="CLARA_ADMIN_TOKEN"):
             client.admin("/status")
         assert client.admin_commands() == []
+
+
+class TestReminders:
+    def test_a_reminder_is_sent_with_who_set_it(self, server):
+        url, state = server
+        reminder = client_for(url).add_reminder("2026-10-05T09:00:00+02:00", "Dentist", "weekly")
+        assert reminder["id"] == 7
+        assert state.reminder_bodies == [
+            {"surface": "console", "user_id": "erwan", "user_name": "Erwan", "text": "Dentist",
+             "at": "2026-10-05T09:00:00+02:00", "repeat": "weekly"}
+        ]
+
+    def test_a_refused_reminder_says_why(self, server):
+        url, _ = server
+        with pytest.raises(ClaraError, match="already past.*HTTP 422"):
+            client_for(url).add_reminder("2020-01-01T00:00:00+00:00", "past")
+
+    def test_reminders_are_listed_and_cancelled(self, server):
+        url, state = server
+        client = client_for(url)
+        assert [r["text"] for r in client.reminders()] == ["Bins"]
+        client.cancel_reminder(3)
+        assert state.deleted == ["/v1/reminders/3?surface=console&user_id=erwan"]
+
+    def test_the_stream_gives_the_reminders_and_the_state_of_the_server_and_nothing_else(self, server):
+        url, _ = server
+        events = list(client_for(url).reminder_events())
+        assert [e["type"] for e in events] == ["reminder", "server"]
+        assert events[0]["text"] == "Dentist é" and events[1]["state"] == "stopping"
+
+    def test_the_stream_needs_the_token(self, server):
+        url, _ = server
+        with pytest.raises(ClaraError, match="401"):
+            list(client_for(url, token="nope").reminder_events())

@@ -7,7 +7,8 @@ them and the console runs them on this computer, after the permission questions.
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from prompt_toolkit.history import FileHistory
 from rich.console import Console, Group
@@ -22,6 +23,7 @@ from .commands import AgentCommands
 from .context import ContextManager
 from .journal import JsonlLogger
 from .permissions import PermissionGate, permission_label
+from .reminders import ReminderListener, notice
 from .remote import RemoteAgent
 from .schema import tools_token_estimate
 from .sessions import SessionRecord, SessionStore, ago
@@ -272,10 +274,23 @@ class AgentConsole:
 
     # -- lifecycle -------------------------------------------------------------------- #
 
+    def _reminder(self, event: Dict[str, Any]) -> None:
+        """A reminder came due on the server (any client may have set it): show it."""
+        text = notice(event, datetime.now().astimezone())
+        # the bell goes in after rendering: rich strips control characters from what it prints
+        self.screen.notify("\a" + self.renderer.text(text, "bold yellow"))
+
+    def _server_status(self, text: str) -> None:
+        """The server is stopping, gone, or back."""
+        self.screen.notify(self.renderer.text(f"● {text}", "yellow"))
+
     def run(self) -> None:
+        listener = ReminderListener(self.client, self._reminder, on_status=self._server_status)
+        listener.start()
         try:
             self.screen.run()
         finally:
+            listener.stop()
             self.tool_context.close()
             if not self.memory:  # nothing kept: not here, and not on the server either
                 for conversation in self.conversations:

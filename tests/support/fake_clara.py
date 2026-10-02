@@ -70,6 +70,8 @@ class FakeClara(ClaraClient):
         self.admin_output: Dict[str, str] = {}
         self.down = False  # the server cannot be reached
         self.nothing_to_compact = False
+        self.reminder_list: List[Dict[str, Any]] = []  # what /remind created
+        self.announced: List[Dict[str, Any]] = []  # reminders the next connection of the stream delivers
 
     def _check(self) -> None:
         if self.down:
@@ -108,6 +110,29 @@ class FakeClara(ClaraClient):
 
     def forget(self, conversation: str) -> None:
         self.forgotten.append(conversation)
+
+    def add_reminder(self, at: str, text: str, repeat: str = "") -> Dict[str, Any]:
+        self._check()
+        reminder = {"id": len(self.reminder_list) + 1, "text": text, "due_at": at, "repeat": repeat}
+        self.reminder_list.append(reminder)
+        return reminder
+
+    def reminders(self) -> List[Dict[str, Any]]:
+        self._check()
+        return list(self.reminder_list)
+
+    def cancel_reminder(self, reminder_id: int) -> None:
+        self._check()
+        before = len(self.reminder_list)
+        self.reminder_list[:] = [r for r in self.reminder_list if r["id"] != reminder_id]
+        if len(self.reminder_list) == before:
+            raise ClaraError("Clara server: No such reminder of yours (HTTP 404)")
+
+    def reminder_events(self) -> Iterator[Dict[str, Any]]:
+        """Delivers what was announced, then the connection ends (the listener reconnects)."""
+        self._check()
+        while self.announced:
+            yield self.announced.pop(0)
 
     def admin(self, line: str) -> str:
         if not self.admin_token:
