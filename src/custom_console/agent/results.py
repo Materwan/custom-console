@@ -20,10 +20,15 @@ class ToolResult(Generic[T]):
     success: bool
     data: Optional[T] = None
     error: Optional[BaseException] = None
+    # Shown to the user in the turn, never sent to the model.
+    diff: Optional[str] = None  # unified diff of a file change
+    todos: Optional[str] = None  # the current checklist
+    summary: Optional[str] = None  # a few words for the tool's line (default: from the data)
+    detail: Optional[str] = None  # what the tool's line hides (default: the diff, or the data)
 
     @classmethod
-    def ok(cls, data: Optional[T] = None) -> "ToolResult[T]":
-        return cls(success=True, data=data)
+    def ok(cls, data: Optional[T] = None, **display: Optional[str]) -> "ToolResult[T]":
+        return cls(success=True, data=data, **display)
 
     @classmethod
     def fail(cls, error: BaseException, data: Optional[T] = None) -> "ToolResult[T]":

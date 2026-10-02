@@ -13,7 +13,10 @@ def test_defaults_are_relative_to_the_root(tmp_path):
     assert s.data_dir == (tmp_path / "data").resolve()
     assert s.agent_db_path == s.data_dir / "agent" / "memory.db"
     assert s.agent_log_path == s.data_dir / "logs" / "agent.jsonl"
-    assert s.workspace_roots == {"result": s.agent_dir / "result", "tmp": s.agent_dir / "tmp"}
+    assert s.agent_usage_path == s.agent_dir / "usage.jsonl"
+    assert s.agent_sessions_dir == s.agent_dir / "sessions" and s.agent_keep_sessions == 5
+    assert s.agent_checkpoints_dir == s.agent_dir / "checkpoints"
+    assert s.agent_num_ctx is None and s.agent_compact_percent == 80 and s.agent_project_file == "AGENT.md"
     assert s.agent_permission_level == 1
     assert s.rmapi_path is None and not s.rmapi_available
     assert s.moodle_enabled and s.smtp_host is None
@@ -36,6 +39,9 @@ def test_overrides(tmp_path):
         "MOODLE_ENABLED": "false",
         "SMTP_PORT": "2525",
         "WSL_DISTRO": "Debian",
+        "AGENT_NUM_CTX": "16384",
+        "AGENT_COMPACT_PERCENT": "0",
+        "AGENT_PROJECT_FILE": "NOTES.md",
     }
     s = load(env, tmp_path)
     assert s.data_dir == (tmp_path / "elsewhere").resolve()
@@ -44,6 +50,7 @@ def test_overrides(tmp_path):
     assert s.moodle_enabled is False
     assert s.smtp_port == 2525
     assert s.wsl_distro == "Debian"
+    assert (s.agent_num_ctx, s.agent_compact_percent, s.agent_project_file) == (16384, 0, "NOTES.md")
 
 
 def test_invalid_integer_is_reported_with_the_variable_name(tmp_path):

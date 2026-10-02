@@ -587,6 +587,39 @@ class FileManager:
         self._notify(on_file, src)
         return 1
 
+    # -- local-only helpers (write, move) ------------------------------------ #
+
+    def local_path(self, raw: str, action: str = "access") -> str:
+        """Absolute local path of `raw`. Refuses the virtual root and the
+        reMarkable, which have no real files behind them."""
+        target = self.resolve(raw)
+        self._reject_root(target, action)
+        if target.backend is Backend.REMOTE:
+            raise InReMarkableError(f"'{action}' is not supported on the reMarkable: {raw}")
+        return target.path
+
+    def move(self, src: str, dst: str) -> str:
+        """Move or rename a local file or folder (like ``mv``). An existing
+        folder `dst` receives the source. Returns the final path."""
+        source = self.local_path(src, "mv")
+        destination = self.local_path(dst, "mv")
+        self._assert_removable(Target(Backend.LOCAL, source))
+        if not os.path.lexists(source):
+            raise FileNotFoundError(source)
+        if os.path.isdir(destination):
+            destination = _normalize(os.path.join(destination, os.path.basename(source)))
+        real_source = os.path.normcase(os.path.realpath(source))
+        real_destination = os.path.normcase(os.path.realpath(destination))
+        if real_destination == real_source:
+            raise ValueError(f"'{src}' and '{dst}' are the same file")
+        if os.path.isdir(source) and real_destination.startswith(real_source + os.sep):
+            raise ValueError(f"cannot move '{src}' into itself")
+        if os.path.lexists(destination):
+            raise FileExistsError(f"{destination} already exists")
+        os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
+        shutil.move(source, destination)
+        return destination
+
     # -- remove ------------------------------------------------------------- #
 
     def _assert_removable(self, target: Target) -> None:
@@ -607,12 +640,18 @@ class FileManager:
                 f"Refusing to delete '{target.path}': it contains the current directory."
             )
 
-    def remove(self, path: str, recursive: bool = False) -> None:
-        """Delete a file, or a folder (`recursive` for non-empty ones)."""
+    def check_removable(self, path: str) -> None:
+        """Raise if :meth:`remove` would refuse `path` (roots, home, the current
+        directory's parents...), without touching anything."""
         self._require_not_root("rm")
         target = self.resolve(path)
         self._reject_root(target, "rm")
         self._assert_removable(target)
+
+    def remove(self, path: str, recursive: bool = False) -> None:
+        """Delete a file, or a folder (`recursive` for non-empty ones)."""
+        self.check_removable(path)
+        target = self.resolve(path)
 
         if target.backend is Backend.REMOTE:
             self._remote().remove(target.path, recursive=recursive)

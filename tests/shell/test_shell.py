@@ -28,7 +28,7 @@ class Harness:
         settings = load_settings({}, root=root, use_dotenv=False)
         self.shell = Shell(
             settings,
-            printer=Printer(Console(file=self.buffer, force_terminal=False, width=120)),
+            printer=Printer(Console(file=self.buffer, force_terminal=False, width=400)),
             files=FileManager(start_dir=str(root)),
             confirm=confirm,
         )
@@ -160,9 +160,9 @@ class TestErrorsNeverKillTheShell:
     def test_blank_line_is_ignored(self, h):
         assert h.run("   ") == ""
 
-    def test_help_flag_prints_usage_and_does_not_exit(self, h, capsys):
-        h.run("ls -h")
-        assert "usage: ls" in capsys.readouterr().out
+    def test_help_flag_prints_usage_through_the_printer_and_does_not_exit(self, h, capsys):
+        assert "usage: ls" in h.run("ls -h")
+        assert capsys.readouterr().out == ""  # nothing leaks to the real stdout
         assert h.shell.context.running
 
 

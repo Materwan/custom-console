@@ -93,3 +93,24 @@ class Printer:
 
     def status(self, message: str) -> Status:
         return self.console.status(message)
+
+
+class _NoStatus:
+    """Stand-in for a rich status when no live display is possible."""
+
+    def __enter__(self) -> "_NoStatus":
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        return False
+
+    def update(self, *args, **kwargs) -> None:
+        return None
+
+
+class QuietPrinter(Printer):
+    """A printer whose console renders into a string: no spinners, which would
+    write control codes into the captured text."""
+
+    def status(self, message: str):  # type: ignore[override]
+        return _NoStatus()

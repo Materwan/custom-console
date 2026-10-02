@@ -10,7 +10,7 @@ from prompt_toolkit.completion import Completer, Completion
 
 from ..apps.finder import SavedApps
 from ..fs import FileManager
-from .commands import APP, MODEL, PATH, CommandRegistry
+from .commands import APP, MODEL, PATH, PROVIDER, CommandRegistry
 from .tokenizer import TokenizeError, current_word, quote_if_needed, split_command, unquote_word
 
 Suggestion = Tuple[str, str]  # (text to insert, text to display)
@@ -174,6 +174,12 @@ class ShellCompleter(Completer):
             for text, is_dir in self.files.suggest(prefix):
                 inserted = quote_if_needed(text + ("/" if is_dir else ""))
                 yield inserted, text.rsplit("/", 1)[-1] + ("/" if is_dir else "")
+        elif kind == PROVIDER:
+            from ..llm.providers import PROVIDERS
+
+            for name in PROVIDERS:
+                if name.startswith(prefix.lower()):
+                    yield name, name
         elif kind == APP and self.saved_apps is not None:
             for name in self.saved_apps.names():
                 if name.startswith(prefix.lower()):

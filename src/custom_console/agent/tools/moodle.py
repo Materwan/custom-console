@@ -156,20 +156,21 @@ def moodle_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         return ToolResult.ok(runner.run(lambda moodle: moodle.input_text(selector, text, submit=submit)))
 
     @guarded(ctx, PermissionLevel.WRITE)
-    def moodle_download_file(file_url: str, save_directory: str, save_relative_path: str) -> ToolResult:
+    def moodle_download_file(file_url: str, save_path: str) -> ToolResult:
         """Download a file from Moodle with the active session.
 
         Args:
             file_url: URL to download, absolute or relative to the Moodle base.
-            save_directory: workspace to save into: "tmp", unless it is a final deliverable
-                ("result").
-            save_relative_path: file path inside that workspace.
+            save_path: local file to create, e.g. "course/lecture1.pdf".
 
         Returns {downloaded, path, suggested_filename, failure}.
         """
-        target = ctx.workspace.resolve(save_directory, save_relative_path)
-        result = runner.run(lambda moodle: moodle.download_file(file_url, str(target)))
-        result["path"] = ctx.workspace.describe(target)
+        target = ctx.files.local_path(save_path, "moodle_download_file")
+        ctx.snapshot(target)
+        result = runner.run(lambda moodle: moodle.download_file(file_url, target))
+        result["path"] = target
+        if result.get("downloaded"):
+            ctx.reads.mark(target)
         return ToolResult.ok(result)
 
     return [

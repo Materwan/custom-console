@@ -18,6 +18,20 @@ class PermissionLevel(IntEnum):
     WRITE = 2  # writes, deletions, sending, clicking...
 
 
+LEVEL_LABELS = {
+    PermissionLevel.NONE: "always ask",
+    PermissionLevel.READ: "reads are auto-accepted",
+    PermissionLevel.WRITE: "everything is auto-accepted",
+}
+
+
+def permission_label(level: int) -> str:
+    try:
+        return LEVEL_LABELS[PermissionLevel(level)]
+    except ValueError:
+        return f"level {level}"
+
+
 class UserPermissionDenied(Exception):
     """The user refused an action requested by the agent."""
 

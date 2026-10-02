@@ -10,6 +10,8 @@ from agno.metrics import RunMetrics
 from agno.run.agent import RunOutput
 
 from custom_console.agent.cache import JsonCache
+from custom_console.agent.context import ContextManager
+from custom_console.agent.usage import UsageLedger
 from custom_console.agent.journal import JsonlLogger
 from custom_console.agent.results import ToolResult
 from custom_console.agent.session import AgentSession
@@ -128,7 +130,13 @@ def content(text, event="RunContent"):
 
 @pytest.fixture
 def session(tmp_path):
-    return AgentSession(JsonlLogger(tmp_path / "log.jsonl"), "user-1", "session-1")
+    return AgentSession(
+        JsonlLogger(tmp_path / "log.jsonl"),
+        "user-1",
+        ContextManager(base_session_id="session-1"),
+        UsageLedger(tmp_path / "usage.jsonl"),
+        model="test-model",
+    )
 
 
 class TestRunTurn:
@@ -142,7 +150,9 @@ class TestRunTurn:
         assert view.answer_text() == "Hello world"
         assert (stats.input_tokens, stats.output_tokens, stats.total_tokens) == (4, 6, 10)
         prompt, kwargs = session.agent.calls[0]
-        assert prompt == "hi" and kwargs["stream"] is True and kwargs["yield_run_output"] is True
+        assert prompt.startswith("[Automatic note, not written by the user. Current date and time: ")
+        assert prompt.endswith(").]\n\nhi")
+        assert kwargs["stream"] is True and kwargs["yield_run_output"] is True
         assert (kwargs["user_id"], kwargs["session_id"]) == ("user-1", "session-1")
         assert [e["type"] for e in read_entries(tmp_path / "log.jsonl")] == ["prompt", "answer"]
 

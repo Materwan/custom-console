@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Optional
 if TYPE_CHECKING:
     from ...apps.finder import SavedApps
     from ...fs import FileManager
+    from ...llm.keys import KeyStore
     from ...llm.ollama import OllamaClient
     from ...settings import Settings
     from ..printer import Printer
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 PATH = "PATH"
 APP = "APP"
 MODEL = "MODEL"
+PROVIDER = "PROVIDER"
 
 
 class CommandError(Exception):
@@ -25,15 +27,23 @@ class CommandError(Exception):
 
 
 class HelpRequested(Exception):
-    """Raised after ``--help`` was printed, to stop the command quietly."""
+    """``--help`` was asked: `text` is the usage to show, and the command stops."""
+
+    def __init__(self, text: str = ""):
+        super().__init__(text)
+        self.text = text
 
 
 class ShellParser(argparse.ArgumentParser):
     """argparse parser that never exits the process.
 
-    Usage errors become :class:`CommandError`; ``-h`` prints the help and
-    raises :class:`HelpRequested`.
+    Usage errors become :class:`CommandError`; ``-h`` raises
+    :class:`HelpRequested` carrying the usage text, which the caller prints
+    (nothing is written to stdout here, so the output can be captured).
     """
+
+    def print_help(self, file=None):  # type: ignore[override]
+        raise HelpRequested(self.format_help())
 
     def error(self, message: str):  # type: ignore[override]
         raise CommandError(message)
@@ -57,6 +67,8 @@ class ShellContext:
     confirm: Callable[[str], bool]
     last_model: str = ""
     running: bool = True
+    keys: Optional["KeyStore"] = None  # API keys of the model providers (None: the real store)
+    ask_secret: Optional[Callable[[str], str]] = None  # asks for an API key, typed masked
 
 
 Handler = Callable[[ShellContext, argparse.Namespace], None]
