@@ -6,16 +6,12 @@ from __future__ import annotations
 import os
 import threading
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 
-from custom_console.agent.context import (
-    ContextManager,
-    build_transcript,
-    describe_now,
-    turn_notes,
-    without_notes,
-)
+from fake_clara import FakeClara
+
+from custom_console.agent.context import ContextManager, describe_now, turn_notes
 from custom_console.agent.journal import JsonlLogger
+from custom_console.agent.remote import RemoteAgent
 from custom_console.agent.session import AgentSession
 from custom_console.agent.tools.state import ReadTracker, StaleFile
 from custom_console.agent.turn import TurnView
@@ -144,24 +140,6 @@ class TestNotes:
         notes = turn_notes(NOW, stale)
         assert "- f9 " in notes and "- f10 " not in notes and "… and 4 more" in notes
 
-    def test_the_notes_can_be_taken_off_a_message(self):
-        message = turn_notes(NOW, [StaleFile("C:/w/[draft] a.md", None, True)]) + "\n\nWhat changed?\n\n[a] list"
-        assert without_notes(message) == "What changed?\n\n[a] list"
-        assert without_notes("[a] note of mine\n\nhi") == "[a] note of mine\n\nhi"
-
-    def test_the_summary_does_not_see_them(self):
-        messages = [SimpleNamespace(role="user", content=turn_notes(NOW) + "\n\nfix the bug", tool_calls=None)]
-        assert build_transcript(messages) == "User: fix the bug"
-
-
-class FakeAgent:
-    def __init__(self):
-        self.inputs = []
-
-    def run(self, prompt, **kwargs):
-        self.inputs.append(prompt)
-        yield SimpleNamespace(event="RunContent", content="ok")
-
 
 class TestSession:
     def session(self, tmp_path, reads):
@@ -173,39 +151,40 @@ class TestSession:
             reads=reads,
             clock=lambda: NOW,
         )
-        session.agent = FakeAgent()
+        session.remote = RemoteAgent(FakeClara(), lambda: [], lambda: "Be useful.")
         return session
 
-    def test_each_message_carries_the_time_and_the_changed_files(self, tmp_path):
+    def test_each_message_carries_the_time_and_the_changed_files_as_its_prefix(self, tmp_path):
         target = tmp_path / "notes.md"
         target.write_text("v1")
         reads = ReadTracker()
         reads.mark(str(target))
         session = self.session(tmp_path, reads)
+        bodies = session.remote.client.bodies
 
         view = TurnView("what is in notes.md?")
         session.run_turn(view, threading.Event())
-        first = session.agent.inputs[0]
-        assert first.startswith("[Automatic note, not written by the user. Current date and time: 2026-10-01 14:32")
-        assert "notes.md" not in without_notes(first).replace("what is in notes.md?", "")
-        assert "Files changed" not in first
+        first = bodies[0]
+        assert first["message"] == "what is in notes.md?"  # the user's words, untouched
+        assert first["prefix"].startswith("[Automatic note, not written by the user. Current date and time: 2026-10-01 14:32")
+        assert "Files changed" not in first["prefix"]
 
         target.write_text("v2 with a new section")
         touch(target, NOW - timedelta(minutes=1))
         session.run_turn(TurnView("and now?"), threading.Event())
-        second = session.agent.inputs[1]
-        assert f"- {os.path.abspath(target)} (modified at 14:31)" in second
-        assert without_notes(second) == "and now?"
+        second = bodies[1]
+        assert f"- {os.path.abspath(target)} (modified at 14:31)" in second["prefix"]
+        assert second["message"] == "and now?"
 
         reads.mark(str(target))  # the agent read it again
         session.run_turn(TurnView("thanks"), threading.Event())
-        assert "Files changed" not in session.agent.inputs[2]
+        assert "Files changed" not in bodies[2]["prefix"]
         assert view.prompt == "what is in notes.md?"  # what the user sees and what is saved: unchanged
 
     def test_without_a_tracker_only_the_time(self, tmp_path):
         session = self.session(tmp_path, None)
         session.run_turn(TurnView("hi"), threading.Event())
-        assert session.agent.inputs[0] == turn_notes(NOW) + "\n\nhi"
+        assert session.remote.client.bodies[0]["prefix"] == turn_notes(NOW)
 
 
 class TestReadTool:

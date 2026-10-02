@@ -262,7 +262,11 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, reading("path"))
     def file_system_cd(path: str) -> ToolResult:
-        """Change the working directory (also switches between drives, WSL and reMarkable)."""
+        """Change the working directory (also switches between drives, WSL and reMarkable).
+
+        Args:
+            path: the folder to move into.
+        """
         files.change_directory(path)
         return ToolResult.ok(f"Changed directory to {files.location}")
 
@@ -279,7 +283,11 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, reading("path"))
     def file_system_stat(path: str) -> ToolResult:
-        """Return the readable/writable/executable permissions of a path."""
+        """Return the readable/writable/executable permissions of a path.
+
+        Args:
+            path: the file or folder to inspect.
+        """
         return ToolResult.ok(files.stat(path)._asdict())
 
     # -- search ---------------------------------------------------------------- #

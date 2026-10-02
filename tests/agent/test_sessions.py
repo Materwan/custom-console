@@ -70,9 +70,10 @@ class TestRecord:
         assert SessionRecord("i", "/d", turns=[turn("first line\nsecond")]).first_prompt == "first line"
         assert len(SessionRecord("i", "/d", turns=[turn("x" * 200)]).first_prompt) == 70
 
-    def test_every_database_session_of_a_compacted_conversation(self):
-        record = SessionRecord("i", "/d", context={"base": "b", "generation": 2})
-        assert record.session_ids() == ["b", "b-1", "b-2"] and SessionRecord("i", "/d").session_ids() == []
+    def test_the_conversation_on_the_server(self):
+        assert SessionRecord("i", "/d", context={"conversation": "c", "summary": "s"}).conversation_id() == "c"
+        assert SessionRecord("i", "/d", context={"base": "b", "generation": 2}).conversation_id() == "b"  # older versions
+        assert SessionRecord("i", "/d").conversation_id() == ""
 
     def test_ago(self):
         now = datetime.now().astimezone()
@@ -145,13 +146,11 @@ class TestStore:
 
 
 def first_session(tmp_path, **options):
-    """A session that was lived: a model switch, tools turned off, two questions, a checklist."""
+    """A session that was lived: tools turned off, two questions, a checklist."""
     session = Session(tmp_path, permission_level=2, memory=True, **options)
     session.console_.tool_context.todos.replace([{"content": "step one", "status": "in_progress"}])
 
     def driver(s):
-        s.send("/model other")
-        s.wait_output("Model: other:1b")
         s.send("/tools off run_command")
         s.wait_output("Turned off")
         s.send("hello there")
@@ -169,13 +168,14 @@ class TestRestore:
         second = Session(tmp_path, permission_level=2, memory=True)
         out = second.run(lambda s: None)
         assert "Previous session" in out and "hello there" in out and "2 exchange(s)" in out and "/restore" in out
-        assert second.console_.record.turns == [] and second.console_.context.base_session_id != first.console_.context.base_session_id
-        assert not any("hello there" in str(p) for p in second.created["agent"].prompts)
+        assert second.console_.record.turns == [] and second.console_.context.session_id != first.console_.context.session_id
+        assert second.clara.bodies == []  # nothing of the old conversation was sent
 
     def test_restore_brings_back_screen_model_tools_level_and_checklist(self, tmp_path):
         first, _ = first_session(tmp_path)
-        old_base = first.console_.context.base_session_id
+        old_conversation = first.console_.context.session_id
         second = Session(tmp_path, permission_level=0, memory=True)
+        second.clara.messages = 4  # the server remembers the conversation
         second.console_.toolset.reset()  # the saved default would hide run_command: only the session remembers it
         second.console_.apply_tools()
         second.console_.tool_context.reads.mark(str(tmp_path / "work" / "visible.txt"))
@@ -188,9 +188,9 @@ class TestRestore:
         console = second.console_
         assert "hello there" in out and "Done: hello there" in out and "second question" in out  # the screen
         assert "Session of" in out and "2 exchange(s)" in out
-        assert console.model == "other:1b" and second.created["switched_to"] == ("other:1b", 4096)
-        assert console.context.base_session_id == old_base and console.record.id == first.console_.record.id
-        assert "run_command" not in [t.__name__ for t in second.created["agent"].tool_list]
+        assert console.context.session_id == old_conversation and console.record.id == first.console_.record.id
+        assert "run_command" not in [t.__name__ for t in console.toolset.enabled()]
+        assert "no memory of this conversation" not in out
         assert console.tool_context.gate.auto_level == 2 and "auto-accept level 2" in out
         assert console.tool_context.todos.render() == "◐ step one"
         with pytest.raises(Exception):  # files read in the new session no longer count: the agent must read again
@@ -277,29 +277,25 @@ class TestRestore:
         session.run(lambda s: None)
         assert not session.settings.agent_sessions_dir.exists()
 
-    def test_a_missing_model_is_reported_and_the_current_one_kept(self, tmp_path):
-        first, _ = first_session(tmp_path)
-        store = first.console_.store
-        record = store.list()[0]
-        record.model = "gone:1b"
-        store.save(record)
-        second = Session(tmp_path, memory=True)
-
-        def driver(s):
-            s.send("/restore")
-            s.wait_output("gone:1b is not installed")
-
-        out = second.run(driver)
-        assert second.console_.model == "gemma4:test" and "keeping gemma4:test" in out
-
-    def test_the_agent_forgetting_the_conversation_is_pointed_out(self, tmp_path):
+    def test_the_server_forgetting_the_conversation_is_pointed_out(self, tmp_path):
         first_session(tmp_path)
         second = Session(tmp_path, memory=True)
-        second.created["agent"].get_chat_history = lambda **kwargs: []
+        second.clara.messages = 0  # the server has nothing left of it
 
         def driver(s):
             s.send("/restore")
-            s.wait_output("will not remember it")
+            s.wait_output("Clara will not remember it")
+
+        second.run(driver)
+
+    def test_an_unreachable_server_is_pointed_out_too(self, tmp_path):
+        first_session(tmp_path)
+        second = Session(tmp_path, memory=True)
+
+        def driver(s):
+            s.clara.down = True
+            s.send("/restore")
+            s.wait_output("could not be asked")
 
         second.run(driver)
 
@@ -308,7 +304,7 @@ class TestRestore:
         record = session.console_.store.new_record()
         record.turns = [turn(f"question {n}", f"answer {n}") for n in range(45)]
         record.model = "gemma4:test"
-        record.context = {"base": "console_session-x", "generation": 0, "summary": ""}
+        record.context = {"conversation": "console_session-x", "summary": ""}
         session.console_.store.save(record)
 
         def driver(s):
@@ -332,9 +328,11 @@ class TestRestore:
 
     def test_old_sessions_beyond_the_limit_are_dropped(self, tmp_path):
         session = Session(tmp_path, memory=True, AGENT_KEEP_SESSIONS="2")
+        conversations = []
 
         def driver(s):
             for number in range(3):
+                conversations.append(s.console_.context.session_id)
                 s.send(f"topic {number}")
                 s.wait_output(f"Done: topic {number}")
                 s.send("/clear")
@@ -344,3 +342,4 @@ class TestRestore:
         session.run(driver)
         kept = session.console_.store.list()
         assert [r.first_prompt for r in kept] == ["topic 2", "topic 1"]
+        assert session.clara.forgotten == [conversations[0]]  # the dropped session is erased from the server too

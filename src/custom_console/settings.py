@@ -51,10 +51,6 @@ def _int(env: Mapping[str, str], name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got {value!r}") from None
 
 
-def _optional_int(env: Mapping[str, str], name: str) -> Optional[int]:
-    return _int(env, name, 0) or None
-
-
 def _path(env: Mapping[str, str], name: str, default: Path) -> Path:
     value = _get(env, name)
     return Path(value).expanduser().resolve() if value else default.resolve()
@@ -70,20 +66,21 @@ class Settings:
     remarkable_sync_dir: Path
     wsl_distro: str
 
-    # Model providers / agent
+    # Local Ollama (the `ai list` / `ai start` commands; the agent itself talks to Clara)
     ollama_host: str
-    default_model: str  # with Ollama on this computer
-    agent_provider: str  # provider used until one is chosen with /provider (ollama, ollama-cloud, chatgpt)
-    ollama_cloud_host: str
-    ollama_cloud_default_model: str
-    openai_base_url: str
-    openai_default_model: str
+    default_model: str
+
+    # The Clara server: it runs the model, the memory and the conversations
+    clara_url: str
+    clara_token: Optional[str]  # chat token (CLARA_TOKENS on the server)
+    clara_admin_token: Optional[str]  # optional: lets /model and /provider reach the server's console
+    clara_user_name: Optional[str]  # how Clara should call you
+
+    # Agent
     agent_instructions_path: Path
     agent_permission_level: int
     agent_user_id: str
     agent_session_id: str
-    agent_num_ctx: Optional[int]  # context window requested from local models (None = automatic)
-    agent_compact_percent: int  # auto-compact when the context is this full (0 = never)
     agent_keep_sessions: int  # saved sessions kept per working directory (/restore)
     agent_project_file: str  # instructions file looked up in the agent's free zone
 
@@ -104,10 +101,6 @@ class Settings:
     @property
     def agent_dir(self) -> Path:
         return self.data_dir / "agent"
-
-    @property
-    def agent_db_path(self) -> Path:
-        return self.agent_dir / "memory.db"
 
     @property
     def agent_cache_path(self) -> Path:
@@ -132,10 +125,6 @@ class Settings:
     @property
     def agent_tools_path(self) -> Path:
         return self.agent_dir / "tools.json"
-
-    @property
-    def agent_provider_path(self) -> Path:
-        return self.agent_dir / "provider.json"
 
     @property
     def agent_checkpoints_dir(self) -> Path:
@@ -194,19 +183,16 @@ def load_settings(
         wsl_distro=_text(env, "WSL_DISTRO", "Ubuntu"),
         ollama_host=_text(env, "OLLAMA_HOST", "http://localhost:11434").rstrip("/"),
         default_model=_text(env, "AGENT_DEFAULT_MODEL", "gemma4"),
-        agent_provider=_text(env, "AGENT_PROVIDER", "ollama").lower(),
-        ollama_cloud_host=_text(env, "OLLAMA_CLOUD_HOST", "https://ollama.com").rstrip("/"),
-        ollama_cloud_default_model=_text(env, "OLLAMA_CLOUD_DEFAULT_MODEL", "gpt-oss:120b"),
-        openai_base_url=_text(env, "OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
-        openai_default_model=_text(env, "OPENAI_DEFAULT_MODEL", "gpt-5-mini"),
+        clara_url=_text(env, "CLARA_URL", "http://127.0.0.1:8765").rstrip("/"),
+        clara_token=_get(env, "CLARA_TOKEN"),
+        clara_admin_token=_get(env, "CLARA_ADMIN_TOKEN"),
+        clara_user_name=_get(env, "CLARA_USER_NAME"),
         agent_instructions_path=_path(
             env, "AGENT_INSTRUCTIONS_PATH", root / "config" / "agent_instructions.txt"
         ),
         agent_permission_level=_int(env, "AGENT_PERMISSION_LEVEL", 1),
         agent_user_id=_text(env, "AGENT_USER_ID", "default_user"),
         agent_session_id=_text(env, "AGENT_SESSION_ID", "console_session"),
-        agent_num_ctx=_optional_int(env, "AGENT_NUM_CTX"),
-        agent_compact_percent=_int(env, "AGENT_COMPACT_PERCENT", 80),
         agent_keep_sessions=max(1, _int(env, "AGENT_KEEP_SESSIONS", 5)),
         agent_project_file=_text(env, "AGENT_PROJECT_FILE", "AGENT.md"),
         moodle_enabled=_flag(env, "MOODLE_ENABLED", True),

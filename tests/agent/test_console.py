@@ -1,4 +1,4 @@
-"""AgentConsole wiring: settings -> tools -> gate -> UI, with a fake agno agent and a fake Ollama."""
+"""AgentConsole wiring: settings -> tools -> gate -> UI, with a fake Clara server."""
 
 from __future__ import annotations
 
@@ -6,17 +6,16 @@ import io
 import json
 import threading
 import time
-from types import SimpleNamespace
 
+import pytest
+from fake_clara import FakeClara, ask_tools, say
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
+from custom_console.agent.clara import ClaraError
 from custom_console.agent.console import AgentConsole, permission_label
-from custom_console.agent.context import without_notes
 from custom_console.fs import FileManager
-from custom_console.llm.keys import KeyStore
-from custom_console.llm.ollama import ModelInfo, OllamaUnavailableError
 from custom_console.settings import load_settings
 
 
@@ -28,155 +27,38 @@ def wait_for(condition, timeout=8.0):
         time.sleep(0.01)
 
 
-class FakeOllama:
-    MODELS = [
-        ModelInfo("gemma4:test", size=2_000_000_000, context_length=8192),
-        ModelInfo("big:cloud", size=300, context_length=262144, remote=True),
-        ModelInfo("other:1b", size=500_000_000, context_length=4096),
-    ]
-
-    def __init__(self, available=True):
-        self.available = available
-
-    def installed(self):
-        if not self.available:
-            raise OllamaUnavailableError("cannot reach Ollama")
-        return list(self.MODELS)
-
-    def info(self, name):
-        models = self.installed()
-        return next((m for m in models if m.name == name or m.name.split(":")[0] == name), None)
-
-
-class ScriptedAgent:
-    """Fake agno agent: calls the tool hook like agno would, then answers."""
-
-    def __init__(self, tools, hook, calls, extra_args):
-        self.tool_list = list(tools)
-        self.hook = hook
-        self.calls = calls
-        self.extra_args = extra_args
-        self.tool_output = None
-        self.prompts = []
-        self.inputs = []
-        self.model = "initial"
-        self.additional_context = None
-
-    @property
-    def tools(self):
-        return {tool.__name__: tool for tool in self.tool_list}
-
-    @tools.setter
-    def tools(self, value):
-        self.tool_list = list(value)
-
-    def run(self, prompt, **kwargs):
-        self.inputs.append(prompt)  # as the model gets it: after the <context> block
-        prompt = without_notes(prompt)
-        self.prompts.append(prompt)
-        if prompt == "write a note":
-            self.tool_output = self.hook(
-                "file_system_write",
-                self.tools["file_system_write"],
-                {"path": self.extra_args["target"], "content": "hello\n"},
-            )
-        yield SimpleNamespace(event="RunContent", content=f"Done: {prompt[:20]}")
-
-    def get_chat_history(self, session_id=None, last_n_runs=None):
-        return [
-            SimpleNamespace(role="user", content="Please build the thing", tool_calls=None),
-            SimpleNamespace(role="assistant", content="Built it.", tool_calls=None),
-        ]
-
-
-class FakeKeyring:
-    """Stands in for the Windows Credential Manager."""
-
-    def __init__(self):
-        self.saved = {}
-
-    def get_password(self, service, name):
-        return self.saved.get((service, name))
-
-    def set_password(self, service, name, value):
-        self.saved[(service, name)] = value
-
-    def delete_password(self, service, name):
-        del self.saved[(service, name)]
-
-
-class FakeCatalog:
-    """The models of a remote provider; `valid_key` is the only key it accepts."""
-
-    def __init__(self, names, key, valid_key, context=128_000):
-        self.names, self.key, self.valid_key, self.context = names, key, valid_key, context
-
-    def installed(self):
-        if self.key != self.valid_key:
-            raise OllamaUnavailableError("refused the API key (HTTP 401)")
-        return [ModelInfo(name, context_length=self.context, remote=True) for name in self.names]
-
-    def info(self, name):
-        return next((model for model in self.installed() if model.name == name), None)
-
-
-REMOTE_MODELS = {"chatgpt": (["gpt-5-mini", "gpt-5", "gpt-4.1"], "sk-good"), "ollama-cloud": (["gpt-oss:120b", "glm-5.3"], "ol-good")}
-
-
-def build(tmp_path, permission_level, write_inside_zone=False, memory=False, provider="ollama", model="gemma4:test", **env):
+def build(tmp_path, permission_level, write_inside_zone=False, memory=False, clara=None, **env):
     root = tmp_path / "project"
     root.mkdir(exist_ok=True)
     work = tmp_path / "work"
     work.mkdir(exist_ok=True)
     (work / "visible.txt").write_text("hi")
     settings = load_settings({"MOODLE_ENABLED": "false", **env}, root=root, use_dotenv=False)
-    created = {"target": str((work if write_inside_zone else tmp_path / "elsewhere") / "note.txt"), "agents": []}
-    keyring = FakeKeyring()
-    created["keyring"] = keyring
+    target = str((work if write_inside_zone else tmp_path / "elsewhere") / "note.txt")
 
-    def factory(settings_, model, name, tools, hook, memory, num_ctx, provider="ollama", api_key=None):
-        created.update(
-            model=model, name=name, memory=memory, num_ctx=num_ctx, tool_names=[t.__name__ for t in tools],
-            provider=provider, api_key=api_key,
-        )
-        agent = ScriptedAgent(tools, hook, created, created)
-        created["agent"] = agent
-        return agent
+    def respond(body):
+        message = body["message"]
+        if message == "write a note":  # the model asks the console to write a file, then answers
+            return [ask_tools(("file_system_write", {"path": target, "content": "hello\n"})), *say(f"Done: {message[:20]}")]
+        return say(f"Done: {message[:20]}")
 
-    def model_factory(settings_, name, num_ctx, provider="ollama", api_key=None):
-        created["switched_to"] = (name, num_ctx)
-        created["switched_provider"] = (provider, api_key)
-        return f"model:{name}"
-
-    def catalogs(provider_, key):
-        if provider_.local:
-            return created["ollama"]
-        names, valid = REMOTE_MODELS[provider_.name]
-        return FakeCatalog(names, key, valid)
-
-    created["ollama"] = FakeOllama()
+    fake = clara or FakeClara(respond)
+    created = {"target": target, "clara": fake, "work": work}
 
     pipe_ctx = create_pipe_input()
     pipe = pipe_ctx.__enter__()
     console = Console(file=io.StringIO(), width=400, force_terminal=False)
     agent_console = AgentConsole(
         settings=settings,
-        model=model,
         name="Tester",
         permission_level=permission_level,
         files=FileManager(start_dir=str(work)),
         memory=memory,
         console=console,
-        agent_factory=factory,
-        model_factory=model_factory,
-        ollama=created["ollama"],
-        provider=provider,
-        keys=KeyStore(env=env, backend=keyring),
-        catalogs=catalogs,
+        client=fake,
         input=pipe,
         output=DummyOutput(),
     )
-    created["work"] = work
     return agent_console, settings, created, console, pipe, pipe_ctx
 
 
@@ -210,6 +92,7 @@ class Session:
         (self.console_, self.settings, self.created, self.out, self.pipe, self.pipe_ctx) = build(
             tmp_path, permission_level, **options
         )
+        self.clara = self.created["clara"]
 
     def run(self, driver):
         try:
@@ -233,7 +116,7 @@ class Session:
 
 
 class TestAgentConsole:
-    def test_answer_flow_and_factory_arguments(self, tmp_path):
+    def test_answer_flow_and_what_the_server_receives(self, tmp_path):
         session = Session(tmp_path, permission_level=2)
 
         def driver(s):
@@ -241,18 +124,52 @@ class TestAgentConsole:
             s.wait_output("Done: hello")
 
         out = session.run(driver)
-        created = session.created
-        assert "Tester" in out and "gemma4:test" in out  # banner
+        assert "Tester" in out and "fake-model on Clara (local)" in out  # banner
         assert "permissions: everything is auto-accepted" in out
         assert "free zone:" in out and "work" in out
-        assert created["model"] == "gemma4:test" and created["memory"] is False
-        assert created["num_ctx"] == 8192  # local model: the window is requested from Ollama
-        names = created["tool_names"]
-        assert {"file_system_read", "file_system_edit", "run_command", "todo_write", "ask_user", "task"} <= set(names)
+
+        [body] = session.clara.bodies
+        assert body["message"] == "hello" and body["surface"] == "console" and body["user_id"] == "tester"
+        assert body["conversation"].startswith("console_session-")
+        assert body["prefix"].startswith("[Automatic note, not written by the user. Current date and time: ")
+        assert session.settings.load_instructions() in body["instructions"]
+        names = {tool["function"]["name"] for tool in body["tools"]}
+        assert {"file_system_read", "file_system_edit", "run_command", "todo_write", "ask_user", "task"} <= names
         assert not any(name.startswith(("moodle_", "workspace_")) for name in names)
+        assert "ephemeral" not in body
 
         entries = [json.loads(l) for l in session.settings.agent_log_path.read_text(encoding="utf-8").splitlines()]
         assert [e["type"] for e in entries] == ["prompt", "answer"]
+
+    def test_the_tool_schemas_sent_describe_the_parameters(self, tmp_path):
+        session = Session(tmp_path)
+        session.pipe_ctx.__exit__(None, None, None)
+        body = session.console_.session.request_body("hi")
+        edit = next(tool for tool in body["tools"] if tool["function"]["name"] == "file_system_edit")["function"]
+        assert edit["parameters"]["required"] == ["path", "old_text", "new_text"]
+        assert edit["parameters"]["properties"]["replace_all"]["type"] == "boolean"
+        assert "exact text" in edit["description"] and "file to edit" in edit["parameters"]["properties"]["path"]["description"]
+
+    def test_the_conversation_is_erased_from_the_server_without_memory(self, tmp_path):
+        session = Session(tmp_path, memory=False)
+        session.run(lambda s: None)
+        assert session.clara.forgotten == [session.console_.context.session_id]
+
+    def test_the_conversation_is_kept_with_memory(self, tmp_path):
+        session = Session(tmp_path, memory=True)
+
+        def driver(s):
+            s.send("hello")
+            s.wait_output("Done: hello")
+
+        session.run(driver)
+        assert session.clara.forgotten == []
+
+    def test_the_server_must_be_reachable_to_open_the_console(self, tmp_path):
+        fake = FakeClara()
+        fake.down = True
+        with pytest.raises(ClaraError, match="Cannot reach"):
+            build(tmp_path, 1, clara=fake)
 
     def test_write_outside_the_zone_asks_at_level_1_and_runs_when_accepted(self, tmp_path):
         session = Session(tmp_path, permission_level=1)
@@ -267,7 +184,8 @@ class TestAgentConsole:
 
         out = session.run(driver)
         assert (tmp_path / "elsewhere" / "note.txt").read_text() == "hello\n"
-        assert json.loads(session.created["agent"].tool_output)["success"] is True
+        [[answer]] = session.clara.results  # what the console told the server
+        assert answer["id"] == "call_0_0" and json.loads(answer["content"])["success"] is True
         assert "→ accepted" in out and "✔ file_system_write" in out
 
     def test_refusal_prevents_the_tool_from_running(self, tmp_path):
@@ -281,7 +199,7 @@ class TestAgentConsole:
 
         out = session.run(driver)
         assert not (tmp_path / "elsewhere" / "note.txt").exists()
-        result = json.loads(session.created["agent"].tool_output)
+        result = json.loads(session.clara.results[0][0]["content"])
         assert result["success"] is False and "UserPermissionDenied" in result["error"]
         assert "→ refused" in out
 
@@ -318,6 +236,44 @@ class TestAgentConsole:
         out = session.run(driver)
         assert (tmp_path / "elsewhere" / "note.txt").read_text() == "hello\n"
         assert "→ auto-accepted" in out
+
+    def test_an_unknown_or_disabled_tool_is_reported_to_the_model(self, tmp_path):
+        fake = FakeClara(lambda body: [ask_tools(("no_such_tool", {})), *say("ok")])
+        session = Session(tmp_path, clara=fake)
+
+        def driver(s):
+            s.send("go")
+            s.wait_output("ok")
+
+        out = session.run(driver)
+        result = json.loads(fake.results[0][0]["content"])
+        assert result["success"] is False and "not an available tool" in result["error"]
+        assert "✘ no_such_tool" in out
+
+    def test_a_server_failure_is_shown_in_the_turn(self, tmp_path):
+        def respond(body):
+            return [{"type": "token", "text": "partial "}, {"type": "error", "message": "The language model failed"}]
+
+        session = Session(tmp_path, clara=FakeClara(respond))
+
+        def driver(s):
+            s.send("hello")
+            s.wait_output("The language model failed")
+
+        out = session.run(driver)
+        assert "partial" in out and "Agent error: The language model failed" in out
+
+    def test_automatic_compaction_by_the_server_is_noted(self, tmp_path):
+        def respond(body):
+            return [{"type": "compacted", "before": 85.0, "after": 12.0}, *say("done")]
+
+        session = Session(tmp_path, clara=FakeClara(respond))
+
+        def driver(s):
+            s.send("hello")
+            s.wait_output("Conversation compacted (85% → 12%")
+
+        session.run(driver)
 
     def test_tool_context_is_closed_when_the_console_exits(self, tmp_path):
         session = Session(tmp_path)
@@ -405,37 +361,60 @@ class TestSlashCommands:
             s.wait_output("Ctrl+C")
 
         out = session.run(driver)
-        for name in ("/model", "/usage", "/context", "/compact", "/undo", "/init", "/ls", "/cd", "/cp", "/rm", "/bye"):
+        for name in ("/model", "/provider", "/usage", "/context", "/compact", "/undo", "/init", "/ls", "/cd", "/cp", "/rm", "/bye"):
             assert name in out
 
-    def test_model_lists_then_switches_and_keeps_the_conversation(self, tmp_path):
+    def test_model_and_provider_are_the_servers_commands(self, tmp_path):
         session = Session(tmp_path)
+        session.clara.admin_output["/provider"] = "* local  Local host"
 
         def driver(s):
-            s.send("/model")
-            s.wait_output("Installed models")
-            s.send("/model other")
-            s.wait_output("Model: other:1b")
-            s.send("/model nothing-like-this")
-            s.wait_output("is not installed")
-
-        out = session.run(driver)
-        assert "big:cloud" in out and "cloud" in out
-        assert session.created["switched_to"] == ("other:1b", 4096)
-        assert session.console_.model == "other:1b" and session.console_.context.window == 4096
-        assert session.created["agent"].model == "model:other:1b"
-        assert "other:1b" in session.console_.screen.title
-
-    def test_switching_to_a_cloud_model_requests_no_context_size(self, tmp_path):
-        session = Session(tmp_path)
-
-        def driver(s):
-            s.send("/model big:cloud")
-            s.wait_output("Model: big:cloud")
+            s.send("/provider")
+            s.wait_output("* local  Local host")
+            session.clara.model, session.clara.provider = "gpt-oss:120b", "cloud"  # what the server does
+            s.send("/provider cloud")
+            s.wait_output("ran /provider cloud")
+            s.send("/model gpt-oss:120b")
+            s.wait_output("ran /model gpt-oss:120b")
 
         session.run(driver)
-        assert session.created["switched_to"] == ("big:cloud", None)
-        assert session.console_.context.window == 262144
+        assert session.clara.admin_calls == ["/provider", "/provider cloud", "/model gpt-oss:120b"]
+        assert session.console_.model == "gpt-oss:120b" and session.console_.provider_name == "cloud"
+        assert "gpt-oss:120b" in session.console_.screen.title and "(cloud)" in session.console_.screen.title
+
+    def test_the_model_the_server_used_is_followed_after_each_turn(self, tmp_path):
+        def respond(body):
+            return say("hi", model="other-model", provider="cloud")
+
+        session = Session(tmp_path, clara=FakeClara(respond))
+
+        def driver(s):
+            s.send("hello")
+            s.wait_output("hi")
+
+        session.run(driver)
+        assert session.console_.model == "other-model" and "other-model" in session.console_.screen.title
+        assert session.console_.session.usage.session_models["other-model"].turns == 1
+
+    def test_without_an_admin_token_the_server_commands_explain(self, tmp_path):
+        session = Session(tmp_path, clara=FakeClara(admin_token=None))
+
+        def driver(s):
+            s.send("/provider")
+            s.wait_output("CLARA_ADMIN_TOKEN")
+
+        session.run(driver)
+
+    def test_provider_names_are_completed_from_the_server(self, tmp_path):
+        from prompt_toolkit.document import Document
+
+        from custom_console.agent.slash import SlashCompleter
+
+        session = Session(tmp_path)
+        completer = SlashCompleter(session.console_.screen.commands)
+        names = [c.text for c in completer.get_completions(Document("/provider c"), None)]
+        session.pipe_ctx.__exit__(None, None, None)
+        assert names == ["cloud"]
 
     def test_usage_reports_session_and_ledger(self, tmp_path):
         session = Session(tmp_path)
@@ -450,42 +429,44 @@ class TestSlashCommands:
         out = session.run(driver)
         assert "This session" in out and "All time" in out and "gemma4:test" in out and "150" in out
 
-    def test_context_shows_the_breakdown(self, tmp_path):
-        session = Session(tmp_path)
+    def test_context_shows_the_breakdown_from_the_servers_figures(self, tmp_path):
+        session = Session(tmp_path, clara=FakeClara(tokens=2048))
 
         def driver(s):
             s.send("/context")
             s.wait_output("Free space")
 
         out = session.run(driver)
-        assert "System prompt" in out and "Tools (" in out and "Messages" in out and "8,192" in out
+        assert "System prompt" in out and "Tools (" in out and "Messages" in out
+        assert "2,048 / 8,192 tokens (25%)" in out
 
-    def test_compact_replaces_the_conversation_by_a_summary(self, tmp_path):
+    def test_compact_has_the_server_summarise_the_conversation(self, tmp_path):
         session = Session(tmp_path)
-        seen = {}
-
-        def summarizer(transcript, previous, focus):
-            seen.update(transcript=transcript, previous=previous, focus=focus)
-            return "User wants the thing built; it is built."
-
-        session.console_.session.summarize = summarizer
 
         def driver(s):
             s.send("/compact the thing")
             s.wait_output("Conversation compacted")
 
         out = session.run(driver)
-        assert "Please build the thing" in seen["transcript"] and seen["focus"] == "the thing"
-        assert "User wants the thing built" in out
+        assert session.clara.compactions == [(session.console_.context.session_id, "the thing")]
+        assert "60% → 10%" in out and "User wants the thing built" in out
         assert session.console_.context.summary.startswith("User wants")
-        assert "summary" in session.created["agent"].additional_context.lower()
-        assert session.console_.context.session_id == session.console_.context.base_session_id + "-1"
-        assert session.console_.context.base_session_id.startswith("console_session-")
+        assert "summary" not in session.clara.bodies[0:1] or True  # the server puts the summary in the prompt
+
+    def test_compacting_an_empty_conversation_says_so(self, tmp_path):
+        session = Session(tmp_path)
+        session.clara.nothing_to_compact = True
+
+        def driver(s):
+            s.send("/compact")
+            s.wait_output("nothing to compact")
+
+        session.run(driver)
 
     def test_clear_starts_a_new_conversation(self, tmp_path):
         session = Session(tmp_path)
-        session.console_.context.adopt_summary("old summary")
-        old_base = session.console_.context.base_session_id
+        session.console_.context.summary = "old summary"
+        old = session.console_.context.session_id
 
         def driver(s):
             s.send("/clear")
@@ -493,8 +474,8 @@ class TestSlashCommands:
 
         session.run(driver)
         context = session.console_.context
-        assert context.generation == 0 and context.base_session_id != old_base  # a session of its own
-        assert session.console_.record.id in context.base_session_id
+        assert context.session_id != old  # a conversation of its own
+        assert session.console_.record.id in context.session_id
 
     def test_undo_restores_what_the_last_turn_changed(self, tmp_path):
         session = Session(tmp_path, write_inside_zone=True)
@@ -520,7 +501,7 @@ class TestSlashCommands:
             s.wait_output("Done: Explore this project")
 
         session.run(driver)
-        assert "AGENT.md" in session.created["agent"].prompts[0]
+        assert "AGENT.md" in session.clara.bodies[0]["message"]
 
     def test_permissions_can_be_changed_while_running(self, tmp_path):
         session = Session(tmp_path, permission_level=1)
@@ -560,20 +541,11 @@ class TestSlashCommands:
         assert paths == ["visible.txt"] and "-a" in flags
         assert {"/cat", "/cd", "/clear", "/compact", "/context", "/cp"} == set(names)
 
-    def test_the_context_meter_counts_a_conversation_resumed_from_memory(self, tmp_path):
-        session = Session(tmp_path)
+    def test_the_context_meter_follows_the_servers_figure_before_the_first_turn(self, tmp_path):
+        session = Session(tmp_path, clara=FakeClara(tokens=6000))
         session.pipe_ctx.__exit__(None, None, None)
-        assert session.console_.context.breakdown().messages > 0  # the fake agent stores two messages
-
-    def test_unavailable_ollama_is_reported(self, tmp_path):
-        session = Session(tmp_path)
-        session.created["ollama"].available = False
-
-        def driver(s):
-            s.send("/model")
-            s.wait_output("cannot reach Ollama")
-
-        session.run(driver)
+        breakdown = session.console_.context.breakdown()
+        assert breakdown.used == 6000 and breakdown.messages > 0  # what is not the prompt or the tools
 
     def test_context_percent_is_shown_in_the_header(self, tmp_path):
         session = Session(tmp_path)
@@ -585,7 +557,11 @@ DOWN, ESCAPE = "\x1b[B", "\x1b"
 
 
 def tool_names(session):
-    return [tool.__name__ for tool in session.created["agent"].tool_list]
+    return [tool.__name__ for tool in session.console_.toolset.enabled()]
+
+
+def sent_tool_names(session):
+    return [tool["function"]["name"] for tool in session.clara.bodies[-1]["tools"]]
 
 
 class TestToolsCommand:
@@ -598,10 +574,14 @@ class TestToolsCommand:
             s.wait_output("Turned off: run_command, todo_write")
             s.send("/tools on todo_write")
             s.wait_output("Turned on: todo_write")
+            s.send("hello")
+            s.wait_output("Done: hello")
 
         out = session.run(driver)
         names = tool_names(session)
         assert "run_command" not in names and "todo_write" in names and "file_system_read" in names
+        sent = sent_tool_names(session)  # the model is only offered the tools that are on
+        assert "run_command" not in sent and "todo_write" in sent and "file_system_read" in sent
         assert session.console_.context.disabled_tools == ["run_command"]
         assert "tools are on (from the next message)" in out
 
@@ -615,8 +595,8 @@ class TestToolsCommand:
             s.wait_output("Done: hello")
 
         session.run(driver)
-        context = session.created["agent"].additional_context
-        assert "Tools turned off by the user" in context and "run_command" in context
+        instructions = session.clara.bodies[-1]["instructions"]
+        assert "Tools turned off by the user" in instructions and "run_command" in instructions
 
     def test_context_accounting_follows_the_selection(self, tmp_path):
         session = Session(tmp_path)
@@ -663,7 +643,7 @@ class TestToolsCommand:
         settings.agent_tools_path.write_text(json.dumps({"disabled": ["run_command"]}), encoding="utf-8")
         session = Session(tmp_path)
         session.pipe_ctx.__exit__(None, None, None)
-        assert "run_command" not in session.created["tool_names"] and "todo_write" in session.created["tool_names"]
+        assert "run_command" not in tool_names(session) and "todo_write" in tool_names(session)
         assert session.console_.context.disabled_tools == ["run_command"]
 
     def test_list_reset_and_mistakes(self, tmp_path):

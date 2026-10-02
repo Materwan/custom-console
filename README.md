@@ -1,8 +1,9 @@
 # Custom Console
 
 A custom Windows terminal with its own commands, a virtual file system that spans
-your disks, WSL and a reMarkable tablet, and a personal AI agent (Ollama + agno)
-that can explore and edit your projects.
+your disks, WSL and a reMarkable tablet, and a personal AI agent that can explore and edit your projects. The agent is a terminal client
+of the **Clara server** (the model, the memory and the conversations live there); its tools
+run on this computer.
 
 - **Shell**: `cd ls tree cat stat find cp rm pwd echo clear launch reload help ai exit`,
   tab completion generated from each command's definition, colored output.
@@ -36,14 +37,16 @@ project root (see `.env.example`; empty values mean "use the default").
 | Variable | Default | Meaning |
 |---|---|---|
 | `RMAPI_PATH` | – | Path to `rmapi.exe`; enables the reMarkable backend |
-| `DATA_DIR` | `<project>/data` | Logs, agent memory, usage ledger, checkpoints, caches |
+| `DATA_DIR` | `<project>/data` | Logs, saved sessions, usage ledger, checkpoints, caches |
 | `WSL_DISTRO` | `Ubuntu` | Distribution exposed as `/wsl-<name>/` |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server |
-| `AGENT_DEFAULT_MODEL` | `gemma4` | Model used by `ai agent` / `ai start` |
+| `CLARA_URL` | `http://127.0.0.1:8765` | The Clara server the agent talks to |
+| `CLARA_TOKEN` | – | Your chat token on that server (`CLARA_TOKENS` there). Required by `ai agent` |
+| `CLARA_ADMIN_TOKEN` | – | Optional: lets `/model` and `/provider` run in the server's console |
+| `CLARA_USER_NAME` | – | How Clara should call you |
+| `OLLAMA_HOST` | `http://localhost:11434` | The local Ollama of `ai list` / `ai start` (not used by the agent) |
+| `AGENT_DEFAULT_MODEL` | `gemma4` | Model `ai start` loads when none is given |
 | `AGENT_PERMISSION_LEVEL` | `1` | Tools auto-accepted by the agent (see below) |
 | `AGENT_INSTRUCTIONS_PATH` | `config/agent_instructions.txt` | The agent's system prompt |
-| `AGENT_NUM_CTX` | automatic | Context window requested from local models (default: the model's maximum, at most 32768) |
-| `AGENT_COMPACT_PERCENT` | `80` | Compact the conversation automatically when the context is this full (`0` = never) |
 | `AGENT_PROJECT_FILE` | `AGENT.md` | Project instructions file looked up in the free zone |
 | `MOODLE_ENABLED` / `MOODLE_BASE_URL` / `MOODLE_STATE_PATH` | `true` / EPITA / `config/cookies/moodle_state.json` | Moodle tools |
 | `SMTP_HOST` `SMTP_PORT` `SMTP_USER` `SMTP_PASSWORD` `SMTP_FROM` | – | The e-mail tool exists only when `SMTP_HOST` is set |
@@ -96,38 +99,30 @@ recursive search; `-sl 1..4` limits the stages) and remembers where it found it.
 ## The AI agent
 
 ```
-ai list [-P PROVIDER] [-r] [-s] [-c]   models of a provider (default: the local Ollama), sizes, capabilities
+ai list [-r] [-s] [-c]                models of the local Ollama, sizes, capabilities
 ai start [model]                      load a local model in memory
-ai agent [-n NAME] [-P PROVIDER] [-m MODEL] [-p 0|1|2] [-d DIR] [--no-memory]
+ai agent [-n NAME] [-p 0|1|2] [-d DIR] [--no-memory]
 ```
 
-### Providers
+### The Clara server
 
-The agent can run on three **providers**:
+The agent does not run a model itself. It is a **client of the Clara server**, which runs the
+model, keeps the memory (what Clara knows about you, the same on every client) and the
+conversations, and compacts them when they grow too long. Set `CLARA_URL` and `CLARA_TOKEN`
+in `.env`; `ai agent` refuses to open when the server cannot be reached.
 
-| Name | Provider | API key |
-|---|---|---|
-| `ollama` | Ollama on this computer (`OLLAMA_HOST`) | none |
-| `ollama-cloud` | Ollama's API on ollama.com: its large models, without a local Ollama | `OLLAMA_API_KEY` ([get one](https://ollama.com/settings/keys)) |
-| `chatgpt` | ChatGPT through the OpenAI API (`OPENAI_BASE_URL`: any OpenAI-compatible server works too) | `OPENAI_API_KEY` ([get one](https://platform.openai.com/api-keys)); billed per token, apart from a ChatGPT subscription |
+The tools stay here. For each message the console sends the server the tools it offers
+(their names, descriptions and parameters, generated from the Python functions), the agent's
+instructions (`AGENT_INSTRUCTIONS_PATH`, the project file, the tools you turned off) and a
+short note (date, files that changed). When the model wants a tool, the server asks the
+console to run it, the console runs it on this computer after the usual permission question,
+and the answer goes back on the same stream. So files, shell, PDF, Moodle and mail never leave
+this machine, and the permissions, the free zone and `/undo` work exactly as before.
 
-In the agent, `/provider` lists them (current one, where each key comes from, last model
-used) and `/provider chatgpt` switches: if no key is known it is asked in the input line
-(typed masked, never kept in the input history), checked by listing the provider's models,
-then saved in the **Windows Credential Manager** (`keyring`); a key set in `.env` takes
-priority over a saved one. A menu of the provider's models follows (`↑`/`↓`, `PgUp`/`PgDn`,
-`Enter`), starting on the model you last used there. The conversation is kept; when it holds
-tool calls made through Ollama and you move to ChatGPT, it is first summarised (as `/compact`
-does), because OpenAI cannot replay them. `/provider forget chatgpt` deletes a saved key.
-Aliases: `local`, `cloud`, `openai`, `gpt`.
-
-The last provider and the last model used with each one are remembered
-(`<DATA_DIR>/agent/provider.json`): `ai agent` starts with them, `-P`/`-m` override them, and
-`AGENT_PROVIDER` is the default before anything was chosen. `/model` lists and switches the
-models of the current provider; a saved session (`/restore`) brings its provider back when
-its key is available. Sub-agents and `/compact` use the current provider. The OpenAI model
-list comes from the API (chat models only, dated snapshots hidden but accepted by name);
-their context windows come from a built-in table (128k when unknown).
+Which model runs, and where (Ollama on the server's computer, or ollama.com with an API
+key), is the server's business: `/provider` and `/model` run **the server's own commands**,
+and need `CLARA_ADMIN_TOKEN` (the server's remote-admin token). The header and `/usage`
+follow whatever model the server used for each turn.
 
 ### Terminal behaviour
 
@@ -176,11 +171,11 @@ Typing `/` lists them above the input, with what they do.
 
 | Command | What it does |
 |---|---|
-| `/model [NAME]` | list the current provider's models, or switch to one (Tab completes; the conversation is kept) |
-| `/provider [NAME \| forget NAME]` | list the providers, or switch to one (`ollama`, `ollama-cloud`, `chatgpt`; see above) |
+| `/model [NAME]` | the server's `/model`: list the models of its provider, or switch (needs `CLARA_ADMIN_TOKEN`) |
+| `/provider [local\|cloud]` | the server's `/provider`: show where it runs the model, or switch (needs `CLARA_ADMIN_TOKEN`) |
 | `/usage` | tokens used by this session, today, the last 7 days and in total, per model |
 | `/context` | how full the context window is: system prompt, tools, project file, summary, messages |
-| `/compact [FOCUS]` | replace the conversation by a summary written by the model |
+| `/compact [FOCUS]` | have the server replace the older messages by a summary written by the model |
 | `/clear` | new conversation (context, checklist), kept as a session of its own, and clear the screen |
 | `/restore [list\|N]` | bring back a previous session of this folder (see below) |
 | `/undo` | undo the file changes the agent made during its last turn (repeat to go further back) |
@@ -234,8 +229,8 @@ above the input (with the diff, for file changes) and you answer in the input li
 - `ask_user` – a question to you with options (one or several to pick, each with a
   description) and, if the agent allows it, an answer of your own.
 - `task` – hands a self-contained job (exploring a folder, finding where something is done,
-  summarising long files) to a **sub-agent**: a fresh agent on the same model that does not
-  see the conversation, works with the **read-only** tools (all tools with
+  summarising long files) to a **sub-agent**: a one-shot job the server runs on the same model
+  (no conversation, no memory), works with the **read-only** tools (all tools with
   `allow_writes=true`, each still asking its permission) and returns only its report, which
   keeps the main context small. Its tool calls are listed under the `task` line and its
   tokens count in the turn and in `/usage`. Sub-agents run one at a time and cannot start
@@ -287,39 +282,40 @@ Previous session: “fix the parser” · 2 h ago · 12 exchange(s) — /restore
 | `/restore 3` | that session of the list (Tab completes the numbers) |
 
 Restoring redraws the questions and answers (tool lines and diffs included; the last 40
-exchanges at most) and brings back what the session had: the **agent's own memory** of the
-conversation and its compaction summary, the **model**, the **tools** that were on (the
+exchanges at most) and brings back what the session had: the **conversation on the server**
+(and its compaction summary), the **tools** that were on (the
 `/tools` default for new sessions is left alone), the **auto-accept level** and the
 **checklist**. The restored session then continues where it stopped. Not restored: undo
 snapshots, and the list of files already read (the agent must read a file again before
-editing it). If the saved model is not installed any more, the current one is kept and you
-are told. The last 5 sessions per folder are kept (`AGENT_KEEP_SESSIONS`); the others are
-deleted, with the agent's memory of them. `ai agent --no-memory` saves nothing, so there is
+editing it). If the server no longer has the conversation, you are told: you can read it, but
+Clara will not remember it. The last 5 sessions per folder are kept (`AGENT_KEEP_SESSIONS`);
+the others are deleted, from the server too. `ai agent --no-memory` saves nothing, so there is
 nothing to restore.
 
 ### Context, memory and undo
 
-- **Window**: local models are asked for a context of `AGENT_NUM_CTX` tokens (by default the
-  model's maximum, capped at 32768: Ollama's own default is much smaller, and the agent's
-  tool definitions alone take about 3000 tokens). Models served by ollama.com use their
-  own window. The header shows `ctx 12% of 32k`; `/context` shows the breakdown.
-- **Compaction**: at `AGENT_COMPACT_PERCENT` the conversation is summarised by the model
-  and continues in a fresh session that starts from that summary (`/compact` does it on
-  demand, `/clear` drops everything).
+- **Window**: the server knows the model's context window and reports how full the
+  conversation is after each turn. The header shows `ctx 12% of 32k`; `/context` shows the
+  breakdown (the system prompt and the tools are estimates, the total is the server's figure).
+- **Compaction**: the **server** summarises the older messages when the context is nearly full
+  (`CLARA_COMPACT_PERCENT` there, 80 by default) and says so in the turn; `/compact [FOCUS]`
+  does it on demand, `/clear` starts a new conversation.
 - **Date, time and changed files**: each message reaches the model after a short note
   (`[Automatic note, not written by the user. Current date and time: 2026-10-01 14:32
   (Thursday, UTC+02:00).]`). When files the agent read (whole or in part) were changed since,
   by you or another program, the note lists them and tells it that what it read is outdated,
   so it reads them again before answering about them; reading a file again takes it off the
   list. The note goes before your message rather than into the system prompt so that the
-  model's prompt cache is kept from one turn to the next, and it is left out of what you
-  see, of the saved sessions and of the compaction summaries.
+  model's prompt cache is kept from one turn to the next (it is sent as the message's
+  `prefix`), and it is left out of what you see, of the saved sessions and of the
+  compaction summaries.
 - **Project instructions**: if `AGENT.md` exists at the root of the free zone it is added
   to the agent's context on every turn (read fresh, first 8000 characters); `/init` has
   the agent write it.
-- **Memory**: the conversation and the agent's long-term memories are kept in
-  `<DATA_DIR>/agent/memory.db`, one session per conversation (see `/restore`). With `--no-memory` the conversation only lives in memory
-  for this run and nothing is stored, except the usage ledger and the `/tools` choice.
+- **Memory**: the conversation lives on the Clara server, one conversation per session (see
+  `/restore`), next to what Clara knows about you. With `--no-memory` nothing is saved here
+  and the conversation is erased from the server when the console closes; only the usage
+  ledger and the `/tools` choice remain.
 - **Undo**: before each file change the previous content is saved (up to 100 MB per file
   or folder; bigger ones are refused) under `<DATA_DIR>/agent/checkpoints/` (kept 7 days).
   `/undo` reverts a whole turn. Changes made by `run_command` are not tracked.
@@ -344,15 +340,17 @@ src/custom_console/
                                  rmdoc.py (.rmdoc -> PDF)
   shell/                         REPL, completer, tokenizer, printer, commands/
   apps/                          application finder and launcher
-  llm/                           Ollama client, providers (Ollama, ollama.com, ChatGPT), API keys
+  llm/                           Ollama client (`ai list`, `ai start`)
   agent/
     ui.py  render.py  turn.py    terminal UI (what is final printed as Markdown as it comes), turn model
     transcript.py                full-screen transcript viewer (Ctrl+T), foldable tool lines
     questions.py                 ask_user's options and answers
-    slash.py  commands.py        slash commands: registry, completion, /model /usage /undo...
-    session.py  factory.py       agno wiring: streaming, tool hook, journal, usage
-    subagent.py                  sub-agents run by the `task` tool
-    context.py  usage.py         context window accounting and compaction, token ledger
+    slash.py  commands.py        slash commands: registry, completion, /compact /usage /undo...
+    clara.py  remote.py          the Clara server: HTTP client, and a turn with tools run here
+    schema.py                    the JSON description of each tool, from its signature
+    session.py                   a turn: streaming, tool hook, journal, usage
+    subagent.py                  sub-agents run by the `task` tool (ephemeral jobs on the server)
+    context.py  usage.py         context accounting, project file, token ledger
     zone.py  checkpoints.py      the free zone, undo snapshots
     toolset.py                   which tools are on (/tools), saved in tools.json
     sessions.py                  saved sessions per folder (/restore)
@@ -370,5 +368,5 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The file system layer and the agent UI are tested without a real tablet, Ollama or
+The file system layer and the agent UI are tested without a real tablet, Clara server or
 terminal (`rmapi` is mocked; the UI is driven through prompt_toolkit's pipe input).

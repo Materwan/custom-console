@@ -19,3 +19,4 @@ dist/
 .vscode/
 *.rmdoc
 *.ico
+*.ini

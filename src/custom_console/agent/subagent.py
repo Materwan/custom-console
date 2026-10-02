@@ -1,22 +1,25 @@
 """Sub-agents: what the `task` tool runs.
 
-A sub-agent is a fresh agno agent on the same model. It does not see the
-conversation: it gets the job's prompt, works with its own tools (the
-read-only ones unless writes are allowed) and hands back its final answer
-only, which keeps the main conversation's context small.
+A sub-agent is a one-shot job given to the Clara server: an *ephemeral* turn on the same model.
+It does not see the conversation (nor Clara's memory): it gets the job's prompt, works with its
+own tools (the read-only ones unless writes are allowed) and hands back its final answer only,
+which keeps the main conversation's context small.
 
-It runs inside the `task` call, in the agent's worker thread. Its tool calls
-are listed under the `task` line of the turn, its tokens count in the turn's
-total, and the permission questions of its tools are asked as usual.
+It runs inside the `task` call, in the agent's worker thread. Its tool calls are listed under
+the `task` line of the turn, its tokens count in the turn's total, and the permission questions
+of its tools are asked as usual.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, List, Optional
+import uuid
+from typing import Any, Callable, Dict, List, Optional
 
+from .clara import ClaraError
 from .context import describe_now
 from .permissions import PermissionLevel
+from .remote import run_remote_turn
 from .results import ToolResult
 from .session import AgentSession, tool_display
 from .turn import TurnStats, format_arguments
@@ -52,25 +55,20 @@ def subagent_tools(tools: List[Tool], allow_writes: bool) -> List[Tool]:
 class SubAgents:
     """Runs the sub-agents of a session.
 
-    `tools()` gives the tools the main agent has now (those turned off with
-    ``/tools`` stay off); `build(tools, tool_hook, instructions)` makes the agno agent.
+    `tools()` gives the tools the main agent has now (those turned off with ``/tools`` stay off).
     """
 
     def __init__(
         self,
         session: AgentSession,
         tools: Callable[[], List[Tool]],
-        build: Callable[[List[Tool], Callable[..., str], str], Any],
         location: Callable[[], str] = lambda: "",
     ) -> None:
         self.session = session
         self.tools = tools
-        self.build = build
         self.location = location
 
     def run(self, description: str, prompt: str, allow_writes: bool = False) -> ToolResult:
-        from agno.run.agent import RunEvent, RunOutput
-
         session = self.session
         view, parent = session.view, session.current_tool
         lines: List[str] = []
@@ -84,13 +82,19 @@ class SubAgents:
             if view is not None:
                 view.activity = f"{description} · {what}"
 
-        def tool_hook(function_name: str, function_call: Callable[..., Any], arguments: dict) -> str:
+        chosen = subagent_tools(self.tools(), allow_writes)
+        by_name = {tool.__name__: tool for tool in chosen}
+
+        def execute(function_name: str, arguments: Dict[str, Any]) -> str:
             if session.cancelled:
                 return ToolResult.fail(RuntimeError("Interrupted by the user.")).to_llm()
             activity(f"running {function_name}")
             started = time.monotonic()
+            function = by_name.get(function_name)
             try:
-                outcome = function_call(**arguments)
+                if function is None:
+                    raise LookupError(f"{function_name} is not an available tool.")
+                outcome = function(**arguments)
             except Exception as error:  # a tool must never break the agent loop
                 outcome = ToolResult.fail(error)
             duration = time.monotonic() - started
@@ -117,34 +121,41 @@ class SubAgents:
             f"{INSTRUCTIONS}Current date and time: {describe_now(session.clock())}\n"
             f"Working directory: {self.location()}"
         )
-        agent = self.build(subagent_tools(self.tools(), allow_writes), tool_hook, instructions)
-        activity("thinking")
+        body = session.remote.client.body(  # type: ignore[union-attr]
+            prompt,
+            f"sub-{uuid.uuid4().hex}",
+            ephemeral=True,
+            instructions=instructions,
+            tools=session.remote.schemas(chosen),  # type: ignore[union-attr]
+        )
         answer: List[str] = []
-        run_output: Optional[Any] = None
+
+        def on_text(chunk: str) -> None:
+            answer.append(chunk)
+            if view is not None:
+                view.count_chunk()  # generated, but not shown: only the final report goes back
+
+        def on_usage(prompt_tokens: int, completion_tokens: int) -> None:
+            if view is not None:
+                view.request_finished(completion_tokens)
+
+        activity("thinking")
+        done: Optional[Dict[str, Any]] = None
         started = time.perf_counter()
         try:
-            for chunk in agent.run(prompt, stream=True, stream_events=True, yield_run_output=True):
-                if session.cancelled:
-                    break
-                if isinstance(chunk, RunOutput):
-                    run_output = chunk
-                    continue
-                event = getattr(chunk, "event", None)
-                if event == RunEvent.model_request_completed:
-                    if view is not None:
-                        view.request_finished(getattr(chunk, "output_tokens", None))
-                    continue
-                if event is not None and event != RunEvent.run_content:
-                    continue
-                content = getattr(chunk, "content", None)
-                if isinstance(content, str) and content:
-                    answer.append(content)
-                    if view is not None:
-                        view.count_chunk()
-        except Exception as error:
+            done = run_remote_turn(
+                session.remote.client,  # type: ignore[union-attr]
+                body,
+                execute,
+                on_text=on_text,
+                on_usage=on_usage,
+                cancel=session._cancel,
+            )
+        except ClaraError as error:
             session.journal.log_error(f"sub-agent: {error}")
             return ToolResult.fail(error, {"partial_report": "".join(answer)})
-        self._account(run_output, time.perf_counter() - started)
+        if done is not None:
+            self._account(done, time.perf_counter() - started)
 
         if session.cancelled:
             return ToolResult.fail(RuntimeError("Interrupted by the user."))
@@ -154,8 +165,9 @@ class SubAgents:
         detail = "\n".join([*lines, "", text]) if lines else text
         return ToolResult.ok({"report": text}, summary=f"{len(lines)} tool call(s)", detail=detail)
 
-    def _account(self, run_output: Any, duration: float) -> None:
+    def _account(self, done: Dict[str, Any], duration: float) -> None:
         """The sub-agent's tokens go to the usage ledger like any other run."""
-        metrics = getattr(run_output, "metrics", None)
-        if metrics is not None:
-            self.session.usage.record(self.session.model, TurnStats.from_metrics(metrics, duration))
+        usage = done.get("usage") or {}
+        prompt_tokens, completion_tokens = int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0))
+        stats = TurnStats(prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, duration)
+        self.session.usage.record(self.session.model, stats)

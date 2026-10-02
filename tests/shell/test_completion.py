@@ -103,7 +103,7 @@ class TestSubcommandsAndValues:
 
     def test_model_names(self, completer):
         assert texts(completer, "ai start ge") == ["gemma4:31b-cloud"]
-        assert texts(completer, "ai agent -m ph") == ["phi3:latest"]
+        assert texts(completer, "ai start ph") == ["phi3:latest"]
 
     def test_model_provider_failure_is_silent(self, tree):
         def broken():

@@ -1,26 +1,29 @@
-"""The agent console: wires settings, tools, the agno agent and the terminal UI."""
+"""The agent console: wires settings, tools, the Clara server and the terminal UI.
+
+The model, the memory and the conversations live on the Clara server; this console is its
+terminal client. The tools (files, shell, PDF, Moodle, mail...) stay here: the server asks for
+them and the console runs them on this computer, after the permission questions.
+"""
 
 from __future__ import annotations
 
-from typing import Any, Callable, List, Optional
+from typing import Any, List, Optional
 
 from prompt_toolkit.history import FileHistory
 from rich.console import Console, Group
 from rich.text import Text
 
 from ..fs import FileManager
-from ..llm.errors import ProviderUnavailableError
-from ..llm.keys import KeyStore
-from ..llm.ollama import ModelInfo, OllamaClient
-from ..llm.providers import Provider, ProviderMemory, get_provider
 from ..settings import Settings
 from .cache import JsonCache
 from .checkpoints import Checkpoints
+from .clara import ClaraClient, ClaraError
 from .commands import AgentCommands
-from .context import ContextManager, choose_window, estimate_messages, summarize_with
-from .factory import build_agent, build_model, build_subagent, tools_token_estimate
+from .context import ContextManager
 from .journal import JsonlLogger
 from .permissions import PermissionGate, permission_label
+from .remote import RemoteAgent
+from .schema import tools_token_estimate
 from .sessions import SessionRecord, SessionStore, ago
 from .session import AgentSession
 from .slash import CommandResult, Renderer, SlashCommand, SlashRegistry
@@ -41,49 +44,35 @@ class AgentConsole:
         self,
         *,
         settings: Settings,
-        model: str,
         name: str,
         permission_level: int,
         files: FileManager,
         memory: bool = True,
         console: Optional[Console] = None,
-        agent_factory: Callable[..., Any] = build_agent,
-        model_factory: Callable[..., Any] = build_model,
-        subagent_factory: Callable[..., Any] = build_subagent,
-        ollama: Optional[OllamaClient] = None,
-        provider: str = "ollama",
-        api_key: Optional[str] = None,
-        keys: Optional[KeyStore] = None,
-        catalogs: Optional[Callable[[Provider, Optional[str]], Any]] = None,
+        client: Optional[ClaraClient] = None,
         **screen_options: Any,
     ) -> None:
-        """`provider` serves `model` (see `llm.providers`); its `api_key` is looked up
-        in `keys` when not given. `catalogs(provider, key)` lists a provider's models
-        (default: the provider's own catalog; `ollama` for the local Ollama)."""
+        """`client` is the connection to the Clara server (default: built from the settings).
+        Raises :class:`ClaraError` when the server cannot be reached. With `memory` False the
+        conversation is not saved here and is erased from the server when the console closes."""
         self.settings = settings
         self.console = console or Console()
         self.files = files
         self.name = name
-        self.model = model
-        self.model_factory = model_factory
-        self.ollama = ollama or OllamaClient(settings.ollama_host)
-        self.keys = keys or KeyStore()
-        self.catalogs = catalogs or (lambda p, key: self.ollama if p.local else p.catalog(settings, key))
-        self.provider_memory = ProviderMemory(settings.agent_provider_path)
-        self.provider = get_provider(provider)
-        if api_key is None and self.provider.needs_key:
-            api_key = self.keys.get(self.provider.key_variable)  # type: ignore[arg-type]
-        self.api_key = api_key
-        self.catalog = self.catalogs(self.provider, api_key)
+        self.memory = memory
+        self.client = client or ClaraClient(
+            settings.clara_url,
+            settings.clara_token,
+            user_id=settings.agent_user_id,
+            user_name=settings.clara_user_name,
+            admin_token=settings.clara_admin_token,
+        )
         self.renderer = Renderer(self.console)
         settings.agent_dir.mkdir(parents=True, exist_ok=True)
 
-        try:
-            info: Optional[ModelInfo] = self.catalog.info(model)
-        except ProviderUnavailableError:
-            info = None
-        window, self.num_ctx = choose_window(info, settings.agent_num_ctx)
-        self.provider_memory.remember(self.provider.name, model)
+        health = self.client.health()
+        self.model = str(health.get("model") or "?")
+        self.provider_name = str(health.get("provider") or "")
 
         directory = files.local_location if files.mode == files.MODE_LOCAL else None
         zone = FreeZone.around(directory)
@@ -91,11 +80,10 @@ class AgentConsole:
         # Sessions are saved per working directory; --no-memory saves nothing.
         self.store = SessionStore(settings.agent_sessions_dir, directory if memory else None, settings.agent_keep_sessions)
         self.record = self.store.new_record()
+        self.conversations = [self._base_id(self.record)]  # every server conversation this run used
         self.context = ContextManager(
-            base_session_id=self._base_id(self.record),
-            window=window,
+            base_session_id=self.conversations[0],
             project_file=zone.root / settings.agent_project_file if zone.root else None,
-            compact_percent=settings.agent_compact_percent,
         )
         reads, todos = ReadTracker(), TodoList()
         self.session = AgentSession(
@@ -103,13 +91,14 @@ class AgentConsole:
             settings.agent_user_id,
             self.context,
             UsageLedger(settings.agent_usage_path),
-            model=model,
+            model=self.model,
             checkpoints=self.checkpoints,
             reads=reads,
             todos=todos,
         )
-        self.session.summarize = lambda transcript, previous, focus: summarize_with(self._chat, transcript, previous, focus)
+        self.session.provider = self.provider_name
         self.session.on_turn = self._turn_done
+        self.session.on_model = self._model_changed
 
         registry = SlashRegistry(self.renderer)
         add_basic_commands(registry)
@@ -126,14 +115,7 @@ class AgentConsole:
             transcript=lambda: [TurnView.from_dict(turn) for turn in self.record.turns],
             **screen_options,
         )
-        self.subagents = SubAgents(
-            self.session,
-            tools=lambda: self.toolset.enabled(),
-            build=lambda tools, hook, instructions: subagent_factory(
-                settings, self.model, tools, hook, instructions, self.num_ctx, **self._model_options()
-            ),
-            location=lambda: files.location,
-        )
+        self.subagents = SubAgents(self.session, tools=lambda: self.toolset.enabled(), location=lambda: files.location)
 
         self.tool_context = ToolContext(
             settings=settings,
@@ -153,11 +135,9 @@ class AgentConsole:
             run_subagent=self.subagents.run,
         )
         self.toolset = ToolSet(build_tool_groups(self.tool_context), settings.agent_tools_path)
-        self.session.agent = agent_factory(
-            settings, model, name, self.toolset.enabled(), self.session.tool_hook, memory, self.num_ctx, **self._model_options()
-        )
-        self._sync_tools(set_agent=False)
-        self._observe_stored_history()
+        self.session.remote = RemoteAgent(self.client, self.toolset.enabled, settings.load_instructions)
+        self._sync_tools()
+        self.session.refresh_context()
 
         AgentCommands(self).register(registry)
 
@@ -176,40 +156,35 @@ class AgentConsole:
             return
         record = self.record
         record.model = self.model
-        record.provider = self.provider.name
+        record.provider = self.provider_name
         record.permission_level = int(self.tool_context.gate.auto_level)
         record.disabled_tools = self.toolset.disabled_names()
         record.todos = self.tool_context.todos.to_list()
         record.context = self.context.state()
         for dropped in self.store.save(record):
-            self._forget_model_memory(dropped)
+            self._forget_conversation(dropped.conversation_id())
 
-    def _forget_model_memory(self, record: SessionRecord) -> None:
-        """Best effort: drop the agent database's copy of a session that is no longer kept."""
-        database = getattr(self.session.agent, "db", None)
-        for session_id in record.session_ids():
-            try:
-                database.delete_session(session_id)
-            except Exception:
-                pass
+    def _forget_conversation(self, conversation: str) -> None:
+        """Best effort: erase a conversation from the server (a session that is no longer kept)."""
+        if not conversation:
+            return
+        try:
+            self.client.forget(conversation)
+        except ClaraError:
+            pass
 
     def new_session(self) -> None:
         """``/clear``: a new conversation that is saved apart from the old one."""
         self.record = self.store.new_record()
-        self.session.clear(self._base_id(self.record))
+        conversation = self._base_id(self.record)
+        self.conversations.append(conversation)
+        self.session.clear(conversation)
         self.record.context = self.context.state()
 
     def restore_session(self, record: SessionRecord) -> List[str]:
-        """Go back to a saved session: the agent's conversation, provider, model, tools,
-        permission level and checklist. Returns the warnings to show."""
+        """Go back to a saved session: the server conversation, tools, permission level and
+        checklist. Returns the warnings to show."""
         notes: List[str] = []
-        if record.provider and record.provider != self.provider.name:
-            notes.extend(self._restore_provider(record))
-        elif record.model and record.model != self.model:
-            try:
-                self.switch_model(record.model)
-            except (LookupError, ProviderUnavailableError) as error:
-                notes.append(f"Model {record.model} is not available ({error}): keeping {self.model}.")
         # Everything is set before anything is saved: saving writes the current state into the record.
         self.context.restore(record.context)
         self.tool_context.gate.auto_level = record.permission_level
@@ -221,32 +196,21 @@ class AgentConsole:
         self.toolset.replace_disabled(record.disabled_tools)
         self._sync_tools()
         self.record = record
-        self._observe_stored_history()
-        try:
-            remembered = self.session.agent.get_chat_history(session_id=self.context.session_id)
-        except Exception:
-            remembered = None
-        if not remembered and not self.context.summary and record.turns:
-            notes.append("The agent's own memory of this conversation is gone: you can read it above, but it will not remember it.")
+        if self.context.session_id not in self.conversations:
+            self.conversations.append(self.context.session_id)
+        info = self.session.refresh_context()
+        if info is None:
+            notes.append("The server could not be asked whether it remembers this conversation.")
+        elif not info.get("messages") and not info.get("summary") and record.turns:
+            notes.append("The server has no memory of this conversation any more: you can read it above, but Clara will not remember it.")
         self.save_session()
         return notes
 
-    def _observe_stored_history(self) -> None:
-        """Count the conversation already stored for this session, so that the
-        context meter is right before the first turn of a resumed conversation."""
-        try:
-            history = self.session.agent.get_chat_history(session_id=self.context.session_id) or []
-            self.context.observe(None, estimate_messages(history))
-        except Exception:
-            pass  # only the meter is affected
-
     # -- tools --------------------------------------------------------------------- #
 
-    def _sync_tools(self, set_agent: bool = True) -> None:
-        """Give the agent the tools that are on, and account for them in the context."""
+    def _sync_tools(self) -> None:
+        """Account for the tools that are on in the context estimate."""
         enabled = self.toolset.enabled()
-        if set_agent:
-            self.session.agent.tools = enabled
         self.context.disabled_tools = self.toolset.disabled_names()
         try:
             tokens = tools_token_estimate(enabled)
@@ -262,8 +226,13 @@ class AgentConsole:
     # -- display ------------------------------------------------------------------- #
 
     def _title(self) -> str:
-        where = "" if self.provider.local else f" ({self.provider.name})"
+        where = f" ({self.provider_name})" if self.provider_name else ""
         return f"{self.name} · {self.model}{where}"
+
+    def _model_changed(self, model: str, provider: str) -> None:
+        """The server switched model or provider (its /provider and /model commands)."""
+        self.model, self.provider_name = model, provider
+        self.screen.title = self._title()
 
     def _toggle_details(self, arguments: str) -> CommandResult:
         shown = self.screen.toggle_details()
@@ -291,95 +260,15 @@ class AgentConsole:
             zone_line = f"free zone: {zone.root} (no questions asked for files there)"
         else:
             zone_line = f"free zone: none ({zone.reason}); every change asks"
+        served = f"{self.model} on Clara ({self.provider_name or 'unknown provider'}) at {self.client.url}"
         return Group(
             Text(self.name, style="bold cyan"),
-            Text(
-                f"model {self.model} · {self.provider.label} · permissions: {permission_label(permission_level)}",
-                style="dim",
-            ),
+            Text(f"model {served} · permissions: {permission_label(permission_level)}", style="dim"),
             Text(zone_line, style="dim"),
             *hint,
             Text("Type /help for the commands.", style="dim"),
             Text(""),
         )
-
-    # -- model ----------------------------------------------------------------------- #
-
-    def _model_options(self) -> dict:
-        """What the agent and model factories need to know about the provider."""
-        return {"provider": self.provider.name, "api_key": self.api_key}
-
-    def _chat(self, messages: List[dict]) -> str:
-        """One plain answer of the current model (the compaction summary)."""
-        return self.provider.chat(self.settings, self.model, self.api_key, messages, self.num_ctx)
-
-    def switch_model(self, name: str) -> ModelInfo:
-        """Use another model of the current provider from the next turn on; the conversation is kept."""
-        info = self.catalog.info(name)
-        if info is None:
-            where = "installed" if self.provider.local else f"available from {self.provider.label}"
-            raise LookupError(f"{name} is not {where} (see /model for the list)")
-        self._use(info)
-        return info
-
-    def _use(self, info: ModelInfo) -> None:
-        window, self.num_ctx = choose_window(info, self.settings.agent_num_ctx)
-        self.session.agent.model = self.model_factory(self.settings, info.name, self.num_ctx, **self._model_options())
-        self.model = self.session.model = info.name
-        self.context.window = window
-        self.screen.title = self._title()
-        self.provider_memory.remember(self.provider.name, info.name)
-
-    # -- provider ------------------------------------------------------------------------- #
-
-    def _history_has_tool_calls(self) -> bool:
-        try:
-            messages = self.session.agent.get_chat_history(session_id=self.context.session_id) or []
-        except Exception:
-            return False
-        return any(getattr(m, "role", "") == "tool" or getattr(m, "tool_calls", None) for m in messages)
-
-    def switch_provider(self, provider: Provider, api_key: Optional[str], catalog: Any, model: str) -> List[str]:
-        """Use `model` of `provider` from the next turn on. Returns the notes to show.
-
-        The conversation is kept. Tool calls made through Ollama cannot be replayed
-        to OpenAI (they may lack the ids OpenAI requires), so a conversation that has
-        some is first summarised, by the provider that made them, and continues from
-        that summary.
-        """
-        info = catalog.info(model)
-        if info is None:
-            raise LookupError(f"{model} is not available from {provider.label}")
-        notes: List[str] = []
-        if provider.family != self.provider.family and provider.family == "openai" and self._history_has_tool_calls():
-            try:
-                before, after = self.session.compact()
-            except Exception as error:
-                raise ProviderUnavailableError(
-                    f"the conversation could not be summarised to carry it over ({error}): use /clear to start afresh"
-                ) from error
-            notes.append(f"The conversation was summarised to carry it over ({before:.0f}% → {after:.0f}% of the context).")
-        self.provider, self.api_key, self.catalog = provider, api_key, catalog
-        self._use(info)
-        self.save_session()
-        return notes
-
-    def _restore_provider(self, record: SessionRecord) -> List[str]:
-        """Go back to the provider (and model) of a saved session, with its saved key."""
-        try:
-            provider = get_provider(record.provider)
-            key = self.keys.get(provider.key_variable) if provider.needs_key else None  # type: ignore[arg-type]
-            if provider.needs_key and not key:
-                raise LookupError(f"no API key for it (/provider {provider.name} asks for one)")
-            catalog = self.catalogs(provider, key)
-            if catalog.info(record.model) is None:
-                raise LookupError(f"{record.model} is not available there")
-        except (LookupError, ProviderUnavailableError) as error:
-            return [f"The session used {record.model} from {record.provider}, which is not available ({error}): keeping {self.model}."]
-        # The session's own conversation came from that provider: nothing to carry over.
-        self.provider, self.api_key, self.catalog = provider, key, catalog
-        self._use(catalog.info(record.model))
-        return []
 
     # -- lifecycle -------------------------------------------------------------------- #
 
@@ -388,3 +277,6 @@ class AgentConsole:
             self.screen.run()
         finally:
             self.tool_context.close()
+            if not self.memory:  # nothing kept: not here, and not on the server either
+                for conversation in self.conversations:
+                    self._forget_conversation(conversation)

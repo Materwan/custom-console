@@ -1,5 +1,6 @@
-"""The agent's slash commands: /model /usage /context /compact /clear /undo /init
-/todo /permissions, plus the file commands of the shell (/ls /cd /cat ...)."""
+"""The agent's slash commands: /model /provider /usage /context /compact /clear /undo /init
+/todo /permissions, plus the file commands of the shell (/ls /cd /cat ...). /model and /provider
+are the Clara server's own commands, run there."""
 
 from __future__ import annotations
 
@@ -12,10 +13,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from ..llm.errors import ProviderUnavailableError
-from ..llm.keys import FROM_ENVIRONMENT, SAVED
-from ..llm.ollama import format_size
-from ..llm.providers import PROVIDERS, connect, describe_model, find_model, get_provider, preferred_model
+from .clara import ClaraError
 from ..shell.commands import build_file_registry
 from ..shell.printer import QuietPrinter
 from ..shell.repl import Shell
@@ -76,7 +74,7 @@ class AgentCommands:
     def __init__(self, app: "AgentConsole") -> None:
         self.app = app
         self.renderer = app.renderer
-        self._models_cache: Optional[tuple] = None
+        self._remote_commands: Optional[list] = None
 
     # -- helpers ------------------------------------------------------------------ #
 
@@ -86,28 +84,18 @@ class AgentCommands:
     def _info(self, message: str) -> CommandResult:
         return CommandResult(self.renderer.text(message, "dim"))
 
-    def _installed(self):
-        """The current provider's models, cached briefly: completion asks on every keystroke."""
-        import time
-
-        provider = self.app.provider.name
-        cache = self._models_cache
-        if cache is None or cache[2] != provider or time.monotonic() - cache[0] > 10:
-            self._models_cache = (time.monotonic(), self.app.catalog.installed(), provider)
-        return self._models_cache[1]
-
     # -- registration --------------------------------------------------------------- #
 
     def register(self, registry: SlashRegistry) -> None:
         add = registry.add
-        add(SlashCommand("model", "show or change the model", self.model, "[MODEL]", self.complete_model))
+        add(SlashCommand("model", "show or change the server's model (needs CLARA_ADMIN_TOKEN)", self._on_server("model"), "[MODEL]", self._complete_on_server("model")))
         add(
             SlashCommand(
                 "provider",
-                "show or change the LLM provider (ollama, ollama-cloud, chatgpt)",
-                self.provider,
-                "[NAME | forget NAME]",
-                self.complete_provider,
+                "show or change where the server runs the model (needs CLARA_ADMIN_TOKEN)",
+                self._on_server("provider"),
+                "[local|cloud]",
+                self._complete_on_server("provider"),
             )
         )
         add(SlashCommand("usage", "tokens used: this session and in total", self.usage))
@@ -161,174 +149,43 @@ class AgentCommands:
     def complete_file_command(self, name: str, arguments: str) -> Iterator[Completion]:
         yield from self.shell.completer.get_completions(Document(f"{name} {arguments}"), None)
 
-    # -- /model -------------------------------------------------------------------------- #
+    # -- /model, /provider: the server's own commands ------------------------------------ #
 
-    def model(self, arguments: str) -> CommandResult:
-        provider = self.app.provider
-        if arguments:
+    def _server_commands(self) -> list:
+        """The server's console commands (for completion), asked once and kept."""
+        if self._remote_commands is None:
             try:
-                info = self.app.switch_model(arguments)
-            except (LookupError, ProviderUnavailableError) as error:
+                self._remote_commands = self.app.client.admin_commands()
+            except ClaraError:
+                self._remote_commands = []
+        return self._remote_commands
+
+    def _on_server(self, name: str):
+        """A handler that runs `/name arguments` in the Clara server's console."""
+
+        def handler(arguments: str) -> CommandResult:
+            try:
+                output = self.app.client.admin(f"/{name} {arguments}".strip())
+                health = self.app.client.health() if arguments else None
+            except ClaraError as error:
                 return self._error(str(error))
-            self.app.save_session()
-            if provider.local:
-                where = "served by ollama.com" if info.remote else "local; it is loaded on first use"
-            else:
-                where = provider.label
-            return CommandResult(
-                self.renderer.text(f"Model: {info.name} ({where}) · context window {self.app.context.window:,} tokens", "green")
-            )
+            if health:  # the model or the provider may have changed
+                self.app._model_changed(str(health.get("model") or self.app.model), str(health.get("provider") or ""))
+            return CommandResult(self.renderer.text(output))
 
-        try:
-            models = self._installed()
-        except ProviderUnavailableError as error:
-            return self._error(str(error))
-        title = "Installed models" if provider.local else f"Models of {provider.label}"
-        table = Table(title=title, title_justify="left")
-        table.add_column("")
-        table.add_column("Model", style="green", no_wrap=True)
-        table.add_column("Size", justify="right")
-        table.add_column("Max context", justify="right")
-        table.add_column("Where")
-        for info in models:
-            table.add_row(
-                "●" if info.name == self.app.model else "",
-                info.name,
-                "-" if info.remote else format_size(info.size),
-                format_count(info.context_length) if info.context_length else "?",
-                provider.where(info),
-            )
-        hint = Text(
-            "Type /model NAME to switch (Tab completes). The conversation is kept. /provider changes the provider.",
-            style="dim",
-        )
-        return CommandResult(self.renderer.render(table, hint))
+        return handler
 
-    def complete_model(self, arguments: str) -> Iterator[Completion]:
-        try:
-            models = self._installed()
-        except Exception:  # the provider is not reachable: nothing to suggest
-            return
-        for info in models:
-            if info.name.lower().startswith(arguments.lower()) or arguments.lower() in info.name.lower():
-                meta = describe_model(info) or self.app.provider.where(info)
-                if info.name == self.app.model:
-                    meta += " · current"
-                yield Completion(info.name, start_position=-len(arguments), display_meta=meta)
+    def _complete_on_server(self, name: str):
+        def completer(arguments: str) -> Iterator[Completion]:
+            if " " in arguments:
+                return
+            for entry in self._server_commands():
+                if entry.get("name") == name:
+                    for choice in entry.get("choices", []):
+                        if choice.startswith(arguments.lower()):
+                            yield Completion(choice, start_position=-len(arguments))
 
-    # -- /provider ------------------------------------------------------------------------- #
-
-    PROVIDER_USAGE = "Usage: /provider [ollama | ollama-cloud | chatgpt | forget NAME]"
-
-    def provider(self, arguments: str) -> CommandResult:
-        words = arguments.split()
-        if not words:
-            return CommandResult(self.renderer.render(self._providers_table()))
-        if words[0].lower() == "forget":
-            return self._forget_key(words[1:])
-        if len(words) != 1:
-            return self._error(self.PROVIDER_USAGE)
-        try:
-            provider = get_provider(words[0])
-        except LookupError as error:
-            return self._error(str(error))
-
-        app = self.app
-        try:
-            connection = connect(
-                provider, app.keys, lambda prompt: app.screen.ask_text(prompt, secret=True), app.catalogs
-            )
-        except ProviderUnavailableError as error:
-            return self._error(f"{provider.label}: {error}")
-        if connection is None:
-            return self._info("No key given: provider unchanged.")
-
-        models = connection.models
-        wanted = app.model if provider.name == app.provider.name else preferred_model(provider, app.settings, app.provider_memory)
-        current = find_model(models, wanted)
-        initial = models.index(current) if current is not None else 0
-        answer = app.screen.ask_choice(
-            f"Model to use with {provider.label}",
-            [Choice(info.name, describe_model(info)) for info in models],
-            allow_other=False,
-            initial=initial,
-        )
-        text = "".join(self.renderer.text(note, "dim") for note in connection.notes)
-        if answer is None:
-            return CommandResult(text + self.renderer.text("Provider unchanged.", "dim"))
-        try:
-            notes = app.switch_provider(provider, connection.key, connection.catalog, answer.selected[0])
-        except (LookupError, ProviderUnavailableError) as error:
-            return CommandResult(text + self.renderer.text(f"Provider unchanged: {error}", "red"))
-        for note in notes:
-            text += self.renderer.text(note, "yellow")
-        text += self.renderer.text(
-            f"Provider: {provider.label} · model {app.model} · context window {app.context.window:,} tokens", "green"
-        )
-        return CommandResult(text)
-
-    def _key_state(self, provider) -> str:
-        if not provider.needs_key:
-            return "not needed"
-        source = self.app.keys.source(provider.key_variable)
-        if source == FROM_ENVIRONMENT:
-            return f"from {provider.key_variable}"
-        if source == SAVED:
-            return "saved"
-        return "missing (asked on first use)"
-
-    def _providers_table(self) -> Table:
-        app = self.app
-        table = Table(title="LLM providers", title_justify="left")
-        table.add_column("")
-        table.add_column("Name", style="green", no_wrap=True)
-        table.add_column("Provider")
-        table.add_column("API key")
-        table.add_column("Last model")
-        for provider in PROVIDERS.values():
-            current = provider.name == app.provider.name
-            table.add_row(
-                "●" if current else "",
-                provider.name,
-                provider.label,
-                self._key_state(provider),
-                app.model if current else (app.provider_memory.last_model(provider.name) or "-"),
-            )
-        return table
-
-    def _forget_key(self, words: List[str]) -> CommandResult:
-        if len(words) != 1:
-            return self._error(self.PROVIDER_USAGE)
-        try:
-            provider = get_provider(words[0])
-        except LookupError as error:
-            return self._error(str(error))
-        if not provider.needs_key:
-            return self._info(f"{provider.label} needs no key.")
-        try:
-            forgotten = self.app.keys.forget(provider.key_variable)
-        except Exception as error:
-            return self._error(f"Could not delete the key: {error}")
-        message = f"Saved key of {provider.label} deleted." if forgotten else f"No saved key for {provider.label}."
-        if self.app.keys.source(provider.key_variable) == FROM_ENVIRONMENT:
-            message += f" {provider.key_variable} is still set in the environment (.env)."
-        return self._info(message)
-
-    def complete_provider(self, arguments: str) -> Iterator[Completion]:
-        words = arguments.split(" ")
-        last = words[-1].lower()
-        if len(words) > 2 or (len(words) == 2 and words[0].lower() != "forget"):
-            return
-        choices = [(p.name, p.label) for p in PROVIDERS.values()]
-        if len(words) == 1:
-            choices.append(("forget", "delete a saved API key"))
-        else:
-            choices = [(p.name, p.label) for p in PROVIDERS.values() if p.needs_key]
-        for name, meta in choices:
-            if name.startswith(last):
-                if name == self.app.provider.name:
-                    meta += " · current"
-                yield Completion(name, start_position=-len(last), display_meta=meta)
+        return completer
 
     # -- /usage, /context ------------------------------------------------------------------ #
 
@@ -342,6 +199,7 @@ class AgentCommands:
         return CommandResult(self.renderer.render(*tables, note))
 
     def context(self, arguments: str) -> CommandResult:
+        self.app.session.refresh_context()  # the server knows the real size
         report = self.app.context.breakdown()
         table = Table(
             title=f"Context · {self.app.model} · {report.used:,} / {report.window:,} tokens ({report.percent:.0f}%)",
@@ -362,12 +220,12 @@ class AgentCommands:
         if report.summary:
             row("Conversation summary", report.summary)
         row(f"Tools ({report.tool_count})", report.tools)
-        row("Messages", report.messages)
+        row("Messages and Clara's memory", report.messages)
         row("Free space", report.free, "dim")
 
         note = Text(
             "Parts are estimates (about 3.5 characters per token); the total is what the model reported "
-            f"when it did. Compaction runs at {self.app.settings.agent_compact_percent}%, or with /compact.",
+            "when it did. The server compacts the conversation when the context is nearly full, or on /compact.",
             style="dim",
         )
         return CommandResult(self.renderer.render(table, note))
@@ -428,7 +286,7 @@ class AgentCommands:
         toolset = app.toolset
         todos = app.tool_context.todos
         facts = [
-            f"model {app.model} ({app.provider.name})",
+            f"model {app.model} ({app.provider_name})",
             f"{len(toolset.enabled())} of {len(toolset.names())} tools on",
             f"auto-accept level {app.tool_context.gate.auto_level} ({permission_label(app.tool_context.gate.auto_level)})",
         ]

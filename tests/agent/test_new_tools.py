@@ -7,10 +7,13 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from fake_clara import FakeClara
+from fake_clara import ask_tools as tool_requests
 
 from custom_console.agent.context import ContextManager
 from custom_console.agent.journal import JsonlLogger
 from custom_console.agent.permissions import PermissionLevel
+from custom_console.agent.remote import RemoteAgent
 from custom_console.agent.questions import Answer, Choice
 from custom_console.agent.results import ToolResult
 from custom_console.agent.session import AgentSession
@@ -129,62 +132,51 @@ class TestMaxLevel:
 # --------------------------------------------------------------------------- #
 
 
-class FakeSubAgent:
-    """Calls the tool hook like agno would, then reports."""
-
-    def __init__(self, tools, hook, instructions, script):
-        self.tools = {tool.__name__: tool for tool in tools}
-        self.hook, self.instructions, self.script = hook, instructions, script
-        self.outputs = []
-
-    def run(self, prompt, **kwargs):
-        from agno.metrics import RunMetrics
-        from agno.run.agent import RunOutput
-
-        self.prompt, self.kwargs = prompt, kwargs
-        for name, arguments in self.script.get("calls", []):
-            tool = self.tools.get(name, lambda **kw: ToolResult.fail(LookupError(f"no tool {name}")))
-            self.outputs.append(json.loads(self.hook(name, tool, arguments)))
-        if self.script.get("cancel"):
-            self.script["cancel"].set()
-        yield SimpleNamespace(event="ModelRequestCompleted", output_tokens=40)
-        for chunk in self.script.get("answer", ["Found it ", "in a.py."]):
-            yield SimpleNamespace(event="RunContent", content=chunk)
-        if self.script.get("error"):
-            raise self.script["error"]
-        yield RunOutput(content="", metrics=RunMetrics(input_tokens=100, output_tokens=50, total_tokens=150))
+def sub_agent_events(calls, answer, error, cancel):
+    """What the server streams for a sub-agent's job: its tool requests, then its report."""
+    if calls:
+        yield tool_requests(*calls)
+    if cancel is not None:
+        cancel.set()
+    yield {"type": "usage", "prompt_tokens": 0, "completion_tokens": 40}
+    for chunk in answer:
+        yield {"type": "token", "text": chunk}
+    if error:
+        yield {"type": "error", "message": str(error)}
+    else:
+        yield {"type": "done", "reply": "".join(answer), "usage": {"prompt_tokens": 100, "completion_tokens": 50}}
 
 
 @pytest.fixture
 def harness(make_ctx, tmp_path):
     """A session in the middle of a turn, the `task` tool, and what the sub-agent did."""
 
-    def factory(**script):
+    def factory(calls=(), answer=("Found it ", "in a.py."), error=None, cancel_midway=False):
         ctx, gate = make_ctx(auto_level=1)
         (tmp_path / "files" / "a.py").write_text("x = 1\n")
         session = AgentSession(
             JsonlLogger(tmp_path / "log.jsonl"), "u", ContextManager(base_session_id="s"), UsageLedger(None), model="m"
         )
         cancel = threading.Event()
-        script.setdefault("cancel_event", cancel)
-        if script.pop("cancel_midway", False):
-            script["cancel"] = cancel
         view = TurnView("hi")
         session._view, session._cancel = view, cancel
-        built = {}
+        fake = FakeClara(lambda body: sub_agent_events(calls, answer, error, cancel if cancel_midway else None))
+        session.remote = RemoteAgent(fake, lambda: build_tools(ctx), lambda: "base")
 
-        def build(tools, hook, instructions):
-            built["agent"] = FakeSubAgent(tools, hook, instructions, script)
-            return built["agent"]
-
-        subagents = SubAgents(session, lambda: build_tools(ctx), build, location=lambda: "/work")
+        subagents = SubAgents(session, lambda: build_tools(ctx), location=lambda: "/work")
         ctx.run_subagent = subagents.run
         task = tool_named(task_tools(ctx), "task")
 
         def call(**arguments):
             return json.loads(session.tool_hook("task", task, arguments))
 
-        return SimpleNamespace(call=call, view=view, built=built, session=session, gate=gate)
+        def outputs():  # what the console told the server about the sub-agent's tool calls
+            return [json.loads(answer["content"]) for batch in fake.results for answer in batch]
+
+        def offered():
+            return {tool["function"]["name"] for tool in fake.bodies[0]["tools"]}
+
+        return SimpleNamespace(call=call, view=view, fake=fake, session=session, gate=gate, outputs=outputs, offered=offered)
 
     return factory
 
@@ -195,10 +187,10 @@ class TestTask:
         output = h.call(description="find x", prompt="Where is x defined?")
 
         assert output == {"success": True, "data": {"report": "Found it in a.py."}}
-        agent = h.built["agent"]
-        assert agent.prompt == "Where is x defined?" and agent.instructions.endswith("Working directory: /work")
-        assert agent.kwargs["stream"] and agent.kwargs["stream_events"]
-        assert [o["success"] for o in agent.outputs] == [True, True]
+        [body] = h.fake.bodies
+        assert body["message"] == "Where is x defined?" and body["instructions"].endswith("Working directory: /work")
+        assert body["ephemeral"] is True and body["conversation"].startswith("sub-")  # a job, not a conversation
+        assert [o["success"] for o in h.outputs()] == [True, True]
         line = h.view.snapshot()[0]
         assert line.text.startswith("✔ task(") and "· 2 tool call(s)" in line.text
         assert line.detail.splitlines()[0].startswith("✔ file_system_read(path='a.py')")
@@ -213,17 +205,19 @@ class TestTask:
     def test_read_only_by_default(self, harness):
         h = harness(calls=[("file_system_write", {"path": "b.py", "content": "y"})])
         h.call(description="d", prompt="p")
-        assert "no tool file_system_write" in h.built["agent"].outputs[0]["error"]
+        assert "file_system_write" not in h.offered() and "file_system_read" in h.offered()
+        assert "not an available tool" in h.outputs()[0]["error"]  # asking anyway does not work
 
     def test_writes_when_allowed_still_go_through_the_gate(self, harness, tmp_path):
         h = harness(calls=[("file_system_write", {"path": str(tmp_path / "elsewhere.txt"), "content": "y"})])
         h.call(description="d", prompt="p", allow_writes=True)
-        assert h.built["agent"].outputs[0]["success"] and len(h.gate.asked) == 1  # outside the zone: asked
+        assert "file_system_write" in h.offered()
+        assert h.outputs()[0]["success"] and len(h.gate.asked) == 1  # outside the zone: asked
 
     def test_it_never_gets_the_conversation_tools(self, harness):
         h = harness()
         h.call(description="d", prompt="p", allow_writes=True)
-        assert not set(h.built["agent"].tools) & EXCLUDED_TOOLS
+        assert not h.offered() & EXCLUDED_TOOLS
 
     def test_a_crash_is_a_failed_result_with_what_was_said(self, harness):
         h = harness(answer=["partial"], error=RuntimeError("model died"))
@@ -241,7 +235,7 @@ class TestTask:
 
     def test_an_empty_prompt_is_refused(self, harness):
         h = harness()
-        assert h.call(description="d", prompt=" ")["success"] is False and "agent" not in h.built
+        assert h.call(description="d", prompt=" ")["success"] is False and h.fake.bodies == []
 
 
 # --------------------------------------------------------------------------- #

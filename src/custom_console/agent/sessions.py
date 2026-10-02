@@ -4,7 +4,7 @@ A session is one conversation: the questions and answers as they were shown, the
 model and tools it used, its compaction summary, its checklist. It is written
 after every turn to ``<agent dir>/sessions/<directory key>/<session id>.json``
 (atomically), and only the most recent ones of a directory are kept. The model's
-own memory of the conversation stays in the agent database, under the session id
+own memory of the conversation stays on the Clara server, under the conversation id
 recorded here.
 """
 
@@ -35,11 +35,11 @@ class SessionRecord:
     started: str = field(default_factory=now_iso)
     updated: str = ""
     model: str = ""
-    provider: str = "ollama"
+    provider: str = ""  # the Clara server's provider when the session was saved (informational)
     permission_level: int = 1
     disabled_tools: List[str] = field(default_factory=list)
     todos: List[Dict[str, Any]] = field(default_factory=list)
-    context: Dict[str, Any] = field(default_factory=dict)  # base session id, generation, summary
+    context: Dict[str, Any] = field(default_factory=dict)  # the server conversation id, its summary
     turns: List[Dict[str, Any]] = field(default_factory=list)  # TurnView.to_dict() of each turn
 
     @property
@@ -87,7 +87,7 @@ class SessionRecord:
             started=str(data.get("started", "")),
             updated=str(data.get("updated", "")),
             model=str(data.get("model", "")),
-            provider=str(data.get("provider") or "ollama"),  # sessions of older versions: the local Ollama
+            provider=str(data.get("provider") or ""),
             permission_level=int(data.get("permission_level", 1)),
             disabled_tools=[str(name) for name in listed("disabled_tools")],
             todos=[item for item in listed("todos") if isinstance(item, dict)],
@@ -95,13 +95,9 @@ class SessionRecord:
             turns=[turn for turn in listed("turns") if isinstance(turn, dict)],
         )
 
-    def session_ids(self) -> List[str]:
-        """Every agent-database session this conversation used (compaction moves on)."""
-        base = self.context.get("base")
-        if not base:
-            return []
-        generation = int(self.context.get("generation", 0) or 0)
-        return [str(base)] + [f"{base}-{n}" for n in range(1, generation + 1)]
+    def conversation_id(self) -> str:
+        """The conversation on the Clara server (sessions saved by older versions: "base")."""
+        return str(self.context.get("conversation") or self.context.get("base") or "")
 
 
 def directory_key(directory: "str | os.PathLike[str]") -> str:

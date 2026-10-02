@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Optional
 if TYPE_CHECKING:
     from ...apps.finder import SavedApps
     from ...fs import FileManager
-    from ...llm.keys import KeyStore
+    from ...agent.clara import ClaraClient
     from ...llm.ollama import OllamaClient
     from ...settings import Settings
     from ..printer import Printer
@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 PATH = "PATH"
 APP = "APP"
 MODEL = "MODEL"
-PROVIDER = "PROVIDER"
 
 
 class CommandError(Exception):
@@ -67,8 +66,7 @@ class ShellContext:
     confirm: Callable[[str], bool]
     last_model: str = ""
     running: bool = True
-    keys: Optional["KeyStore"] = None  # API keys of the model providers (None: the real store)
-    ask_secret: Optional[Callable[[str], str]] = None  # asks for an API key, typed masked
+    clara: Optional["ClaraClient"] = None  # connection to the Clara server (None: built from the settings)
 
 
 Handler = Callable[[ShellContext, argparse.Namespace], None]

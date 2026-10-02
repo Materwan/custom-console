@@ -1,4 +1,9 @@
-"""Runs one agent turn: streams the answer into a TurnView and traces tool calls."""
+"""Runs one agent turn: streams the answer into a TurnView and traces tool calls.
+
+The model runs on the Clara server. The console sends it the user's message with its tools
+(described, not sent as code); when the model calls one, the server asks the console to run it
+here and the console answers with the result (see `remote.py`).
+"""
 
 from __future__ import annotations
 
@@ -10,9 +15,11 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .checkpoints import Checkpoints
-from .context import ContextManager, Summarizer, build_transcript, context_tokens_of, estimate_messages, turn_notes
+from .clara import ClaraError
+from .context import ContextManager, turn_notes
 from .diffs import count_changes
 from .journal import JsonlLogger
+from .remote import RemoteAgent, run_remote_turn
 from .results import ToolResult
 from .tools.state import ReadTracker, TodoList
 from .turn import DIFF, STYLE_ERROR, Segment, TurnStats, TurnView
@@ -61,10 +68,10 @@ def tool_display(result: ToolResult) -> Tuple[str, str, str]:
 
 
 class AgentSession:
-    """Glue between an agno agent and the UI.
+    """Glue between the Clara server and the UI.
 
-    `run_turn` is meant to run in a worker thread. The agent is bound after
-    construction (`session.agent = ...`) because the tools it needs are built
+    `run_turn` is meant to run in a worker thread. The remote agent is bound after
+    construction (`session.remote = ...`) because the tools it lends to the server are built
     from objects that themselves refer to this session.
     """
 
@@ -81,18 +88,19 @@ class AgentSession:
         todos: Optional[TodoList] = None,
         clock: Callable[[], datetime] = lambda: datetime.now().astimezone(),
     ):
-        self.agent: Any = None
+        self.remote: Optional[RemoteAgent] = None
         self.journal = journal
         self.user_id = user_id
         self.context = context
         self.usage = usage
         self.model = model
+        self.provider = ""
         self.checkpoints = checkpoints
         self.reads = reads
         self.todos = todos
         self.clock = clock
-        self.summarize: Optional[Summarizer] = None  # set by the console: asks the model for a summary
         self.on_turn: Optional[Callable[[TurnView], None]] = None  # told of every finished turn (saved sessions)
+        self.on_model: Optional[Callable[[str, str], None]] = None  # told when the server's model changes
         self._view: Optional[TurnView] = None
         self._cancel: Optional[threading.Event] = None
         self.current_tool: Optional[Segment] = None  # line of the tool running now (for sub-agents)
@@ -113,13 +121,24 @@ class AgentSession:
         if self._view is not None:
             self._view.permission(info, status)
 
-    # -- tool hook ------------------------------------------------------------ #
+    # -- tools ----------------------------------------------------------------- #
+
+    def execute_tool(self, name: str, arguments: Dict[str, Any]) -> str:
+        """Run the tool the server asked for, here, and give back what the model is told."""
+        tools = {tool.__name__: tool for tool in self.remote.tools()}  # type: ignore[union-attr]
+        function = tools.get(name)
+        if function is None:
+
+            def function(**_: Any) -> ToolResult:  # shown and journaled like any failed call
+                raise LookupError(f"{name} is not an available tool (it may have been turned off).")
+
+        return self.tool_hook(name, function, arguments)
 
     def tool_hook(self, function_name: str, function_call: Callable[..., Any], arguments: Dict[str, Any]) -> str:
-        """agno tool hook: show and journal the call, hand the model a compact text.
+        """Show and journal a tool call, run it, and hand the model a compact text.
 
-        The hook is told by agno to call `function_call(**arguments)` itself, which
-        lets it time the call and turn every outcome into a ToolResult.
+        It calls `function_call(**arguments)` itself, which lets it time the call and turn
+        every outcome into a ToolResult.
         """
         view = self._view
         if self.cancelled:
@@ -163,49 +182,49 @@ class AgentSession:
 
     # -- turn ----------------------------------------------------------------- #
 
-    def model_input(self, prompt: str) -> str:
-        """The user's message as the model gets it: after the date and time, and the
-        list of the files that changed since the agent read them (see `turn_notes`)."""
+    def instructions(self) -> str:
+        """The agent's system prompt, plus what changes from one turn to the next."""
+        extra = self.context.additional_context()
+        base = self.remote.instructions()  # type: ignore[union-attr]
+        return f"{base}\n\n{extra}" if extra else base
+
+    def request_body(self, prompt: str) -> Dict[str, Any]:
+        """The request of a turn. The automatic notes (date, files that changed) go in the
+        `prefix`: the server shows them to the model with the message, keeps them in the history
+        and leaves them out of summaries."""
         stale = self.reads.stale() if self.reads is not None else []
-        return f"{turn_notes(self.clock(), stale)}\n\n{prompt}"
+        return self.remote.client.body(  # type: ignore[union-attr]
+            prompt,
+            self.context.session_id,
+            tools=self.remote.schemas(),  # type: ignore[union-attr]
+            instructions=self.instructions(),
+            prefix=turn_notes(self.clock(), stale),
+        )
 
     def run_turn(self, view: TurnView, cancel: threading.Event) -> Optional[TurnStats]:
         """Stream the agent's answer to `view`. Never raises."""
-        from agno.run.agent import RunEvent, RunOutput
-
         self._view, self._cancel = view, cancel
         self.journal.log_prompt(view.prompt)
         if self.checkpoints is not None:
             self.checkpoints.begin_turn(view.prompt[:60])
-        self.agent.additional_context = self.context.additional_context() or None
         started = time.perf_counter()
-        run_output = None
+        done: Optional[Dict[str, Any]] = None
         try:
-            for chunk in self.agent.run(
-                self.model_input(view.prompt),
-                stream=True,
-                stream_events=True,  # for the token count of each model request
-                yield_run_output=True,
-                user_id=self.user_id,
-                session_id=self.context.session_id,
-            ):
-                if cancel.is_set():
-                    break
-                if isinstance(chunk, RunOutput):
-                    run_output = chunk
-                    continue
-                event = getattr(chunk, "event", None)
-                if event == RunEvent.model_request_completed:
-                    view.request_finished(getattr(chunk, "output_tokens", None))
-                    continue
-                if event is not None and event != RunEvent.run_content:
-                    continue
-                content = getattr(chunk, "content", None)
-                if isinstance(content, str) and content:
-                    view.add_text(content)
-        except Exception as error:
+            done = run_remote_turn(
+                self.remote.client,  # type: ignore[union-attr]
+                self.request_body(view.prompt),
+                self.execute_tool,
+                on_text=view.add_text,
+                on_usage=lambda prompt_tokens, completion_tokens: view.request_finished(completion_tokens),
+                on_note=view.add_note,
+                cancel=cancel,
+            )
+        except ClaraError as error:
             view.add_note(f"Agent error: {error}", STYLE_ERROR)
             self.journal.log_error(str(error))
+        except Exception as error:  # the UI must survive anything
+            view.add_note(f"Agent error: {type(error).__name__}: {error}", STYLE_ERROR)
+            self.journal.log_error(f"{type(error).__name__}: {error}")
         finally:
             self._view = None  # `_cancel` stays until the next turn so that `cancelled` is readable
 
@@ -213,9 +232,7 @@ class AgentSession:
             view.add_note("Interrupted by the user.")
         self.journal.log_answer(view.answer_text())
 
-        stats = self._account(run_output, time.perf_counter() - started)
-        if stats is not None and not cancel.is_set():
-            self._compact_if_needed(view)
+        stats = self._account(done, time.perf_counter() - started) if done is not None else None
         view.stats = stats
         if self.on_turn is not None:
             try:
@@ -224,50 +241,46 @@ class AgentSession:
                 self.journal.log_error(f"session not saved: {error}")
         return stats
 
-    def _account(self, run_output: Any, duration: float) -> Optional[TurnStats]:
-        """Usage ledger and context size after a turn."""
-        metrics = getattr(run_output, "metrics", None)
-        messages = getattr(run_output, "messages", None) or []
-        if messages:
-            self.context.observe(context_tokens_of(messages), estimate_messages(messages))
-        if metrics is None:
-            return None
-        stats = TurnStats.from_metrics(metrics, duration)
+    def _account(self, done: Dict[str, Any], duration: float) -> TurnStats:
+        """Usage ledger, context size and model after a turn."""
+        usage = done.get("usage") or {}
+        prompt_tokens, completion_tokens = int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0))
+        self.context.observe(done.get("context"))
+        self._use_model(str(done.get("model") or self.model), str(done.get("provider") or self.provider))
+        stats = TurnStats(prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, duration)
         self.usage.record(self.model, stats)
         return dataclasses.replace(stats, context_percent=self.context.percent)
 
+    def _use_model(self, model: str, provider: str) -> None:
+        """The server may switch model or provider at any time (its /provider command)."""
+        changed = (model, provider) != (self.model, self.provider)
+        self.model, self.provider = model, provider
+        if changed and self.on_model is not None:
+            self.on_model(model, provider)
+
     # -- context -------------------------------------------------------------- #
 
-    def _compact_if_needed(self, view: TurnView) -> None:
-        if not self.context.should_compact():
-            return
-        view.activity = "compacting"
-        view.add_note(f"Context is {self.context.percent:.0f}% full: compacting the conversation…")
+    def refresh_context(self) -> Optional[Dict[str, Any]]:
+        """Ask the server how full the conversation's context is (None if it cannot say)."""
         try:
-            before, after = self.compact()
-            view.add_note(f"Conversation compacted ({before:.0f}% → {after:.0f}% of the context).")
-        except Exception as error:
-            view.add_note(f"Could not compact the conversation: {error}", STYLE_ERROR)
+            info = self.remote.client.context(self.context.session_id)  # type: ignore[union-attr]
+        except ClaraError:
+            return None
+        self.context.observe(info)
+        self.context.summary = str(info.get("summary") or "")
+        return info
 
     def compact(self, focus: str = "") -> Tuple[float, float]:
-        """Replace the conversation by a summary. Returns the context usage
-        (percent) before and after. Blocking: call it from a worker thread."""
-        if self.summarize is None:
-            raise RuntimeError("no summariser configured")
-        messages: List[Any] = self.agent.get_chat_history(session_id=self.context.session_id) or []
-        transcript = build_transcript(messages)
-        if not transcript.strip() and not self.context.summary:
-            raise LookupError("the conversation is empty: nothing to compact")
-        summary = self.summarize(transcript, self.context.summary, focus)
-        before = self.context.percent
-        self.context.adopt_summary(summary)
-        self.agent.additional_context = self.context.additional_context() or None
-        return before, self.context.percent
+        """Replace the older messages by a summary, on the server. Returns the context usage
+        (percent) before and after. Blocking: call it from a worker thread. Raises
+        :class:`NothingToCompact` (a LookupError) when the conversation is empty."""
+        result = self.remote.client.compact(self.context.session_id, focus)  # type: ignore[union-attr]
+        self.refresh_context()
+        return float(result["before_percent"]), float(result["after_percent"])
 
-    def clear(self, base_session_id: Optional[str] = None) -> None:
-        """Start a fresh conversation (``/clear``), as a new session if an id is given."""
-        self.context.reset(base_session_id)
-        self.agent.additional_context = self.context.additional_context() or None
+    def clear(self, session_id: str) -> None:
+        """Start a fresh conversation (``/clear``); the old one stays on the server."""
+        self.context.reset(session_id)
         if self.todos is not None:
             self.todos.clear()
         if self.reads is not None:
