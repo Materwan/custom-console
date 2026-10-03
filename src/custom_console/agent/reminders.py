@@ -1,8 +1,8 @@
-"""Reminders: set from the console with /remind, and shown here, with every other Clara client,
-when the server announces them.
+"""Reminders and notifications: reminders are set from the console with /remind; the server announces
+them, and its notifications (from Clara, another client, or the server itself), to this user's clients.
 
 The server keeps the reminders and decides when they are due. A background thread holds a stream
-open to it; a reminder that came due while the console was closed arrives as soon as it connects.
+open to it; what came while the console was closed arrives as soon as it connects.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 import threading
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .clara import ClaraClient, ClaraError
 
@@ -19,6 +19,7 @@ LATE_SECONDS = 120  # a reminder shown this long after it fired is announced as 
 RECONNECT_SECONDS = 5.0
 
 WHEN_HELP = "WHEN: +30m, +2h, +3d | 09:30 | tomorrow 09:30 | 2026-10-05 09:30"
+TARGETS_HELP = "@SURFACES: only on those clients, e.g. @app or @app,discord (default: all of yours)"
 
 
 def _clock(text: str) -> Tuple[int, int]:
@@ -26,6 +27,16 @@ def _clock(text: str) -> Tuple[int, int]:
     if not match or int(match[1]) > 23 or int(match[2]) > 59:
         raise ValueError(f"Not a time of day: {text!r} (use HH:MM).")
     return int(match[1]), int(match[2])
+
+
+def take_targets(argument: str) -> Tuple[List[str], str]:
+    """``(surfaces, the rest)``: an ``@app,discord`` word among the first two says where to show it."""
+    words = argument.split()
+    for index, word in enumerate(words[:2]):
+        if word.startswith("@"):
+            del words[index]
+            return [name for name in word[1:].lower().split(",") if name], " ".join(words)
+    return [], argument
 
 
 def parse_remind(argument: str, now: datetime) -> Tuple[datetime, str, str]:
@@ -68,11 +79,15 @@ def local_time(moment: str) -> str:
 
 
 def notice(event: Dict[str, Any], now: datetime) -> str:
-    """The line shown for an announced reminder."""
+    """The line shown for an announced reminder (always this user's own) or a notification."""
+    if event.get("type") == "notification":
+        late = (now - datetime.fromisoformat(event["sent_at"])).total_seconds() > LATE_SECONDS
+        when = f"  (sent {local_time(event['sent_at'])})" if late else ""
+        title = f"{event['title']}: " if event.get("title") else ""
+        return f"🔔 {title}{event['text']}{when}"
     missed = (now - datetime.fromisoformat(event["fired_at"])).total_seconds() > LATE_SECONDS
     late = f"  (missed, it was due {local_time(event['due_at'])})" if missed else ""
-    author = f"  (set by {event['from']})" if event.get("from") else ""
-    return f"⏰ {event.get('message') or event['text']}{late}{author}"
+    return f"⏰ {event.get('message') or event['text']}{late}"
 
 
 SERVER_SAYS = {
@@ -83,8 +98,8 @@ SERVER_SAYS = {
 
 
 class ReminderListener:
-    """Calls `on_event(event)` for every reminder the server announces, and `on_status(text)` when the
-    server stops, is gone or is back, from a background thread. When the connection drops (the server
+    """Calls `on_event(event)` for every reminder and notification the server announces, and
+    `on_status(text)` when the server stops, is gone or is back, from a background thread. When the connection drops (the server
     restarts, the network goes) it tries again."""
 
     def __init__(

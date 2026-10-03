@@ -724,12 +724,12 @@ class TestReminders:
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         return {"type": "reminder", "id": 1, "text": text, "due_at": now, "fired_at": now, "from": "Alice", **fields}
 
-    def test_remind_sets_one_on_the_server_for_every_client(self, tmp_path):
+    def test_remind_sets_one_on_the_server_for_your_clients(self, tmp_path):
         session = Session(tmp_path)
 
         def driver(s):
             s.send("/remind weekly +2h Water the plants")
-            s.wait_output("every connected client will see it")
+            s.wait_output("shown on all your clients")
 
         out = session.run(driver)
         [reminder] = session.clara.reminder_list
@@ -789,7 +789,7 @@ class TestReminders:
             s.wait_output("Dentist at 9")
 
         out = session.run(driver)
-        assert "⏰ Dentist at 9" in out and "set by Alice" in out
+        assert "⏰ Dentist at 9" in out and "Alice" not in out  # always your own: no author
 
     def test_a_reminder_that_comes_due_while_the_console_runs_is_shown(self, tmp_path, monkeypatch):
         monkeypatch.setattr(reminders, "RECONNECT_SECONDS", 0.05)

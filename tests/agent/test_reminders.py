@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fake_clara import FakeClara
 
-from custom_console.agent.reminders import ReminderListener, notice, parse_remind
+from custom_console.agent.reminders import ReminderListener, notice, parse_remind, take_targets
 
 PARIS = timezone(timedelta(hours=2))
 NOW = datetime(2026, 10, 2, 12, 0, tzinfo=PARIS)
@@ -68,13 +68,23 @@ class TestNotice:
 
     def test_a_reminder_that_just_fired(self):
         text = notice(self.event(), datetime(2026, 10, 2, 10, 0, 5, tzinfo=timezone.utc))
-        assert "Dentist" in text and "set by Erwan" in text and "missed" not in text
+        assert "Dentist" in text and "missed" not in text
 
     def test_a_reminder_that_fired_while_the_console_was_closed(self):
         assert "missed, it was due" in notice(self.event(), datetime(2026, 10, 2, 15, 0, tzinfo=timezone.utc))
 
-    def test_no_author(self):
-        assert "set by" not in notice(self.event(**{"from": None}), datetime(2026, 10, 2, 10, 0, 1, tzinfo=timezone.utc))
+    def test_a_reminder_is_always_ones_own_so_its_author_is_not_shown(self):
+        assert "Erwan" not in notice(self.event(), datetime(2026, 10, 2, 10, 0, 1, tzinfo=timezone.utc))
+
+    def test_a_notification(self):
+        event = {"type": "notification", "title": "Answer ready", "text": "Done.", "sent_at": "2026-10-02T10:00:00+00:00"}
+        assert notice(event, datetime(2026, 10, 2, 10, 0, 1, tzinfo=timezone.utc)) == "🔔 Answer ready: Done."
+        assert "(sent " in notice({**event, "title": ""}, datetime(2026, 10, 2, 15, 0, tzinfo=timezone.utc))
+
+    def test_targets_are_an_at_word_before_the_time(self):
+        assert take_targets("@App,discord +30m Tea") == (["app", "discord"], "+30m Tea")
+        assert take_targets("weekly @app 09:00 Bins") == (["app"], "weekly 09:00 Bins")
+        assert take_targets("+30m mail @bob") == ([], "+30m mail @bob")
 
 
     def test_the_message_clara_wrote_replaces_the_reminder_name(self):

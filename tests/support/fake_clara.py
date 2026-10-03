@@ -111,11 +111,16 @@ class FakeClara(ClaraClient):
     def forget(self, conversation: str) -> None:
         self.forgotten.append(conversation)
 
-    def add_reminder(self, at: str, text: str, repeat: str = "") -> Dict[str, Any]:
+    def add_reminder(self, at: str, text: str, repeat: str = "", targets: Optional[List[str]] = None) -> Dict[str, Any]:
         self._check()
-        reminder = {"id": len(self.reminder_list) + 1, "text": text, "due_at": at, "repeat": repeat}
+        reminder = {"id": len(self.reminder_list) + 1, "text": text, "due_at": at, "repeat": repeat,
+                    "targets": list(targets or [])}
         self.reminder_list.append(reminder)
         return reminder
+
+    def notify(self, text: str, title: str = "", targets: Optional[List[str]] = None) -> Dict[str, Any]:
+        self._check()
+        return {"id": 1, "targets": list(targets or [])}
 
     def reminders(self) -> List[Dict[str, Any]]:
         self._check()

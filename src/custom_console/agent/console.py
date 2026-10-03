@@ -275,7 +275,7 @@ class AgentConsole:
     # -- lifecycle -------------------------------------------------------------------- #
 
     def _reminder(self, event: Dict[str, Any]) -> None:
-        """A reminder came due on the server (any client may have set it): show it."""
+        """A reminder of this user came due on the server, or a notification came: show it."""
         text = notice(event, datetime.now().astimezone())
         # the bell goes in after rendering: rich strips control characters from what it prints
         self.screen.notify("\a" + self.renderer.text(text, "bold yellow"))

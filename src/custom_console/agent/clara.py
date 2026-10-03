@@ -142,13 +142,21 @@ class ClaraClient:
     def _identity(self) -> Dict[str, str]:
         return {"surface": self.surface, "user_id": self.user_id}
 
-    def add_reminder(self, at: str, text: str, repeat: str = "") -> Dict[str, Any]:
-        """Set a reminder every connected client will be shown. `at` is ISO 8601 with its offset.
-        Returns `{"id", "text", "due_at", "repeat"}`."""
+    def add_reminder(self, at: str, text: str, repeat: str = "", targets: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Set a reminder for this user, shown on the surfaces in `targets` (none: on all of theirs). `at` is
+        ISO 8601 with its offset. Returns `{"id", "text", "due_at", "repeat", "targets"}`."""
         body: Dict[str, Any] = {**self._identity(), "text": text, "at": at, "repeat": repeat}
         if self.user_name:
             body["user_name"] = self.user_name
+        if targets:
+            body["targets"] = list(targets)
         return self._request("POST", "/v1/reminders", json=body).json()
+
+    def notify(self, text: str, title: str = "", targets: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Send this user a notification now (e.g. when a long job is done), on the surfaces in `targets`
+        (none: on all of theirs)."""
+        body: Dict[str, Any] = {**self._identity(), "text": text, "title": title, "targets": list(targets or [])}
+        return self._request("POST", "/v1/notifications", json=body).json()
 
     def reminders(self) -> List[Dict[str, Any]]:
         """This user's reminders that have not fired yet."""
@@ -158,12 +166,12 @@ class ClaraClient:
         self._request("DELETE", f"/v1/reminders/{reminder_id}", params=self._identity())
 
     def reminder_events(self) -> Iterator[Dict[str, Any]]:
-        """What the server announces, for as long as the connection holds: ``reminder`` events (what
-        fired while this client was away first) and ``server`` events (``state``: running, stopping or
-        stopped). Closing the generator closes the connection."""
-        response = self._request("GET", "/v1/reminders/stream", stream=True)
+        """What the server announces to this user, for as long as the connection holds: ``reminder`` and
+        ``notification`` events (what came while this client was away first) and ``server`` events
+        (``state``: running, stopping or stopped). Closing the generator closes the connection."""
+        response = self._request("GET", "/v1/notifications/stream", params=self._identity(), stream=True)
         for event in self._events(response):
-            if event.get("type") in ("reminder", "server"):
+            if event.get("type") in ("reminder", "notification", "server"):
                 yield event
 
     # -- the server itself ----------------------------------------------------------------- #

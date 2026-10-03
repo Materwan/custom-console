@@ -19,7 +19,7 @@ from ..shell.commands import build_file_registry
 from ..shell.printer import QuietPrinter
 from ..shell.repl import Shell
 from .permissions import PermissionLevel, permission_label
-from .reminders import REPEATS, local_time, parse_remind
+from .reminders import REPEATS, local_time, parse_remind, take_targets
 from .render import turn_renderables
 from .sessions import ago
 from .slash import CommandResult, SlashCommand, SlashRegistry
@@ -100,7 +100,7 @@ class AgentCommands:
                 self._complete_on_server("provider"),
             )
         )
-        add(SlashCommand("remind", "remind EVERY connected Clara client at a time", self.remind, "[daily|weekly|monthly] WHEN TEXT", self.complete_remind))
+        add(SlashCommand("remind", "a notification for you at a time, on your Clara clients", self.remind, "[daily|weekly|monthly] [@SURFACES] WHEN TEXT", self.complete_remind))
         add(SlashCommand("reminders", "your reminders that have not fired yet", self.reminders))
         add(SlashCommand("unremind", "cancel one of your reminders", self.unremind, "ID", self.complete_unremind))
         add(SlashCommand("usage", "tokens used: this session and in total", self.usage))
@@ -192,20 +192,20 @@ class AgentCommands:
 
         return completer
 
-    # -- /remind, /reminders, /unremind: shown on every connected client ----------------------- #
+    # -- /remind, /reminders, /unremind: shown on your own clients ------------------------------ #
 
     def remind(self, arguments: str) -> CommandResult:
+        targets, arguments = take_targets(arguments)
         try:
             due, repeat, text = parse_remind(arguments, datetime.now().astimezone())
-            reminder = self.app.client.add_reminder(due.isoformat(timespec="seconds"), text, repeat)
+            reminder = self.app.client.add_reminder(due.isoformat(timespec="seconds"), text, repeat, targets)
         except (ValueError, ClaraError) as error:
             return self._error(str(error))
         when = local_time(reminder["due_at"])
         again = f", then {reminder['repeat']}" if reminder["repeat"] else ""
+        where = ", ".join(reminder.get("targets") or []) or "all your clients"
         return CommandResult(
-            self.renderer.text(
-                f"Reminder {reminder['id']} set for {when}{again}: every connected client will see it.", "green"
-            )
+            self.renderer.text(f"Reminder {reminder['id']} set for {when}{again}, shown on {where}.", "green")
         )
 
     def reminders(self, arguments: str) -> CommandResult:
@@ -219,9 +219,11 @@ class AgentCommands:
         table.add_column("#", justify="right")
         table.add_column("When")
         table.add_column("Repeat")
+        table.add_column("Where")
         table.add_column("Text", overflow="fold")
         for reminder in found:
-            table.add_row(str(reminder["id"]), local_time(reminder["due_at"]), reminder["repeat"], reminder["text"])
+            where = ", ".join(reminder.get("targets") or []) or "everywhere"
+            table.add_row(str(reminder["id"]), local_time(reminder["due_at"]), reminder["repeat"], where, reminder["text"])
         return CommandResult(self.renderer.render(table))
 
     def unremind(self, arguments: str) -> CommandResult:

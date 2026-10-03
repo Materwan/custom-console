@@ -25,6 +25,8 @@ class State:
         self.deleted = []
         self.closed_early = threading.Event()
         self.reminder_bodies = []
+        self.notification_bodies = []
+        self.stream_paths = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -66,15 +68,18 @@ class Handler(BaseHTTPRequestHandler):
             if not self.allowed(CHAT):
                 return
             return self.reply(200, {"tokens": 100, "window": 1000, "percent": 10.0, "summary": "", "messages": 2})
-        if self.path.startswith("/v1/reminders/stream"):
+        if self.path.startswith("/v1/notifications/stream"):
             if not self.allowed(CHAT):
                 return
+            self.state.stream_paths.append(self.path)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
             self.wfile.write(b": keepalive\n\n")
             self.event({"type": "reminder", "id": 1, "text": "Dentist é", "due_at": "2026-10-02T10:00:00+00:00",
                         "fired_at": "2026-10-02T10:00:00+00:00", "from": "Erwan"})
+            self.event({"type": "notification", "id": 2, "title": "", "text": "Build done",
+                        "sent_at": "2026-10-02T10:00:00+00:00", "source": "server"})
             self.event({"type": "server", "state": "stopping", "message": "Clara is stopping"})
             return self.event({"type": "something-else"})
         if self.path.startswith("/v1/reminders"):
@@ -111,6 +116,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.body["text"] == "past":
                 return self.reply(422, {"detail": "That moment is already past."})
             return self.reply(201, {"id": 7, "text": self.body["text"], "due_at": self.body["at"], "repeat": self.body["repeat"]})
+        if self.path == "/v1/notifications":
+            if self.allowed(CHAT):
+                self.state.notification_bodies.append(self.body)
+                self.reply(201, {"id": 1, "targets": self.body["targets"]})
+            return
         if self.path == "/v1/admin/command":
             if self.allowed(ADMIN):
                 line = self.body["line"]
@@ -355,11 +365,22 @@ class TestReminders:
         client.cancel_reminder(3)
         assert state.deleted == ["/v1/reminders/3?surface=console&user_id=erwan"]
 
-    def test_the_stream_gives_the_reminders_and_the_state_of_the_server_and_nothing_else(self, server):
-        url, _ = server
+    def test_the_stream_gives_the_reminders_notifications_and_state_of_the_server_and_nothing_else(self, server):
+        url, state = server
         events = list(client_for(url).reminder_events())
-        assert [e["type"] for e in events] == ["reminder", "server"]
-        assert events[0]["text"] == "Dentist é" and events[1]["state"] == "stopping"
+        assert [e["type"] for e in events] == ["reminder", "notification", "server"]
+        assert events[0]["text"] == "Dentist é" and events[2]["state"] == "stopping"
+        assert state.stream_paths == ["/v1/notifications/stream?surface=console&user_id=erwan"]  # as this user
+
+    def test_a_reminder_can_be_for_some_surfaces_and_a_notification_sent(self, server):
+        url, state = server
+        client = client_for(url)
+        client.add_reminder("2026-10-05T09:00:00+02:00", "Dentist", targets=["app"])
+        assert state.reminder_bodies[-1]["targets"] == ["app"]
+        client.notify("Long job done", "Job", ["app", "cli"])
+        assert state.notification_bodies == [
+            {"surface": "console", "user_id": "erwan", "text": "Long job done", "title": "Job", "targets": ["app", "cli"]}
+        ]
 
     def test_the_stream_needs_the_token(self, server):
         url, _ = server
