@@ -249,6 +249,19 @@ class ClaraClient:
         body: Dict[str, Any] = {**self._identity(), "text": text, "title": title, "targets": list(targets or [])}
         return self._request("POST", "/v1/notifications", json=body).json()
 
+    def settings(self) -> Dict[str, Any]:
+        """This user's settings on the server: `notify_after` (seconds a task takes before it notifies them when
+        done; 0: never; None: not set), `notify_after_default` and `notify_after_effective`."""
+        return self._request("GET", "/v1/settings", params=self._identity()).json()
+
+    def set_notify_after(self, seconds: Optional[int]) -> Dict[str, Any]:
+        """Set how long a task takes before this user is notified when it is done (0: never; None: the server's
+        default). Returns the settings."""
+        body: Dict[str, Any] = {**self._identity(), "notify_after": seconds}
+        if self.user_name:
+            body["user_name"] = self.user_name
+        return self._request("PATCH", "/v1/settings", json=body).json()
+
     def reminders(self) -> List[Dict[str, Any]]:
         """This user's reminders that have not fired yet."""
         return self._request("GET", "/v1/reminders", params=self._identity()).json()["reminders"]

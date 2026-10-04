@@ -1,4 +1,4 @@
-"""The agent's slash commands: /model /provider /remind /reminders /unremind /usage /context /compact
+"""The agent's slash commands: /model /provider /remind /reminders /unremind /notify-after /usage /context /compact
 /clear /undo /init /todo /permissions, plus the file commands of the shell (/ls /cd /cat ...). /model and /provider
 are the Clara server's own commands, run there."""
 
@@ -102,6 +102,7 @@ class AgentCommands:
         add(SlashCommand("remind", "a notification for you at a time, on your Clara clients", self.remind, "[daily|weekly|monthly] [@SURFACES] WHEN TEXT", self.complete_remind))
         add(SlashCommand("reminders", "your reminders that have not fired yet", self.reminders))
         add(SlashCommand("unremind", "cancel one of your reminders", self.unremind, "ID", self.complete_unremind))
+        add(SlashCommand("notify-after", "how long a task takes before you are notified when it is done", self.notify_after, "[SECONDS|off|default]", self.complete_notify_after))
         add(SlashCommand("usage", "tokens used: this session and in total", self.usage))
         add(SlashCommand("context", "how full the context window is", self.context))
         add(SlashCommand("compact", "summarise the conversation to free context", self.compact, "[FOCUS]"))
@@ -258,6 +259,41 @@ class AgentCommands:
         for reminder in found:
             if str(reminder["id"]).startswith(arguments):
                 yield Completion(str(reminder["id"]), start_position=-len(arguments), display_meta=reminder["text"][:60])
+
+    # -- /notify-after: when a finished task notifies you ------------------------------------- #
+
+    def notify_after(self, arguments: str) -> CommandResult:
+        word = arguments.strip().lower()
+        try:
+            if not word:
+                settings = self.app.client.settings()
+            elif word == "default":
+                settings = self.app.client.set_notify_after(None)
+            elif word in ("off", "never"):
+                settings = self.app.client.set_notify_after(0)
+            elif word.isdigit():
+                settings = self.app.client.set_notify_after(int(word))
+            else:
+                return self._error("Usage: /notify-after [SECONDS|off|default]")
+        except ClaraError as error:
+            return self._error(str(error))
+
+        def words(seconds: int) -> str:
+            return "never" if seconds == 0 else f"after {seconds} s of work"
+
+        own, default = settings["notify_after"], settings["notify_after_default"]
+        if own is None:
+            text = f"You are notified {words(default)} when a task is done (the server's default)."
+        else:
+            text = f"You are notified {words(own)} when a task is done (the server's default: {words(default)})."
+        return CommandResult(self.renderer.text(text, "green" if word else "dim"))
+
+    def complete_notify_after(self, arguments: str) -> Iterator[Completion]:
+        if " " in arguments:
+            return
+        for word, meta in {"off": "never notified", "default": "the server's delay"}.items():
+            if word.startswith(arguments.lower()):
+                yield Completion(word, start_position=-len(arguments), display_meta=meta)
 
     # -- /usage, /context ------------------------------------------------------------------ #
 

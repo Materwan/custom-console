@@ -72,6 +72,7 @@ class FakeClara(ClaraClient):
         self.nothing_to_compact = False
         self.reminder_list: List[Dict[str, Any]] = []  # what /remind created
         self.announced: List[Dict[str, Any]] = []  # reminders the next connection of the stream delivers
+        self.notify_after_value: Optional[int] = None  # what /notify-after set (None: the server's default)
 
     def _check(self) -> None:
         if self.down:
@@ -121,6 +122,17 @@ class FakeClara(ClaraClient):
     def notify(self, text: str, title: str = "", targets: Optional[List[str]] = None) -> Dict[str, Any]:
         self._check()
         return {"id": 1, "targets": list(targets or [])}
+
+    def settings(self) -> Dict[str, Any]:
+        self._check()
+        own = self.notify_after_value
+        return {"notify_after": own, "notify_after_default": 120,
+                "notify_after_effective": 120 if own is None else own}
+
+    def set_notify_after(self, seconds: Optional[int]) -> Dict[str, Any]:
+        self._check()
+        self.notify_after_value = seconds
+        return self.settings()
 
     def reminders(self) -> List[Dict[str, Any]]:
         self._check()

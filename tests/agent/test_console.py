@@ -782,6 +782,22 @@ class TestReminders:
         assert "Dentist" in out and "weekly" in out
         assert [r["text"] for r in session.clara.reminder_list] == ["Bins"]
 
+    def test_notify_after_is_shown_and_set(self, tmp_path):
+        session = Session(tmp_path)
+
+        def driver(s):
+            s.send("/notify-after")
+            s.wait_output("after 120 s of work")
+            s.send("/notify-after off")
+            s.wait_output("notified never")
+            s.send("/notify-after 90")
+            s.wait_output("notified after 90 s")
+            s.send("/notify-after soon")
+            s.wait_output("Usage: /notify-after")
+
+        session.run(driver)
+        assert session.clara.notify_after_value == 90  # what was not understood changed nothing
+
     def test_a_reminder_waiting_at_startup_is_shown_above_the_prompt(self, tmp_path):
         session = Session(tmp_path)
         session.clara.announced.append(self.announced("Dentist at 9"))  # came due while the console was closed

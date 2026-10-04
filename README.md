@@ -194,6 +194,7 @@ Typing `/` lists them above the input, with what they do.
 | `/provider [local\|cloud]` | the server's `/provider`: show where it runs the model, or switch (needs `CLARA_ADMIN_TOKEN`) |
 | `/remind [daily\|weekly\|monthly] [@SURFACES] WHEN TEXT` | a reminder for you, shown on your Clara clients at that time (see below) |
 | `/reminders` `/unremind ID` | your reminders that have not fired yet; cancel one |
+| `/notify-after [SECONDS\|off\|default]` | how long a task (a turn, tools included) takes before you are notified on your Clara clients when it is done; `off`: never; `default`: the server's delay. Kept by the server, so it is the same on every client |
 | `/usage` | tokens used by this session, today, the last 7 days and in total, per model |
 | `/context` | how full the context window is: system prompt, tools, project file, summary, messages |
 | `/compact [FOCUS]` | have the server replace the older messages by a summary written by the model |
