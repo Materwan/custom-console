@@ -123,7 +123,7 @@ class SubAgents:
         )
         body = session.remote.client.body(  # type: ignore[union-attr]
             prompt,
-            f"sub-{uuid.uuid4().hex}",
+            session.remote.client.conversation_id(f"sub-{uuid.uuid4().hex}"),  # type: ignore[union-attr]
             ephemeral=True,
             instructions=instructions,
             tools=session.remote.schemas(chosen),  # type: ignore[union-attr]

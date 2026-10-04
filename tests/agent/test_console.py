@@ -132,7 +132,7 @@ class TestAgentConsole:
 
         [body] = session.clara.bodies
         assert body["message"] == "hello" and body["surface"] == "console" and body["user_id"] == "tester"
-        assert body["conversation"].startswith("console_session-")
+        assert body["conversation"].startswith("console:tester:console_session-")  # under the user (or the server refuses it)
         assert body["prefix"].startswith("[Automatic note, not written by the user. Current date and time: ")
         assert session.settings.load_instructions() in body["instructions"]
         names = {tool["function"]["name"] for tool in body["tools"]}

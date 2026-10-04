@@ -189,7 +189,7 @@ class TestTask:
         assert output == {"success": True, "data": {"report": "Found it in a.py."}}
         [body] = h.fake.bodies
         assert body["message"] == "Where is x defined?" and body["instructions"].endswith("Working directory: /work")
-        assert body["ephemeral"] is True and body["conversation"].startswith("sub-")  # a job, not a conversation
+        assert body["ephemeral"] is True and body["conversation"].startswith(f"console:{body['user_id']}:sub-")  # a job, under the user
         assert [o["success"] for o in h.outputs()] == [True, True]
         line = h.view.snapshot()[0]
         assert line.text.startswith("✔ task(") and "· 2 tool call(s)" in line.text

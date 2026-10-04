@@ -57,6 +57,15 @@ class ClaraClient:
         self.surface = surface
         self._http = session or requests.Session()
 
+    def conversation_id(self, name: str) -> str:
+        """The server's id for one of this user's conversations: `console:<user>:<name>`. A user who signed in may
+        only use conversations under their own account (HTTP 403 otherwise), and a client token kept to the
+        console surface (CLARA_CLIENT_SURFACES) only those starting with `console:`."""
+        return f"{self.surface}:{self.user_id}:{name}"
+
+    def owns(self, conversation: str) -> bool:
+        return conversation.startswith(f"{self.surface}:{self.user_id}:")
+
     # -- plumbing ------------------------------------------------------------------ #
 
     def _headers(self, token: Optional[str]) -> Dict[str, str]:

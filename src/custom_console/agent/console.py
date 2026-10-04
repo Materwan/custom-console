@@ -147,7 +147,7 @@ class AgentConsole:
     # -- saved sessions (/restore) ---------------------------------------------------- #
 
     def _base_id(self, record: SessionRecord) -> str:
-        return f"{self.settings.agent_session_id}-{record.id}"
+        return self.client.conversation_id(f"{self.settings.agent_session_id}-{record.id}")
 
     def _turn_done(self, view: Any) -> None:
         self.record.turns.append(view.to_dict())
@@ -199,6 +199,10 @@ class AgentConsole:
         self.toolset.replace_disabled(record.disabled_tools)
         self._sync_tools()
         self.record = record
+        if not self.client.owns(self.context.session_id):
+            # saved before conversations were named after the user: the server refuses that id to a login
+            self.context.reset(self._base_id(record))
+            notes.append("This session was saved by an older version: you can read it above, but Clara continues it as a new conversation.")
         if self.context.session_id not in self.conversations:
             self.conversations.append(self.context.session_id)
         info = self.session.refresh_context()

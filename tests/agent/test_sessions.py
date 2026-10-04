@@ -314,6 +314,21 @@ class TestRestore:
         out = session.run(driver)
         assert "5 earlier exchange(s) not shown" in out and "question 44" in out and "question 4\n" not in out
 
+    def test_a_session_saved_under_an_old_conversation_id_goes_on_under_the_users_own(self, tmp_path):
+        session = Session(tmp_path, memory=True)
+        record = session.console_.store.new_record()
+        record.turns = [turn("old question", "old answer")]
+        record.context = {"conversation": "console_session-x", "summary": "old"}  # refused to a login (HTTP 403)
+        session.console_.store.save(record)
+
+        def driver(s):
+            s.send("/restore")
+            s.wait_output("saved by an older version")
+
+        session.run(driver)
+        restored = session.console_.context.session_id
+        assert session.console_.client.owns(restored) and restored.endswith(f"console_session-{record.id}")
+
     def test_arguments_are_completed(self, tmp_path):
         from prompt_toolkit.document import Document
 
