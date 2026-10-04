@@ -68,6 +68,7 @@ class AgentConsole:
             user_id=settings.agent_user_id,
             user_name=settings.clara_user_name,
             admin_token=settings.clara_admin_token,
+            password=settings.clara_password if settings.clara_user else None,
         )
         self.renderer = Renderer(self.console)
         settings.agent_dir.mkdir(parents=True, exist_ok=True)

@@ -40,8 +40,9 @@ project root (see `.env.example`; empty values mean "use the default").
 | `DATA_DIR` | `<project>/data` | Logs, saved sessions, usage ledger, checkpoints, caches |
 | `WSL_DISTRO` | `Ubuntu` | Distribution exposed as `/wsl-<name>/` |
 | `CLARA_URL` | `http://127.0.0.1:8765` | The Clara server the agent talks to |
-| `CLARA_TOKEN` | – | Your chat token on that server (`CLARA_TOKENS` there). Required by `ai agent` |
-| `CLARA_ADMIN_TOKEN` | – | Optional: lets `/model` and `/provider` run in the server's console |
+| `CLARA_USER`, `CLARA_PASSWORD` | – | Your user name and password on that server (the administrator makes them with `/user add`): `ai agent` signs in by itself, and the server knows it is you |
+| `CLARA_TOKEN` | – | Instead of a user: a chat token (`CLARA_TOKENS` there). Required by `ai agent` when there is no `CLARA_USER` |
+| `CLARA_ADMIN_TOKEN` | – | Optional: lets `/model` and `/provider` run in the server's console (not needed when `CLARA_USER` is an administrator) |
 | `CLARA_USER_NAME` | – | How Clara should call you |
 | `OLLAMA_HOST` | `http://localhost:11434` | The local Ollama of `ai list` / `ai start` (not used by the agent) |
 | `AGENT_DEFAULT_MODEL` | `gemma4` | Model `ai start` loads when none is given |

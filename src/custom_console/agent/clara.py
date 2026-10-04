@@ -7,6 +7,7 @@ Server-Sent Events. This module only speaks the protocol; `remote.py` runs a tur
 from __future__ import annotations
 
 import json
+import socket
 from typing import Any, Dict, Iterator, List, Optional
 
 import requests
@@ -42,10 +43,14 @@ class ClaraClient:
         user_name: Optional[str] = None,
         surface: str = "console",
         admin_token: Optional[str] = None,
+        password: Optional[str] = None,
         session: Optional[requests.Session] = None,
     ) -> None:
+        """With a `password`, the client signs in as `user_id` when it needs a token (and again if the server
+        signs it out); the token it gets is kept in memory only. Without one, `token` is a shared client token."""
         self.url = url.rstrip("/")
         self.token = token
+        self.password = password
         self.admin_token = admin_token
         self.user_id = user_id
         self.user_name = user_name
@@ -57,10 +62,33 @@ class ClaraClient:
     def _headers(self, token: Optional[str]) -> Dict[str, str]:
         return {"Authorization": f"Bearer {token}"} if token else {}
 
-    def _request(self, method: str, path: str, *, token: Optional[str] = None, **options: Any) -> requests.Response:
+    def _login(self) -> str:
+        """Sign in with the password: a token bound to this user and surface."""
+        try:
+            response = self._http.post(
+                self.url + "/v1/auth/login",
+                json={"username": self.user_id, "password": self.password, "surface": self.surface,
+                      "device": socket.gethostname()},
+                timeout=(CONNECT_TIMEOUT, 30),
+            )
+        except requests.ConnectionError:
+            raise ClaraError(f"Cannot reach the Clara server at {self.url}.") from None
+        except requests.Timeout:
+            raise ClaraError(f"The Clara server at {self.url} did not answer in time.") from None
+        if response.status_code >= 400:
+            raise ClaraError(f"Cannot sign in as {self.user_id}: {_detail(response)}")
+        self.token = response.json()["token"]
+        return self.token
+
+    def _request(
+        self, method: str, path: str, *, token: Optional[str] = None, _retry: bool = True, **options: Any
+    ) -> requests.Response:
+        own = token is None
+        if own and not self.token and self.password:
+            self._login()
         token = token if token is not None else self.token
         if not token:
-            raise ClaraError("No token for the Clara server: set CLARA_TOKEN in the .env file.")
+            raise ClaraError("No way to sign in to the Clara server: set CLARA_USER and CLARA_PASSWORD (or CLARA_TOKEN) in the .env file.")
         try:
             response = self._http.request(
                 method,
@@ -73,6 +101,10 @@ class ClaraClient:
             raise ClaraError(f"Cannot reach the Clara server at {self.url}.") from None
         except requests.Timeout:
             raise ClaraError(f"The Clara server at {self.url} did not answer in time.") from None
+        if response.status_code == 401 and own and self.password and _retry:  # signed out: sign in again, once
+            response.close()
+            self.token = None
+            return self._request(method, path, _retry=False, **options)
         if response.status_code >= 400:
             raise ClaraError(f"Clara server: {_detail(response)} (HTTP {response.status_code})")
         return response
@@ -187,14 +219,18 @@ class ClaraClient:
         return response.json()
 
     def admin(self, line: str) -> str:
-        """Run a command of the server's console (/provider, /model...); needs the admin token."""
-        if not self.admin_token:
+        """Run a command of the server's console (/provider, /model...); needs the admin token, or to be signed
+        in as an administrator."""
+        if not self.admin_token and not self.password:
             raise ClaraError("No admin token: set CLARA_ADMIN_TOKEN in the .env file to use the server's commands.")
         response = self._request("POST", "/v1/admin/command", token=self.admin_token, json={"line": line})
         return response.json().get("output", "")
 
     def admin_commands(self) -> List[Dict[str, Any]]:
         """The server's console commands, with the values they complete."""
-        if not self.admin_token:
+        if not self.admin_token and not self.password:
             return []
-        return self._request("GET", "/v1/admin/commands", token=self.admin_token).json()
+        try:
+            return self._request("GET", "/v1/admin/commands", token=self.admin_token).json()
+        except ClaraError:
+            return []  # signed in as a user who is not an administrator

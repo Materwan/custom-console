@@ -74,6 +74,8 @@ class Settings:
     clara_url: str
     clara_token: Optional[str]  # chat token (CLARA_TOKENS on the server)
     clara_admin_token: Optional[str]  # optional: lets /model and /provider reach the server's console
+    clara_user: Optional[str]  # your user name on the server: with clara_password, instead of a shared token
+    clara_password: Optional[str]
     clara_user_name: Optional[str]  # how Clara should call you
 
     # Agent
@@ -186,12 +188,15 @@ def load_settings(
         clara_url=_text(env, "CLARA_URL", "http://127.0.0.1:8765").rstrip("/"),
         clara_token=_get(env, "CLARA_TOKEN"),
         clara_admin_token=_get(env, "CLARA_ADMIN_TOKEN"),
+        clara_user=(_get(env, "CLARA_USER") or "").lower() or None,
+        clara_password=_get(env, "CLARA_PASSWORD"),
         clara_user_name=_get(env, "CLARA_USER_NAME"),
         agent_instructions_path=_path(
             env, "AGENT_INSTRUCTIONS_PATH", root / "config" / "agent_instructions.txt"
         ),
         agent_permission_level=_int(env, "AGENT_PERMISSION_LEVEL", 1),
-        agent_user_id=_text(env, "AGENT_USER_ID", "default_user"),
+        # a user who signs in speaks as themselves: the server takes nothing else
+        agent_user_id=(_get(env, "CLARA_USER") or "").lower() or _text(env, "AGENT_USER_ID", "default_user"),
         agent_session_id=_text(env, "AGENT_SESSION_ID", "console_session"),
         agent_keep_sessions=max(1, _int(env, "AGENT_KEEP_SESSIONS", 5)),
         agent_project_file=_text(env, "AGENT_PROJECT_FILE", "AGENT.md"),

@@ -95,3 +95,10 @@ def test_dotenv_file_is_loaded_without_overriding_the_environment(tmp_path, monk
     assert s.default_model == "from-dotenv"
     assert s.wsl_distro == "FromEnv"
     monkeypatch.delenv("AGENT_DEFAULT_MODEL", raising=False)
+
+
+def test_a_user_who_signs_in_speaks_as_themselves(tmp_path):
+    s = load({"CLARA_USER": " Erwan ", "CLARA_PASSWORD": "pw", "AGENT_USER_ID": "someone-else"}, tmp_path)
+    assert (s.clara_user, s.clara_password, s.agent_user_id) == ("erwan", "pw", "erwan")
+    s = load({}, tmp_path)
+    assert (s.clara_user, s.clara_password, s.agent_user_id) == (None, None, "default_user")

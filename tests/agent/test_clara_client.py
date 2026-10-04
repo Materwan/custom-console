@@ -27,6 +27,9 @@ class State:
         self.reminder_bodies = []
         self.notification_bodies = []
         self.stream_paths = []
+        self.logins = []  # bodies of POST /v1/auth/login
+        self.user_tokens = set()  # tokens the server gave and still accepts
+        self.admin_user = False  # the user who signs in is an administrator
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -49,7 +52,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def allowed(self, token):
-        if self.headers.get("Authorization") == f"Bearer {token}":
+        sent = self.headers.get("Authorization", "")
+        signed_in = sent.removeprefix("Bearer ") in self.state.user_tokens
+        if sent == f"Bearer {token}" or (signed_in and (token == CHAT or self.state.admin_user)):
             return True
         self.reply(401, {"detail": "Missing or invalid token"})
         return False
@@ -95,6 +100,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.body = self.json_body()  # always read it: answering with the request unread resets the connection
+        if self.path == "/v1/auth/login":
+            self.state.logins.append(self.body)
+            if self.body["password"] != "right-password":
+                return self.reply(401, {"detail": "Wrong user name or password"})
+            token = f"clu_{len(self.state.logins)}"
+            self.state.user_tokens.add(token)
+            return self.reply(200, {"token": token, "user": {"name": self.body["username"]}})
         if self.path == "/v1/chat/stream":
             return self.stream() if self.allowed(CHAT) else None
         if self.path.startswith("/v1/turns/") and self.path.endswith("/tool-results"):
@@ -386,3 +398,47 @@ class TestReminders:
         url, _ = server
         with pytest.raises(ClaraError, match="401"):
             list(client_for(url, token="nope").reminder_events())
+
+
+class TestPassword:
+    def user(self, url, password="right-password", **options):
+        return ClaraClient(url, None, user_id="erwan", surface="console", password=password, **options)
+
+    def test_it_signs_in_when_it_first_needs_a_token_and_then_keeps_it(self, server):
+        url, state = server
+        client = self.user(url)
+        client.notify("one")
+        client.notify("two")
+        assert len(state.logins) == 1
+        assert state.logins[0]["username"] == "erwan" and state.logins[0]["surface"] == "console"
+        assert len(state.notification_bodies) == 2
+
+    def test_a_wrong_password_says_so(self, server):
+        url, _ = server
+        with pytest.raises(ClaraError, match="Cannot sign in as erwan: Wrong user name or password"):
+            self.user(url, password="nope").notify("x")
+
+    def test_it_signs_in_again_when_the_server_signed_it_out(self, server):
+        url, state = server
+        client = self.user(url)
+        client.notify("one")
+        state.user_tokens.clear()  # an administrator signed this device out
+        client.notify("two")
+        assert len(state.logins) == 2 and len(state.notification_bodies) == 2
+
+    def test_a_client_token_is_not_retried(self, server):
+        url, state = server
+        with pytest.raises(ClaraError, match="401"):
+            ClaraClient(url, "wrong", user_id="erwan").notify("x")
+        assert state.logins == []
+
+    def test_an_administrator_user_needs_no_admin_token(self, server):
+        url, state = server
+        state.admin_user = True
+        client = self.user(url)
+        assert client.admin("/status") == "ran /status"
+        assert [c["name"] for c in client.admin_commands()] == ["provider"]
+
+    def test_a_user_who_is_not_an_administrator_just_has_no_completion(self, server):
+        url, _ = server
+        assert self.user(url).admin_commands() == []
