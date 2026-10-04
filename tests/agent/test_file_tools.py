@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
 
 import pytest
 
@@ -38,9 +40,6 @@ def fs(ctx, files_dir):
 
 
 class TestExploration:
-    def test_pwd(self, fs, files_dir):
-        assert fs["file_system_pwd"]().data == str(files_dir).replace("\\", "/")
-
     def test_list(self, fs):
         assert fs["file_system_list"]().data == ["a.txt", "sub/"]
         assert fs["file_system_list"](path="sub").data == ["deep.py"]
@@ -77,9 +76,26 @@ class TestExploration:
         summary = fs["file_system_read"]("long.txt", mode="summary").data
         assert summary.splitlines()[0] == "l0" and len(summary.splitlines()) == 50
 
-    def test_read_truncation_notice(self, fs):
+    def test_a_cut_read_says_which_lines_it_shows_and_where_to_go_on(self, fs):
         data = fs["file_system_read"]("a.txt", max_chars=5).data
-        assert data.startswith("one\nt") and "truncated to 5 characters" in data
+        assert data.startswith("one\n[... cut at 5 characters: lines 1-1 of ")
+        assert 'Read on with mode="range", start_line=2' in data
+
+    def test_a_cut_range_counts_from_its_first_line(self, fs, files_dir):
+        (files_dir / "long.txt").write_text("\n".join(f"line {i}" for i in range(1, 101)))
+        data = fs["file_system_read"]("long.txt", mode="range", start_line=50, max_chars=30).data
+        assert data.startswith("line 50\nline 51\nline 52\n[... cut") and "lines 50-52 of 100" in data
+        assert "start_line=53" in data
+
+    def test_line_numbers(self, fs, files_dir):
+        (files_dir / "n.txt").write_text("a\nb\nc")
+        assert fs["file_system_read"]("n.txt", mode="range", start_line=2, line_numbers=True).data == "     2\tb\n     3\tc"
+
+    def test_reads_are_capped_by_the_context_window(self, fs, files_dir, ctx):
+        ctx.window = lambda: 4_000  # at least 4,000 characters are always allowed
+        (files_dir / "big.txt").write_text("x" * 100 + "\n" + "y" * 10_000)
+        data = fs["file_system_read"]("big.txt", max_chars=1_000_000).data
+        assert "cut at 4000 characters" in data
 
     def test_read_binary_file_fails_cleanly(self, fs, files_dir):
         (files_dir / "b.bin").write_bytes(b"\x00\x01")
@@ -517,3 +533,98 @@ class TestChangesCanBeUndone:
         assert not (files_dir / "created.txt").exists() and not (files_dir / "copy.txt").exists()
         assert (files_dir / "d" / "in.txt").read_text() == "inner"
         assert (files_dir / "m.txt").read_text() == "moveme" and not (files_dir / "moved.txt").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Edits that help the model, git-aware searches, protected paths
+# --------------------------------------------------------------------------- #
+
+
+class TestEditHelp:
+    def test_trailing_spaces_need_not_match(self):
+        text = "def f():   \n    return 1  \n"
+        edited, count = apply_edit(text, "def f():\n    return 1", "def f():\n    return 2")
+        assert (edited, count) == ("def f():\n    return 2\n", 1)
+
+    def test_a_missing_text_shows_the_closest_passage_with_its_lines(self):
+        text = "a = 1\ndef total(items):\n    return sum(items)\nb = 2\n"
+        with pytest.raises(ValueError) as caught:
+            apply_edit(text, "def total(item):\n    return sum(item)", "x")
+        message = str(caught.value)
+        assert "closest passage (lines 2-3" in message
+        assert "     2\tdef total(items):\n     3\t    return sum(items)" in message
+
+    def test_nothing_alike_shows_nothing(self):
+        with pytest.raises(ValueError) as caught:
+            apply_edit("alpha\nbeta\n", "completely different", "x")
+        assert "closest" not in str(caught.value)
+
+
+class TestMultiEdit:
+    def test_several_replacements_at_once(self, fs, files_dir):
+        fs["file_system_read"]("a.txt")
+        result = fs["file_system_multi_edit"](
+            "a.txt", [{"old_text": "one", "new_text": "1"}, {"old_text": "three", "new_text": "3"}]
+        )
+        assert result.success and result.data["replacements"] == 2
+        assert (files_dir / "a.txt").read_text() == "1\ntwo\n3\nfour\n"
+
+    def test_all_or_nothing(self, fs, files_dir):
+        fs["file_system_read"]("a.txt")
+        result = fs["file_system_multi_edit"](
+            "a.txt", [{"old_text": "one", "new_text": "1"}, {"old_text": "nine", "new_text": "9"}]
+        )
+        assert not result.success and "Edit 2 of 2" in str(result.error) and "Nothing was changed" in str(result.error)
+        assert (files_dir / "a.txt").read_text() == "one\ntwo\nthree\nfour\n"
+
+    def test_edits_are_given_as_text_by_some_models(self, fs, files_dir):
+        fs["file_system_read"]("a.txt")
+        assert fs["file_system_multi_edit"]("a.txt", '[{"old_text": "two", "new_text": "2"}]').success
+        assert (files_dir / "a.txt").read_text() == "one\n2\nthree\nfour\n"
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+class TestGitAwareSearch:
+    def repo(self, files_dir):
+        subprocess.run(["git", "init", "-q", str(files_dir)], check=True)
+        (files_dir / ".gitignore").write_text("build/\n*.log\n")
+        (files_dir / "build").mkdir()
+        (files_dir / "build" / "out.py").write_text("needle = 1\n")
+        (files_dir / "debug.log").write_text("needle\n")
+        (files_dir / "src").mkdir()
+        (files_dir / "src" / "main.py").write_text("needle = 2\n")
+
+    def test_grep_and_glob_leave_out_what_git_ignores(self, fs, files_dir):
+        self.repo(files_dir)
+        assert fs["file_system_grep"]("needle").data == "src/main.py:1:needle = 2"
+        assert set(fs["file_system_glob"]("*.py").data.splitlines()) == {"src/main.py", "sub/deep.py"}
+        assert fs["file_system_glob"]("src/").data == "src/"
+
+    def test_outside_a_repository_everything_is_searched(self, fs, files_dir):
+        (files_dir / "debug.log").write_text("needle\n")
+        assert "debug.log:1:needle" in fs["file_system_grep"]("needle").data
+
+
+class TestProtectedPaths:
+    def test_changes_to_protected_paths_ask_even_in_the_zone(self, make_ctx, files_dir):
+        ctx, log = make_ctx(zone=True, auto_level=1, answer=False)
+        tools = by_name(filesystem_tools(ctx))
+        for path in (".git/hooks/pre-commit", ".vscode/tasks.json", ".env", "sub/.env.local", ".venv/x.py"):
+            result = tools["file_system_write"](path, "x")
+            assert isinstance(result.error, UserPermissionDenied), path
+        assert len(log.asked) == 5
+
+    def test_reading_them_stays_free_and_ordinary_files_too(self, make_ctx, files_dir):
+        ctx, log = make_ctx(zone=True, auto_level=0, answer=False)
+        (files_dir / ".env").write_text("A=1")
+        tools = by_name(filesystem_tools(ctx))
+        assert tools["file_system_read"](".env").success
+        assert tools["file_system_write"]("notes.txt", "x").success
+        assert log.asked == []
+
+    def test_the_project_file_is_protected(self, files_dir):
+        from custom_console.agent.zone import FreeZone
+
+        zone = FreeZone(files_dir, protected_files=["AGENT.md"])
+        assert not zone.contains(files_dir / "AGENT.md", write=True)
+        assert zone.contains(files_dir / "AGENT.md") and zone.contains(files_dir / "sub" / "AGENT.md", write=True)

@@ -22,6 +22,10 @@ STYLE_NOTE = "note"
 STYLE_TOOL = "tool"
 STYLE_PERMISSION = "permission"
 STYLE_ERROR = "error"
+STYLE_THINKING = "thinking"
+
+THINKING_MARK = "✻"
+SERVER_SUMMARY_CHARS = 50
 
 
 @dataclass
@@ -54,19 +58,6 @@ class TurnStats:
         known = {f.name for f in fields(cls)}
         return cls(**{key: value for key, value in data.items() if key in known})
 
-    @classmethod
-    def from_metrics(cls, metrics: Any, duration: float) -> "TurnStats":
-        """Build from an agno metrics object (missing/None fields count as 0)."""
-
-        def number(name: str) -> int:
-            return int(getattr(metrics, name, 0) or 0)
-
-        return cls(
-            input_tokens=number("input_tokens"),
-            output_tokens=number("output_tokens"),
-            total_tokens=number("total_tokens"),
-            duration=duration,
-        )
 
 
 def _short(value: Any, limit: int) -> str:
@@ -89,6 +80,8 @@ class TurnView:
         self.started = time.monotonic()
         self._segments: List[Segment] = []
         self._running_tools: List[Segment] = []
+        self._thinking: Optional[Segment] = None  # the model's reasoning being streamed
+        self._thinking_started = 0.0
         self._tokens_counted = 0  # output tokens of the finished model requests
         self._chunks = 0  # text chunks of the request in progress (about one token each)
         self._lock = threading.RLock()
@@ -99,11 +92,50 @@ class TurnView:
         if not chunk:
             return
         with self._lock:
+            self.close_thinking()
             self._chunks += 1
             if self._segments and self._segments[-1].kind == TEXT:
                 self._segments[-1].text += chunk
             else:
                 self._segments.append(Segment(TEXT, chunk))
+
+    def add_thinking(self, chunk: str) -> None:
+        """A piece of the model's reasoning: one line ("✻ thinking…") that hides the text."""
+        if not chunk:
+            return
+        with self._lock:
+            self._chunks += 1  # reasoning tokens are generated tokens
+            if self._thinking is None:
+                self._thinking = Segment(NOTE, f"{THINKING_MARK} thinking…", STYLE_THINKING, done=False)
+                self._thinking_started = time.monotonic()
+                self._segments.append(self._thinking)
+            self._thinking.detail += chunk
+
+    def close_thinking(self) -> None:
+        """The reasoning in progress is over (the model writes, calls a tool, or the turn ends)."""
+        with self._lock:
+            note, self._thinking = self._thinking, None
+            if note is not None:
+                note.detail = note.detail.strip()
+                note.text = f"{THINKING_MARK} thought for {time.monotonic() - self._thinking_started:.1f}s"
+                note.done = True
+
+    def server_tool(self, name: str, arguments: Mapping[str, Any], result: str) -> Segment:
+        """A tool the server ran itself (remember, web_search...): one finished line, its result hidden."""
+        failed = result.startswith("Error")
+        lines = result.strip().split("\n") if result.strip() else []
+        if len(lines) == 1 and len(lines[0]) <= SERVER_SUMMARY_CHARS:
+            summary, detail = lines[0], ""
+        else:
+            summary, detail = (f"{len(lines)} lines" if lines else ""), result.strip()
+        text = f"{'✘' if failed else '✔'} {name}({format_arguments(arguments)}) · on the server"
+        if summary:
+            text += f" · {summary}"
+        with self._lock:
+            self.close_thinking()
+            note = Segment(NOTE, text, STYLE_ERROR if failed else STYLE_TOOL, detail)
+            self._segments.append(note)
+            return note
 
     def count_chunk(self) -> None:
         """A chunk of text was generated but not shown (a sub-agent's answer)."""
@@ -121,6 +153,7 @@ class TurnView:
         :meth:`update_note` (handles stay valid when other lines are inserted)."""
         note = Segment(NOTE, text, style)
         with self._lock:
+            self.close_thinking()
             self._segments.append(note)
         return note
 
@@ -135,10 +168,13 @@ class TurnView:
             if style is not None:
                 note.style = style
 
-    def add_detail(self, note: Segment, line: str) -> None:
-        """Add a line to what a (running) tool line hides, e.g. a sub-agent's activity."""
+    def add_detail(self, note: Segment, line: str, keep: Optional[int] = None) -> None:
+        """Add a line to what a (running) tool line hides, e.g. a sub-agent's activity or a
+        command's output; with `keep`, only the last `keep` lines stay."""
         with self._lock:
             note.detail = f"{note.detail}\n{line}" if note.detail else line
+            if keep is not None and note.detail.count("\n") >= keep * 2:  # trimmed now and then, not at each line
+                note.detail = "\n".join(note.detail.split("\n")[-keep:])
 
     def tool_started(self, name: str, arguments: Mapping[str, Any]) -> Segment:
         with self._lock:

@@ -8,8 +8,9 @@ run on this computer.
 - **Shell**: `cd ls tree cat stat find cp rm pwd echo clear launch reload help ai exit`,
   tab completion generated from each command's definition, colored output.
 - **Virtual file system**: one tree rooted at `/` (see below).
-- **AI agent**: a chat in the terminal with file, search, edit, shell, PDF, web, e-mail and
-  Moodle tools, a free zone where file work needs no confirmation, undo, context
+- **AI agent**: a chat in the terminal with file, search, edit, git, shell, PDF, desktop,
+  e-mail and Moodle tools (and the server's web search), a free zone where file work needs no
+  confirmation, permission answers that can last ("always"), undo, plan mode, context
   management and token accounting.
 
 Windows only (it uses the registry, `\\wsl$` and detached processes).
@@ -44,6 +45,7 @@ project root (see `.env.example`; empty values mean "use the default").
 | `CLARA_TOKEN` | – | Instead of a user: a chat token (`CLARA_TOKENS` there). Required by `ai agent` when there is no `CLARA_USER` |
 | `CLARA_ADMIN_TOKEN` | – | Optional: lets `/model` and `/provider` run in the server's console (not needed when `CLARA_USER` is an administrator) |
 | `CLARA_USER_NAME` | – | How Clara should call you |
+| `CLARA_TIMEZONE` | this computer's | Your time zone (IANA name, `Europe/Paris`), sent with each message: the server tells the model the date and time in it |
 | `OLLAMA_HOST` | `http://localhost:11434` | The local Ollama of `ai list` / `ai start` (not used by the agent) |
 | `AGENT_DEFAULT_MODEL` | `gemma4` | Model `ai start` loads when none is given |
 | `AGENT_PERMISSION_LEVEL` | `1` | Tools auto-accepted by the agent (see below) |
@@ -110,7 +112,13 @@ ai agent [-n NAME] [-p 0|1|2] [-d DIR] [--no-memory]
 The agent does not run a model itself. It is a **client of the Clara server**, which runs the
 model, keeps the memory (what Clara knows about you, the same on every client) and the
 conversations, and compacts them when they grow too long. Set `CLARA_URL` and `CLARA_TOKEN`
-in `.env`; `ai agent` refuses to open when the server cannot be reached.
+in `.env`; `ai agent` refuses to open when the server cannot be reached. The server also has tools
+of its own (memory, reminders, notifications, and with an Ollama API key `web_search` and
+`web_fetch`): they run there, and each shows one line in the turn (`✔ remember(...) · on the server`).
+
+If a turn stops before its end (you press `Ctrl+C`, the connection breaks, the model fails), the server
+keeps what was done so far, with a note saying it was interrupted: Clara knows which files she had
+already changed.
 
 The tools stay here. For each message the console sends the server the tools it offers
 (their names, descriptions and parameters, generated from the Python functions), the agent's
@@ -134,7 +142,17 @@ While the agent answers, what is final (a finished paragraph, a finished tool ca
 printed **as it comes** into the normal scrollback, rendered as **Markdown**, so you can
 scroll back, select and copy during the answer. Only the part still being written stays
 in a live area above the input, as plain text. A paragraph counts as finished once the
-next one starts (never in the middle of a code block or a list).
+next one starts (never in the middle of a code block or a list). The model's reasoning, for
+the models that show it, streams there too (its last lines), then folds into one line
+(`✻ thought for 4.2s`, unfolded by `Ctrl+O`); so does the output of a running command.
+
+A message sent while the agent works is **queued** and sent when it is done (the rule shows
+`2 queued`; `Ctrl+C` drops the queue with the answer in progress). In a message:
+
+- `@path` attaches a file (its content goes with the message, and it counts as read) or a folder
+  (its list); `Tab` completes the paths. A mention that is not a path (`@someone`) is left alone.
+- A line starting with `!` runs a command yourself in the agent's working directory (`!git
+  status`): its output is shown, and goes to the agent with your next message.
 
 The rule above the input shows the model, what the agent is doing, the time spent and the
 tokens generated so far (`⠹ thinking · 12.4s · ↓ 523 tokens`), the progress of its
@@ -153,12 +171,12 @@ final state is printed at the end of each turn.
 
 | Key | Action |
 |---|---|
-| `Enter` | send (while the agent is busy, the text stays in the input line) |
+| `Enter` | send (while the agent is busy: queued, sent when it is done) |
 | `Shift+Tab` | new line in the input (in a suggestion list: previous suggestion) |
 | `Tab` | complete a `/command`, a path or a model name; cycle through the suggestions |
 | `Ctrl+O` | show / hide what tool lines hide, from now on |
 | `Ctrl+T` | the transcript viewer (when idle) |
-| `Ctrl+C` | stop the answer in progress (the partial answer is kept); clears the input when idle; refuses a pending permission question |
+| `Ctrl+C` | stop the answer in progress at once (the partial answer is kept, here and on the server); clears the input when idle; refuses a pending permission question |
 | `Ctrl+D` | leave the agent |
 
 When the agent needs a decision it asks with `ask_user`: the question and its options
@@ -181,10 +199,11 @@ Typing `/` lists them above the input, with what they do.
 | `/compact [FOCUS]` | have the server replace the older messages by a summary written by the model |
 | `/clear` | new conversation (context, checklist), kept as a session of its own, and clear the screen |
 | `/restore [list\|N]` | bring back a previous session of this folder (see below) |
-| `/undo` | undo the file changes the agent made during its last turn (repeat to go further back) |
+| `/undo` | undo the file changes the agent made during its last turn (repeat to go further back); the agent is told |
+| `/plan [on\|off]` | plan mode: the agent gets only the tools that read, and answers with a plan |
 | `/init` | ask the agent to write the project instructions file (`AGENT.md`) |
 | `/todo` | show the agent's checklist |
-| `/permissions [0\|1\|2]` | show or change the auto-accept level, and show the free zone |
+| `/permissions [0\|1\|2\|forget]` | show or change the auto-accept level, the free zone and the "always" answers (`forget` drops them) |
 | `/tools` | menu to turn the agent's tools on and off (see below) |
 | `/details` | show or hide what tool lines hide (same as `Ctrl+O`) |
 | `/transcript` | the conversation in a full-screen viewer, tool lines unfoldable (same as `Ctrl+T`) |
@@ -234,32 +253,67 @@ start: a later `cd` by the agent does not move it. Launching from a drive root, 
 folder or one of its parents gives no zone at all (a warning is shown), and the zone folder
 itself can never be removed or moved without asking.
 
+Some paths inside the zone are never free to *change*: `.git`, `.hg`, `.svn`, `.github`,
+`.vscode`, `.idea`, `.venv`/`venv`, `.env` files and the project file (`AGENT.md`) at its root.
+Writing there could run code later (a git hook, an editor task) or steer the agent; reading
+them stays free.
+
 Everywhere else, and for the other tools, every tool declares a level; a tool whose level
 is ≤ the session's auto-accept level runs without asking, otherwise the question appears
-above the input (with the diff, for file changes) and you answer in the input line
-(`Enter` or `y` = yes).
+above the input (with the diff, for file changes; the whole e-mail, for `send_email`).
+What you were typing is put aside meanwhile and comes back. An answer must be typed (an
+empty `Enter` answers nothing):
+
+| Answer | |
+|---|---|
+| `y` | yes, this once |
+| `a` | yes, and for the rest of the session for calls of the same kind |
+| `p` | yes, and from now on in this project (kept in `<DATA_DIR>/agent/permissions/`) |
+| `n` | no; `n use pytest -x instead` tells the agent why |
+
+"The same kind" is the tool in that folder (`file_system_write in C:/notes`), the program and
+its subcommand for `run_command` (`git status …` commands), the kind of file for `open_path`,
+the recipient for `send_email`. A command that chains or redirects (`&&`, `|`, `>`...) is
+always asked. `/permissions` lists what you allowed; `/permissions forget` drops it.
 
 | Level | Auto-accepted outside the zone | Examples |
 |---|---|---|
-| `0` | only trivial tools | `file_system_pwd`, `todo_write` |
-| `1` (default) | reads | reading or listing a path outside the zone, `moodle_list_courses`, `get_weather` |
-| `2` | everything | writing outside the zone, `run_command`, `moodle_click_element`, `send_email` |
+| `0` | only trivial tools | `todo_write`, `command_output` |
+| `1` (default) | reads | reading or listing a path outside the zone, `git_status`, `moodle_list_courses`, `get_weather` |
+| `2` | everything | writing outside the zone, `run_command`, `open_path`, `clipboard_read`, `send_email` |
 
 `run_command` is level 2 even inside the zone: it asks unless you chose `-p 2`.
 
 ### Tools
 
-- **Navigate and search**: `file_system_pwd list cd tree stat`, `file_system_find` (by name,
+Every tool answers the model in plain text (a failure starts with `Error:`), never in JSON
+with escaped strings: the model copies what it read into its edits as it is.
+
+- **Navigate and search**: `file_system_list cd tree stat`, `file_system_find` (by name,
   also on the reMarkable), `file_system_glob` (files by pattern, newest first),
-  `file_system_grep` (content, regular expressions, context lines).
-- **Read**: `file_system_read` (whole file, line range, or outline of a Python file).
+  `file_system_grep` (content, regular expressions, context lines). In a git repository the
+  searches only see what git does not ignore (`.gitignore`: builds, caches...). The working
+  directory is told with each message.
+- **Read**: `file_system_read` (whole file, line range, or outline of a Python file;
+  `line_numbers=true`). What it returns is capped to a share of the context window; a cut
+  read says which lines it showed and where to go on.
 - **Change**: `file_system_edit` replaces an exact piece of text (it must be unique, or use
-  `replace_all`), `file_system_write` creates or replaces a file, `file_system_copy`,
-  `file_system_move`, `file_system_remove`. A file must have been read before it is edited
-  or overwritten, and must not have changed since. Line endings (CRLF) and BOM are kept;
-  binary and non-UTF-8 files are refused. Each change keeps a diff under its tool line.
-- `run_command` – a shell command in the current directory (`cmd.exe`), with a timeout
-  (60 s by default, 600 s at most), stopped by `Ctrl+C`.
+  `replace_all`; spaces at the ends of lines need not match, and when the text is not found
+  the error shows the closest passage), `file_system_multi_edit` makes several replacements
+  in one file at once (all or none), `file_system_write` creates or replaces a file,
+  `file_system_copy`, `file_system_move`, `file_system_remove`. A file must have been read
+  before it is edited or overwritten, and must not have changed since. Line endings (CRLF)
+  and BOM are kept; binary and non-UTF-8 files are refused. Each change keeps a diff under
+  its tool line.
+- **Git** (read only, level 1): `git_status`, `git_diff` (unstaged, staged, or since a
+  revision), `git_log`.
+- `run_command` – a shell command in the current directory, with `cmd` (default) or
+  `shell="powershell"`, a timeout (60 s by default, 600 s at most), stopped by `Ctrl+C`. It
+  runs in its own hidden console with UTF-8 output; what it prints shows live under its line.
+  `background=true` starts it and returns at once (a dev server, a watcher): `command_output`
+  reads what it printed since, `command_stop` stops it; they are stopped when the agent closes.
+- **Desktop** (Windows): `open_path` (a file with its application, a folder, a URL),
+  `launch_app` (by name, like the shell's `launch`), `clipboard_read`, `clipboard_write`.
 - `todo_write` – the agent's checklist for multi-step work, followed in the rule above the
   input and printed at the end of the turn.
 - `ask_user` – a question to you with options (one or several to pick, each with a
@@ -285,7 +339,7 @@ above the input (with the diff, for file changes) and you answer in the input li
 ### Choosing the tools: `/tools`
 
 Every tool costs prompt tokens and gives the agent a power: `/tools` opens a menu of them,
-grouped (Files, Commands, Checklist, Questions, Sub-agents, Documents, Web, Mail, Moodle).
+grouped (Files, Git, Commands, Checklist, Questions, Sub-agents, Documents, Web, Desktop, Mail, Moodle).
 
 | Key | |
 |---|---|
@@ -336,15 +390,16 @@ nothing to restore.
 - **Compaction**: the **server** summarises the older messages when the context is nearly full
   (`CLARA_COMPACT_PERCENT` there, 80 by default) and says so in the turn; `/compact [FOCUS]`
   does it on demand, `/clear` starts a new conversation.
-- **Date, time and changed files**: each message reaches the model after a short note
-  (`[Automatic note, not written by the user. Current date and time: 2026-10-01 14:32
-  (Thursday, UTC+02:00).]`). When files the agent read (whole or in part) were changed since,
-  by you or another program, the note lists them and tells it that what it read is outdated,
-  so it reads them again before answering about them; reading a file again takes it off the
-  list. The note goes before your message rather than into the system prompt so that the
-  model's prompt cache is kept from one turn to the next (it is sent as the message's
-  `prefix`), and it is left out of what you see, of the saved sessions and of the
-  compaction summaries.
+- **Working directory, changed files, attachments**: each message reaches the model after a
+  short note (`[Automatic note, not written by the user. Working directory: C:/work.]`). When
+  files the agent read (whole or in part) were changed since, by you or another program, the
+  note lists them and tells it that what it read is outdated, so it reads them again before
+  answering about them; reading a file again takes it off the list. The files you attach with
+  `@`, the output of a `!command` and what `/undo` reverted follow it. All this goes before your
+  message rather than into the system prompt so that the model's prompt cache is kept from one
+  turn to the next (it is sent as the message's `prefix`), and it is left out of what you see,
+  of the saved sessions and of the compaction summaries. The date and time come from the server,
+  in your time zone (`CLARA_TIMEZONE`).
 - **Project instructions**: if `AGENT.md` exists at the root of the free zone it is added
   to the agent's context on every turn (read fresh, first 8000 characters); `/init` has
   the agent write it.
@@ -379,8 +434,10 @@ src/custom_console/
   llm/                           Ollama client (`ai list`, `ai start`)
   agent/
     ui.py  render.py  turn.py    terminal UI (what is final printed as Markdown as it comes), turn model
+    overlays.py                  what waits for an answer above the input: questions, menus, choices
     transcript.py                full-screen transcript viewer (Ctrl+T), foldable tool lines
     questions.py                 ask_user's options and answers
+    mentions.py                  @path attachments and their completion
     slash.py  commands.py        slash commands: registry, completion, /compact /usage /undo...
     clara.py  remote.py          the Clara server: HTTP client, and a turn with tools run here
     reminders.py                 /remind parsing, the notice, the background listener
@@ -391,9 +448,9 @@ src/custom_console/
     zone.py  checkpoints.py      the free zone, undo snapshots
     toolset.py                   which tools are on (/tools), saved in tools.json
     sessions.py                  saved sessions per folder (/restore)
-    permissions.py  results.py   permission gate, ToolResult
+    permissions.py  results.py   permission gate and "always" rules, ToolResult (plain text for the model)
     cache.py  journal.py  diffs.py
-    tools/                       one module per tool family (filesystem, shell, todo, pdf...)
+    tools/                       one module per tool family (filesystem, git, shell, desktop, todo, pdf...)
     moodle/                      Playwright client + dedicated worker thread
 tests/                           mirrors the package
 ```

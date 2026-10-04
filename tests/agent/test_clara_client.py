@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -306,14 +307,28 @@ class TestRemoteTurn:
 
         class Boom:
             def stream_turn(self, body):
-                try:
-                    yield {"type": "error", "message": "bad"}
-                finally:
-                    closed.append(True)
+                yield {"type": "error", "message": "bad"}
+                time.sleep(30)  # the server would go on: the connection must be given up
 
-        with pytest.raises(ClaraError):
+            def abort_stream(self):
+                closed.append(True)
+
+        with pytest.raises(ClaraError, match="bad"):
             run_remote_turn(Boom(), {}, lambda n, a: "")
         assert closed == [True]
+
+    def test_a_turn_that_ends_normally_leaves_the_connection_alone(self):
+        closed = []
+
+        class Fine:
+            def stream_turn(self, body):
+                yield {"type": "done", "reply": "ok"}
+
+            def abort_stream(self):
+                closed.append(True)
+
+        assert run_remote_turn(Fine(), {}, lambda n, a: "")["reply"] == "ok"
+        assert closed == []  # the server ends a finished turn's stream itself
 
 
 class TestOtherCalls:

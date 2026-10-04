@@ -37,9 +37,18 @@ def _when(timestamp: float, now: datetime) -> str:
     return f"at {moment:%H:%M}" if moment.date() == now.date() else f"on {moment:%Y-%m-%d} at {moment:%H:%M}"
 
 
-def turn_notes(now: datetime, stale: Sequence["StaleFile"] = ()) -> str:
-    """What the model is told along with each message: the date and time, and the files that
-    changed since it read them (its earlier reads of them are outdated).
+def turn_notes(
+    stale: Sequence["StaleFile"] = (),
+    working_directory: str = "",
+    extra: Sequence[str] = (),
+    now: Optional[datetime] = None,
+) -> str:
+    """What the model is told along with each message: the working directory, the files that
+    changed since it read them (its earlier reads of them are outdated), then `extra` blocks
+    (files the user attached, a command the user ran...). "" when there is nothing to say.
+
+    The date and time are not here: the server gives them, in this computer's time zone (the
+    request's `timezone`). `now` is only used to say when a file changed.
 
     It is sent as the *prefix* of the message (the server keeps it in the history but leaves it
     out of summaries) rather than put into the system prompt: the system prompt and the history
@@ -50,7 +59,10 @@ def turn_notes(now: datetime, stale: Sequence["StaleFile"] = ()) -> str:
     XML-like ``<context>`` block before the message made it end its turn without
     an answer most of the time; a bracketed note saying it is not from the user did not.
     """
-    lines = [f"{NOTES_START} Current date and time: {describe_now(now)}."]
+    now = now or datetime.now().astimezone()
+    lines: List[str] = []
+    if working_directory:
+        lines.append(f"Working directory: {working_directory}.")
     if stale:
         lines.append(
             "Files changed since you read them; what you read of them is outdated, read them again "
@@ -63,7 +75,9 @@ def turn_notes(now: datetime, stale: Sequence["StaleFile"] = ()) -> str:
             lines.append(f"- {item.path} ({what})")
         if len(stale) > STALE_FILES_SHOWN:
             lines.append(f"- … and {len(stale) - STALE_FILES_SHOWN} more")
-    return "\n".join(lines) + "]"
+    blocks = [f"{NOTES_START} " + "\n".join(lines) + "]"] if lines else []
+    blocks.extend(block for block in extra if block.strip())
+    return "\n\n".join(blocks)
 
 
 def estimate_tokens(text: str) -> int:
@@ -104,6 +118,7 @@ class ContextManager:
 
         self.summary = ""  # the server's summary of the older messages (for /context, /compact)
         self.disabled_tools: List[str] = []  # tools the user turned off (/tools)
+        self.plan_mode = False  # /plan: only the tools that read are offered
         self._instructions = 0
         self._tools = 0
         self._tool_count = 0
@@ -146,6 +161,13 @@ class ContextManager:
         project = self.project_instructions()
         if project:
             parts.append(f"## Project instructions ({self.project_file.name})\n{project}")  # type: ignore[union-attr]
+        if self.plan_mode:
+            parts.append(
+                "## Plan mode\n"
+                "The user turned plan mode on (/plan): only the tools that read are available. Explore, "
+                "then answer with a plan (steps, files to change, how to check). Do not try to change "
+                "anything until the user turns plan mode off."
+            )
         if self.disabled_tools:
             parts.append(
                 "## Tools turned off by the user\n"

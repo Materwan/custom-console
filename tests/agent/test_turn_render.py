@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
@@ -131,10 +130,6 @@ def test_format_arguments_shortens():
 
 
 class TestTurnStats:
-    def test_from_metrics_tolerates_missing_values(self):
-        stats = TurnStats.from_metrics(SimpleNamespace(input_tokens=5, output_tokens=None), 2.0)
-        assert (stats.input_tokens, stats.output_tokens, stats.total_tokens) == (5, 0, 0)
-
     def test_speed(self):
         assert TurnStats(0, 50, 50, 2.0).tokens_per_second == 25.0
         assert TurnStats(0, 50, 50, 0.0).tokens_per_second == 0.0

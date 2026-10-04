@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import socket
+import threading
 from typing import Any, Dict, Iterator, List, Optional
 
 import requests
@@ -33,6 +34,19 @@ def _detail(response: requests.Response) -> str:
         return response.text.strip()[:300] or response.reason or "error"
 
 
+def _socket_of(response: requests.Response) -> Optional[socket.socket]:
+    """The socket under a streamed response (urllib3 keeps it in private attributes)."""
+    raw = response.raw
+    for find in (lambda: raw._connection.sock, lambda: raw._fp.fp.raw._sock):
+        try:
+            sock = find()
+        except AttributeError:
+            continue
+        if isinstance(sock, socket.socket):
+            return sock
+    return None
+
+
 class ClaraClient:
     def __init__(
         self,
@@ -45,6 +59,7 @@ class ClaraClient:
         admin_token: Optional[str] = None,
         password: Optional[str] = None,
         session: Optional[requests.Session] = None,
+        timezone: Optional[str] = None,
     ) -> None:
         """With a `password`, the client signs in as `user_id` when it needs a token (and again if the server
         signs it out); the token it gets is kept in memory only. Without one, `token` is a shared client token."""
@@ -55,7 +70,10 @@ class ClaraClient:
         self.user_id = user_id
         self.user_name = user_name
         self.surface = surface
+        self.timezone = timezone  # IANA name: the server tells the model the date and time in it
         self._http = session or requests.Session()
+        self._streaming: Optional[requests.Response] = None  # the turn being streamed (see abort_stream)
+        self._streaming_lock = threading.Lock()
 
     def conversation_id(self, name: str) -> str:
         """The server's id for one of this user's conversations: `console:<user>:<name>`. A user who signed in may
@@ -130,6 +148,8 @@ class ClaraClient:
         }
         if self.user_name:
             body["user_name"] = self.user_name
+        if self.timezone:
+            body["timezone"] = self.timezone
         body.update({key: value for key, value in extra.items() if value not in (None, "", [], False)})
         return body
 
@@ -137,7 +157,37 @@ class ClaraClient:
         """The events of one turn. Closing the generator closes the connection, which makes
         the server give the turn up."""
         response = self._request("POST", "/v1/chat/stream", json=body, stream=True)
-        yield from self._events(response)
+        with self._streaming_lock:
+            self._streaming = response
+        try:
+            yield from self._events(response)
+        finally:
+            with self._streaming_lock:
+                if self._streaming is response:
+                    self._streaming = None
+
+    def abort_stream(self) -> None:
+        """Give up the turn being streamed, from any thread: the connection is shut down (the server then
+        gives the turn up) and closed in the background."""
+        with self._streaming_lock:
+            response = self._streaming
+        if response is None:
+            return
+        sock = _socket_of(response)
+        if sock is not None:
+            try:  # tells the server at once, whatever the reading thread is doing
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        # Closing waits for a read in progress (it holds the buffer's lock): never block the caller on it
+        threading.Thread(target=self._close_quietly, args=(response,), name="stream-close", daemon=True).start()
+
+    @staticmethod
+    def _close_quietly(response: requests.Response) -> None:
+        try:
+            response.close()
+        except Exception:
+            pass
 
     @staticmethod
     def _events(response: requests.Response) -> Iterator[Dict[str, Any]]:

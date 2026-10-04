@@ -48,7 +48,7 @@ def moodle_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
     runner = MoodleRunner(
         settings.moodle_base_url,
         settings.moodle_state_path,
-        confirm_login=ctx.gate.ask,
+        confirm_login=lambda text: bool(ctx.gate.ask(text)),
     )
     ctx.on_close(runner.close)
 

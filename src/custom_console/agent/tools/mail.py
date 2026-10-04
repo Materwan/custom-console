@@ -8,6 +8,8 @@ from ..permissions import PermissionLevel
 from ..results import ToolResult
 from .base import ToolContext, guarded
 
+PREVIEW_CHARS = 2_000  # of the body, shown in the permission question
+
 
 def build_message(sender: str, recipient: str, subject: str, content: str) -> EmailMessage:
     message = EmailMessage()
@@ -23,7 +25,11 @@ def mail_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
     if not settings.smtp_host:
         return []  # no SMTP server: do not offer a tool that cannot work
 
-    @guarded(ctx, PermissionLevel.WRITE)
+    def describe(recipient: str, subject: str, content: str = "") -> str:
+        body = content if len(content) <= PREVIEW_CHARS else content[:PREVIEW_CHARS] + " […]"
+        return f"Agent wants to send an email to {recipient}\nSubject: {subject}\n\n{body}"
+
+    @guarded(ctx, PermissionLevel.WRITE, describe=describe, rule=lambda recipient, **_: f"send_email:{recipient.strip().lower()}")
     def send_email(recipient: str, subject: str, content: str = "") -> ToolResult:
         """Send an email.
 

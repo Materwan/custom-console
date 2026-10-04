@@ -139,8 +139,7 @@ class TestRunTurn:
         assert (stats.input_tokens, stats.output_tokens, stats.total_tokens) == (4, 6, 10)
         [body] = fake.bodies
         assert body["message"] == "hi" and body["conversation"] == "session-1" and body["user_id"] == "tester"
-        assert body["prefix"].startswith("[Automatic note, not written by the user. Current date and time: ")
-        assert body["prefix"].endswith(").]")
+        assert "prefix" not in body  # nothing to note: no working directory, no file changed
         assert body["instructions"] == "Be useful."
         assert [e["type"] for e in read_entries(tmp_path / "log.jsonl")] == ["prompt", "answer"]
 
@@ -219,11 +218,11 @@ class TestToolHook:
         session._view, session._cancel = view, cancel
         return view, cancel
 
-    def test_success_is_shown_journaled_and_returned_as_compact_json(self, session, tmp_path):
+    def test_success_is_shown_journaled_and_returned_as_text(self, session, tmp_path):
         view, _ = self.hook_env(session, tmp_path)
         output = session.tool_hook("file_system_list", lambda **kw: ToolResult.ok(["a", "b"]), {"path": "."})
 
-        assert json.loads(output) == {"success": True, "data": ["a", "b"]}
+        assert output == "a\nb"
         note = view.snapshot()[0]
         assert note.text.startswith("✔ file_system_list(path='.')")
         entry = read_entries(tmp_path / "log.jsonl")[0]
@@ -232,7 +231,7 @@ class TestToolHook:
     def test_failed_result_is_flagged(self, session, tmp_path):
         view, _ = self.hook_env(session, tmp_path)
         output = session.tool_hook("t", lambda **kw: ToolResult.fail(FileNotFoundError("x")), {})
-        assert json.loads(output)["success"] is False
+        assert output == "Error: FileNotFoundError: x"
         assert view.snapshot()[0].text.startswith("✘ t()") and view.snapshot()[0].style == "error"
         assert read_entries(tmp_path / "log.jsonl")[0]["error"] == "x"
 
@@ -242,22 +241,21 @@ class TestToolHook:
         def explode(**kwargs):
             raise RuntimeError("kaboom")
 
-        output = json.loads(session.tool_hook("t", explode, {"a": 1}))
-        assert output == {"success": False, "error": "RuntimeError: kaboom"}
+        assert session.tool_hook("t", explode, {"a": 1}) == "Error: RuntimeError: kaboom"
 
     def test_plain_return_values_are_wrapped(self, session, tmp_path):
         self.hook_env(session, tmp_path)
-        assert json.loads(session.tool_hook("t", lambda **kw: "text", {})) == {"success": True, "data": "text"}
+        assert session.tool_hook("t", lambda **kw: "text", {}) == "text"
 
     def test_tools_do_not_run_after_a_cancel(self, session, tmp_path):
         view, cancel = self.hook_env(session, tmp_path)
         cancel.set()
         ran = []
-        output = json.loads(session.tool_hook("t", lambda **kw: ran.append(1), {}))
-        assert ran == [] and output["success"] is False and "Interrupted" in output["error"]
+        output = session.tool_hook("t", lambda **kw: ran.append(1), {})
+        assert ran == [] and output.startswith("Error: ") and "Interrupted" in output
 
     def test_works_without_a_current_view(self, session, tmp_path):
-        assert json.loads(session.tool_hook("t", lambda **kw: ToolResult.ok(1), {}))["data"] == 1
+        assert session.tool_hook("t", lambda **kw: ToolResult.ok(1), {}) == "1"
 
     def test_permission_decisions_are_shown_in_the_turn(self, session, tmp_path):
         view, _ = self.hook_env(session, tmp_path)

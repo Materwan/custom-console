@@ -21,7 +21,18 @@ from rich.console import Group, RenderableType
 from rich.markdown import Markdown
 from rich.text import Text
 
-from .turn import DIFF, NOTE, STYLE_ERROR, STYLE_NOTE, STYLE_PERMISSION, STYLE_TOOL, TEXT, Segment, TurnStats, TurnView
+from .turn import (
+    DIFF,
+    STYLE_ERROR,
+    STYLE_NOTE,
+    STYLE_PERMISSION,
+    STYLE_THINKING,
+    STYLE_TOOL,
+    TEXT,
+    Segment,
+    TurnStats,
+    TurnView,
+)
 
 StyledLine = Tuple[str, str]  # (prompt_toolkit style, text)
 
@@ -29,6 +40,7 @@ PROMPT_MARK = "❯ "
 ELLIPSIS = "…"
 DIFF_INDENT = "  "
 DETAIL_INDENT = "    "
+LIVE_DETAIL_ROWS = 4  # rows of the reasoning, or of a running tool's output, shown in the live area
 
 # Final (rich) style of each note kind.
 RICH_NOTE_STYLES = {
@@ -36,6 +48,7 @@ RICH_NOTE_STYLES = {
     STYLE_TOOL: "dim cyan",
     STYLE_PERMISSION: "yellow",
     STYLE_ERROR: "red",
+    STYLE_THINKING: "dim italic",
 }
 
 # Final (rich) style of a diff line or a checklist line, chosen by its first character.
@@ -122,6 +135,10 @@ def segment_lines(segment: Segment, width: int, details: bool = False) -> List[S
     if segment.kind == DIFF:  # a diff saved by an older version: a detail of the line above
         return _styled_block(segment.text, width, diff_style, DIFF_INDENT) if details else []
     lines = [(f"class:{segment.style}", piece) for piece in wrap_line(segment.text, width)]
+    if not segment.done and segment.detail.strip():  # reasoning or output as it comes: its last rows
+        style = "class:thinking" if segment.style == STYLE_THINKING else "class:detail"
+        rows = _styled_block(segment.detail.strip(), width, lambda _line: style, DETAIL_INDENT)
+        return lines + rows[-LIVE_DETAIL_ROWS:]
     if details:
         lines.extend(detail_lines(segment, width))
     return lines

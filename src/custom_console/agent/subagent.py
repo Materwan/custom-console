@@ -27,7 +27,7 @@ from .turn import TurnStats, format_arguments
 Tool = Callable[..., Any]
 
 # Tools a sub-agent never gets: they belong to the conversation with the user.
-EXCLUDED_TOOLS = frozenset({"task", "ask_user", "todo_write", "file_system_cd"})
+EXCLUDED_TOOLS = frozenset({"task", "ask_user", "todo_write", "file_system_cd", "command_output", "command_stop"})
 
 INSTRUCTIONS = """\
 You are a sub-agent: another agent handed you one job. Do it with your tools, then answer
@@ -35,8 +35,8 @@ with a report for that agent, who sees nothing but your final answer.
 - Explore before concluding: search, then read. Never guess what a file contains.
 - Report facts: what you found, with file paths (and line numbers when useful), and what
   remains uncertain. Be concise; do not copy whole files.
-- Each tool returns JSON: {"success": true, "data": ...} or {"success": false, "error": ...}.
-  When a tool fails, read the error and fix the call instead of repeating it.
+- Each tool returns text; a failure starts with "Error:". When a tool fails, read the error
+  and fix the call instead of repeating it.
 - Answer in the language of the job.
 """
 
@@ -121,12 +121,12 @@ class SubAgents:
             f"{INSTRUCTIONS}Current date and time: {describe_now(session.clock())}\n"
             f"Working directory: {self.location()}"
         )
-        body = session.remote.client.body(  # type: ignore[union-attr]
+        body = session.remote.client.body(
             prompt,
-            session.remote.client.conversation_id(f"sub-{uuid.uuid4().hex}"),  # type: ignore[union-attr]
+            session.remote.client.conversation_id(f"sub-{uuid.uuid4().hex}"),
             ephemeral=True,
             instructions=instructions,
-            tools=session.remote.schemas(chosen),  # type: ignore[union-attr]
+            tools=session.remote.schemas(chosen),
         )
         answer: List[str] = []
 
@@ -144,12 +144,12 @@ class SubAgents:
         started = time.perf_counter()
         try:
             done = run_remote_turn(
-                session.remote.client,  # type: ignore[union-attr]
+                session.remote.client,
                 body,
                 execute,
                 on_text=on_text,
                 on_usage=on_usage,
-                cancel=session._cancel,
+                cancel=session.cancel_event,
             )
         except ClaraError as error:
             session.journal.log_error(f"sub-agent: {error}")

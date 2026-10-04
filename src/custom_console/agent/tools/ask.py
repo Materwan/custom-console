@@ -48,7 +48,7 @@ def ask_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
         Args:
             question: the question, in one or two sentences.
-            options: 2 to 6 possible answers, each {"label": "short answer", "description":
+            options: 2 to 6 possible answers (at most 9), each {"label": "short answer", "description":
                 "what choosing it implies"}. May be empty when allow_other is true.
             multiple: true when the user may pick several options.
             allow_other: true to let the user type an answer of their own instead.

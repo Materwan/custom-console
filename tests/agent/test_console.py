@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from fake_clara import FakeClara, ask_tools, say
+from outcome import outcome
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
@@ -133,7 +134,7 @@ class TestAgentConsole:
         [body] = session.clara.bodies
         assert body["message"] == "hello" and body["surface"] == "console" and body["user_id"] == "tester"
         assert body["conversation"].startswith("console:tester:console_session-")  # under the user (or the server refuses it)
-        assert body["prefix"].startswith("[Automatic note, not written by the user. Current date and time: ")
+        assert body["prefix"].startswith("[Automatic note, not written by the user. Working directory: ")
         assert session.settings.load_instructions() in body["instructions"]
         names = {tool["function"]["name"] for tool in body["tools"]}
         assert {"file_system_read", "file_system_edit", "run_command", "todo_write", "ask_user", "task"} <= names
@@ -187,7 +188,7 @@ class TestAgentConsole:
         out = session.run(driver)
         assert (tmp_path / "elsewhere" / "note.txt").read_text() == "hello\n"
         [[answer]] = session.clara.results  # what the console told the server
-        assert answer["id"] == "call_0_0" and json.loads(answer["content"])["success"] is True
+        assert answer["id"] == "call_0_0" and outcome(answer["content"]).success
         assert "→ accepted" in out and "✔ file_system_write" in out
 
     def test_refusal_prevents_the_tool_from_running(self, tmp_path):
@@ -201,8 +202,8 @@ class TestAgentConsole:
 
         out = session.run(driver)
         assert not (tmp_path / "elsewhere" / "note.txt").exists()
-        result = json.loads(session.clara.results[0][0]["content"])
-        assert result["success"] is False and "UserPermissionDenied" in result["error"]
+        result = outcome(session.clara.results[0][0]["content"])
+        assert not result.success and "UserPermissionDenied" in result.error
         assert "→ refused" in out
 
     def test_write_inside_the_zone_never_asks_even_at_level_0_and_folds_the_diff(self, tmp_path):
@@ -248,8 +249,8 @@ class TestAgentConsole:
             s.wait_output("ok")
 
         out = session.run(driver)
-        result = json.loads(fake.results[0][0]["content"])
-        assert result["success"] is False and "not an available tool" in result["error"]
+        result = outcome(fake.results[0][0]["content"])
+        assert not result.success and "not an available tool" in result.error
         assert "✘ no_such_tool" in out
 
     def test_a_server_failure_is_shown_in_the_turn(self, tmp_path):
@@ -619,13 +620,13 @@ class TestToolsCommand:
             s.send("/tools")
             wait_for(lambda: s.console_.screen._menu is not None)
             rows = s.console_.screen._menu.rows()
-            assert rows[0] == ("group", "Files") and rows[1][1].key == "file_system_pwd"
+            assert rows[0] == ("group", "Files") and rows[1][1].key == "file_system_list"
             s.pipe.send_text(DOWN + " " + "\r")  # the first tool under "Files"
-            s.wait_output("Turned off: file_system_pwd")
+            s.wait_output("Turned off: file_system_list")
 
         session.run(driver)
-        assert "file_system_pwd" not in tool_names(session)
-        assert json.loads(session.settings.agent_tools_path.read_text(encoding="utf-8")) == {"disabled": ["file_system_pwd"]}
+        assert "file_system_list" not in tool_names(session)
+        assert json.loads(session.settings.agent_tools_path.read_text(encoding="utf-8")) == {"disabled": ["file_system_list"]}
 
     def test_escape_leaves_the_tools_as_they_were(self, tmp_path):
         session = Session(tmp_path)
@@ -637,7 +638,7 @@ class TestToolsCommand:
             s.wait_output("Tools unchanged.")
 
         session.run(driver)
-        assert "file_system_pwd" in tool_names(session) and not session.settings.agent_tools_path.exists()
+        assert "file_system_list" in tool_names(session) and not session.settings.agent_tools_path.exists()
 
     def test_a_saved_selection_is_used_at_startup(self, tmp_path):
         settings = load_settings({"MOODLE_ENABLED": "false"}, root=tmp_path / "project", use_dotenv=False)

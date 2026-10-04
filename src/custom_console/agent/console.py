@@ -22,16 +22,18 @@ from .clara import ClaraClient, ClaraError
 from .commands import AgentCommands
 from .context import ContextManager
 from .journal import JsonlLogger
-from .permissions import PermissionGate, permission_label
+from .mentions import MentionCompleter, attach
+from .permissions import ApprovalRules, PermissionGate, PermissionLevel, permission_label
 from .reminders import ReminderListener, notice
 from .remote import RemoteAgent
 from .schema import tools_token_estimate
-from .sessions import SessionRecord, SessionStore, ago
+from .sessions import SessionRecord, SessionStore, ago, directory_key
 from .session import AgentSession
 from .slash import CommandResult, Renderer, SlashCommand, SlashRegistry
 from .subagent import SubAgents
 from .toolset import ToolSet
 from .tools import ToolContext, build_tool_groups
+from .tools.shell import run_shell, shorten_output
 from .tools.state import ReadTracker, TodoList
 from .turn import TurnView
 from .ui import AgentScreen, add_basic_commands
@@ -39,6 +41,11 @@ from .usage import UsageLedger, format_count
 from .zone import FreeZone
 
 __all__ = ["AgentConsole", "permission_label"]
+
+BANG_TIMEOUT = 600  # seconds a command typed with ! may run
+BANG_NOTE_CHARS = 4_000  # of its output, told to the model with the next message
+ATTACH_SHARE = 0.2  # share of the context window the files attached with @ may take
+PLAN_TOOLS = frozenset({"ask_user", "todo_write", "task"})  # kept in plan mode besides the reading tools
 
 
 class AgentConsole:
@@ -69,6 +76,7 @@ class AgentConsole:
             user_name=settings.clara_user_name,
             admin_token=settings.clara_admin_token,
             password=settings.clara_password if settings.clara_user else None,
+            timezone=settings.clara_timezone,
         )
         self.renderer = Renderer(self.console)
         settings.agent_dir.mkdir(parents=True, exist_ok=True)
@@ -78,7 +86,11 @@ class AgentConsole:
         self.provider_name = str(health.get("provider") or "")
 
         directory = files.local_location if files.mode == files.MODE_LOCAL else None
-        zone = FreeZone.around(directory)
+        zone = FreeZone.around(directory, protected_files=[settings.agent_project_file])
+        # "always in this project" answers are kept per working directory (not with --no-memory)
+        rules = ApprovalRules(
+            settings.agent_permissions_dir / f"{directory_key(directory)}.json" if directory and memory else None
+        )
         self.checkpoints = Checkpoints(settings.agent_checkpoints_dir)
         # Sessions are saved per working directory; --no-memory saves nothing.
         self.store = SessionStore(settings.agent_sessions_dir, directory if memory else None, settings.agent_keep_sessions)
@@ -98,10 +110,12 @@ class AgentConsole:
             checkpoints=self.checkpoints,
             reads=reads,
             todos=todos,
+            location=lambda: files.location,
         )
         self.session.provider = self.provider_name
         self.session.on_turn = self._turn_done
-        self.session.on_model = self._model_changed
+        self.session.on_model = self.model_changed
+        self.session.attach = lambda prompt: attach(prompt, files, reads, self.tool_context.max_chars(ATTACH_SHARE))
 
         registry = SlashRegistry(self.renderer)
         add_basic_commands(registry)
@@ -116,17 +130,20 @@ class AgentConsole:
             status=self._status,
             todos=todos.progress,
             transcript=lambda: [TurnView.from_dict(turn) for turn in self.record.turns],
+            completer=MentionCompleter(files.suggest),
+            bang=self.run_bang,
             **screen_options,
         )
-        self.subagents = SubAgents(self.session, tools=lambda: self.toolset.enabled(), location=lambda: files.location)
+        self.subagents = SubAgents(self.session, tools=self.offered_tools, location=lambda: files.location)
 
         self.tool_context = ToolContext(
             settings=settings,
             files=files,
             gate=PermissionGate(
                 auto_level=permission_level,
-                ask=self.screen.ask_permission,
+                ask=lambda info, rule=None: self.screen.ask_tool_permission(info, rule, project=rules.has_project),
                 record=self.session.record_permission,
+                rules=rules,
             ),
             cache=JsonCache(settings.agent_cache_path),
             zone=zone,
@@ -136,9 +153,11 @@ class AgentConsole:
             is_cancelled=lambda: self.session.cancelled,
             ask_user=self.screen.ask_choice,
             run_subagent=self.subagents.run,
+            progress=self.session.tool_progress,
+            window=lambda: self.context.window,
         )
         self.toolset = ToolSet(build_tool_groups(self.tool_context), settings.agent_tools_path)
-        self.session.remote = RemoteAgent(self.client, self.toolset.enabled, settings.load_instructions)
+        self.session.remote = RemoteAgent(self.client, self.offered_tools, settings.load_instructions)
         self._sync_tools()
         self.session.refresh_context()
 
@@ -215,9 +234,29 @@ class AgentConsole:
 
     # -- tools --------------------------------------------------------------------- #
 
-    def _sync_tools(self) -> None:
-        """Account for the tools that are on in the context estimate."""
+    @property
+    def plan_mode(self) -> bool:
+        return self.context.plan_mode
+
+    def set_plan_mode(self, on: bool) -> None:
+        """/plan: only the tools that read are offered (to the agent and its sub-agents)."""
+        self.context.plan_mode = on
+        self._sync_tools()
+
+    def offered_tools(self) -> List[Any]:
+        """The tools the agent may call now: those that are on, and in plan mode only those that read."""
         enabled = self.toolset.enabled()
+        if not self.plan_mode:
+            return enabled
+        return [
+            tool
+            for tool in enabled
+            if tool.__name__ in PLAN_TOOLS or getattr(tool, "max_level", PermissionLevel.WRITE) <= PermissionLevel.READ
+        ]
+
+    def _sync_tools(self) -> None:
+        """Account for the tools that are offered in the context estimate."""
+        enabled = self.offered_tools()
         self.context.disabled_tools = self.toolset.disabled_names()
         try:
             tokens = tools_token_estimate(enabled)
@@ -236,7 +275,7 @@ class AgentConsole:
         where = f" ({self.provider_name})" if self.provider_name else ""
         return f"{self.name} · {self.model}{where}"
 
-    def _model_changed(self, model: str, provider: str) -> None:
+    def model_changed(self, model: str, provider: str) -> None:
         """The server switched model or provider (its /provider and /model commands)."""
         self.model, self.provider_name = model, provider
         self.screen.title = self._title()
@@ -248,7 +287,31 @@ class AgentConsole:
 
     def _status(self) -> str:
         report = self.context.breakdown()
-        return f"ctx {report.percent:.0f}% of {format_count(report.window)}"
+        plan = "plan mode · " if self.plan_mode else ""
+        return f"{plan}ctx {report.percent:.0f}% of {format_count(report.window)}"
+
+    # -- !command ------------------------------------------------------------------ #
+
+    def run_bang(self, command: str) -> CommandResult:
+        """A line typed as ``!command``: run it in the agent's working directory, show its output, and
+        tell the model about it with the next message."""
+        if not command:
+            return CommandResult(self.renderer.text("Usage: !COMMAND   (runs it in the agent's working directory)", "red"))
+        if self.files.mode != self.files.MODE_LOCAL:
+            return CommandResult(self.renderer.text("Commands run in a local folder: /cd into one first.", "red"))
+        cwd = self.files.local_location
+        code, output, reason = run_shell(command, cwd, BANG_TIMEOUT, lambda: self.screen.stop_requested)
+        output = output.strip("\n")
+        ending = {"timeout": f"killed after {BANG_TIMEOUT}s", "cancelled": "stopped"}.get(reason, f"exit code {code}")
+        self.session.pending_notes.append(
+            f"[The user ran a command themselves in {cwd}: `{command}` ({ending}). Its output:]\n"
+            f"```\n{shorten_output(output, BANG_NOTE_CHARS)}\n```"
+        )
+        text = self.renderer.text(f"$ {command}", "bold")
+        if output:
+            text += self.renderer.text(output)
+        text += self.renderer.text(f"({ending}; the agent sees this output with your next message)", "dim")
+        return CommandResult(text)
 
     def _banner(self, permission_level: int, zone: FreeZone) -> Group:
         previous = self.store.list()

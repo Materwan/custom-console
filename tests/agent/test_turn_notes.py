@@ -1,5 +1,5 @@
-"""What the agent is told with each message: the date and time, and the files that
-changed since it read them."""
+"""What the agent is told with each message: its working directory, the files that changed
+since it read them, and what is attached (the date and time come from the server)."""
 
 from __future__ import annotations
 
@@ -30,10 +30,13 @@ class TestTime:
         assert describe_now(NOW) == "2026-10-01 14:32 (Thursday, UTC+02:00)"
         assert describe_now(datetime(2026, 1, 4, 9, 5, tzinfo=timezone(timedelta(hours=-5)))) == "2026-01-04 09:05 (Sunday, UTC-05:00)"
 
-    def test_the_notes_without_changed_files(self):
-        assert turn_notes(NOW) == (
-            "[Automatic note, not written by the user. Current date and time: 2026-10-01 14:32 (Thursday, UTC+02:00).]"
-        )
+    def test_nothing_to_say_gives_no_note(self):
+        assert turn_notes(now=NOW) == ""
+
+    def test_the_working_directory_and_extra_blocks(self):
+        notes = turn_notes((), "C:/work", ["[File attached by the user: a.txt]", " "], now=NOW)
+        assert notes == "[Automatic note, not written by the user. Working directory: C:/work.]\n\n[File attached by the user: a.txt]"
+        assert turn_notes((), "", ["only this"], now=NOW) == "only this"
 
 
 class TestStaleFiles:
@@ -129,7 +132,7 @@ class TestNotes:
             StaleFile("C:/w/b.py", (NOW - timedelta(days=1)).timestamp(), False),
             StaleFile("C:/w/c.txt", None, True),
         ]
-        notes = turn_notes(NOW, stale)
+        notes = turn_notes(stale, now=NOW)
         assert "Files changed since you read them" in notes and "read them again" in notes
         assert "- C:/w/a.md (modified at 14:30)" in notes
         assert "- C:/w/b.py (modified on 2026-09-30 at 14:32, you had read only part of it)" in notes
@@ -137,7 +140,7 @@ class TestNotes:
 
     def test_a_long_list_is_cut(self):
         stale = [StaleFile(f"f{i}", NOW.timestamp(), True) for i in range(14)]
-        notes = turn_notes(NOW, stale)
+        notes = turn_notes(stale, now=NOW)
         assert "- f9 " in notes and "- f10 " not in notes and "… and 4 more" in notes
 
 
@@ -154,7 +157,7 @@ class TestSession:
         session.remote = RemoteAgent(FakeClara(), lambda: [], lambda: "Be useful.")
         return session
 
-    def test_each_message_carries_the_time_and_the_changed_files_as_its_prefix(self, tmp_path):
+    def test_each_message_carries_the_changed_files_as_its_prefix(self, tmp_path):
         target = tmp_path / "notes.md"
         target.write_text("v1")
         reads = ReadTracker()
@@ -166,8 +169,7 @@ class TestSession:
         session.run_turn(view, threading.Event())
         first = bodies[0]
         assert first["message"] == "what is in notes.md?"  # the user's words, untouched
-        assert first["prefix"].startswith("[Automatic note, not written by the user. Current date and time: 2026-10-01 14:32")
-        assert "Files changed" not in first["prefix"]
+        assert "prefix" not in first  # nothing to tell: no note at all
 
         target.write_text("v2 with a new section")
         touch(target, NOW - timedelta(minutes=1))
@@ -178,13 +180,24 @@ class TestSession:
 
         reads.mark(str(target))  # the agent read it again
         session.run_turn(TurnView("thanks"), threading.Event())
-        assert "Files changed" not in bodies[2]["prefix"]
+        assert "prefix" not in bodies[2]
         assert view.prompt == "what is in notes.md?"  # what the user sees and what is saved: unchanged
 
-    def test_without_a_tracker_only_the_time(self, tmp_path):
+    def test_pending_notes_are_told_once_with_the_attachments(self, tmp_path):
         session = self.session(tmp_path, None)
+        session.pending_notes.append("[The user ran a command themselves]")
+        session.attach = lambda prompt: [f"[attached for {prompt}]"]
         session.run_turn(TurnView("hi"), threading.Event())
-        assert session.remote.client.bodies[0]["prefix"] == turn_notes(NOW)
+        session.run_turn(TurnView("again"), threading.Event())
+        bodies = session.remote.client.bodies
+        assert bodies[0]["prefix"] == "[The user ran a command themselves]\n\n[attached for hi]"
+        assert bodies[1]["prefix"] == "[attached for again]"
+
+    def test_the_timezone_goes_with_each_request(self, tmp_path):
+        session = self.session(tmp_path, None)
+        session.remote.client.timezone = "Europe/Paris"
+        session.run_turn(TurnView("hi"), threading.Event())
+        assert session.remote.client.bodies[0]["timezone"] == "Europe/Paris"
 
 
 class TestReadTool:

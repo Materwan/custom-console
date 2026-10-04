@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 
 
@@ -60,8 +59,9 @@ class TestBuildTools:
         from pathlib import Path
 
         text = (Path(__file__).parents[2] / "config" / "agent_instructions.txt").read_text(encoding="utf-8")
+        unexplained = {"get_location", "get_weather", "send_email"}  # their own description is enough
         for tool in build_tools(ctx):
-            if tool.__name__.startswith("file_system_") or tool.__name__ in ("pdf_to_markdown", "rmdoc_to_pdf", "run_command", "todo_write"):
+            if tool.__name__ not in unexplained and not tool.__name__.startswith("moodle_"):
                 assert tool.__name__ in text, tool.__name__
 
 
@@ -334,5 +334,5 @@ class TestMoodleHelpers:
         ok = tool("/pluginfile.php/1/f.pdf", "dl/f.pdf")
         assert ok.data["path"].endswith("dl/f.pdf") and saved["path"] == ok.data["path"]
         assert (files_dir / "dl" / "f.pdf").read_bytes() == b"pdf"
-        assert json.loads(ok.to_llm())["data"]["downloaded"] is True
+        assert "downloaded: true" in ok.to_llm().splitlines()
         ctx.reads.check(saved["path"])  # the agent may edit what it downloaded

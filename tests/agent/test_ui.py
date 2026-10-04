@@ -219,13 +219,14 @@ class TestTurns:
         out = h.run(driver)
         assert "Agent error: model exploded" in out and "partial" in out
 
-    def test_enter_while_busy_does_not_start_a_second_turn(self):
+    def test_a_message_sent_while_busy_is_queued_then_sent(self):
         release = threading.Event()
         calls = []
 
         def runner(view, cancel):
             calls.append(view.prompt)
-            release.wait(5)
+            if view.prompt == "one":
+                release.wait(5)
 
         h = Harness(runner)
 
@@ -233,11 +234,33 @@ class TestTurns:
             h.send("one\r")
             wait_for(lambda: calls == ["one"])
             h.send("two\r")  # typed while busy
-            time.sleep(0.3)
-            assert calls == ["one"]
-            assert h.screen._buffer.text == "two"  # kept in the input line
+            h.send("three\r")
+            wait_for(lambda: len(h.screen._queue) == 2)
+            assert calls == ["one"] and h.screen._buffer.text == ""
+            assert "(2 waiting)" in joined(h.screen._header_fragments())
             release.set()
+            wait_for(lambda: calls == ["one", "two", "three"] and h.idle())
+
+        h.run(driver)
+        assert calls == ["one", "two", "three"]
+
+    def test_ctrl_c_drops_the_queue(self):
+        calls = []
+
+        def runner(view, cancel):
+            calls.append(view.prompt)
+            cancel.wait(5)
+
+        h = Harness(runner)
+
+        def driver(h):
+            h.send("one\r")
+            wait_for(lambda: calls == ["one"])
+            h.send("two\r")
+            wait_for(lambda: h.screen._queue == ["two"])
+            h.send(CTRL_C)
             wait_for(h.idle)
+            time.sleep(0.2)
 
         h.run(driver)
         assert calls == ["one"]

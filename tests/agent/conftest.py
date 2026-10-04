@@ -17,10 +17,12 @@ class GateLog:
     def __init__(self, answer: bool = True):
         self.answer = answer
         self.asked = []
+        self.rules = []  # what an "always" answer would have covered, for each question
         self.recorded = []
 
-    def ask(self, info: str) -> bool:
+    def ask(self, info: str, rule=None):
         self.asked.append(info)
+        self.rules.append(rule)
         return self.answer
 
     def record(self, info: str, status: str) -> None:

@@ -150,10 +150,10 @@ class TestCommandsInTheScreen:
             h.send("/slow\r")
             assert started.wait(5)
             seen["header"] = joined(h.screen._header_fragments())
-            h.send("/help\r")  # Enter while busy keeps the text in the input line
-            wait_for(lambda: h.screen._buffer.text == "/help")
+            h.send("/help\r")  # sent while busy: queued, run once /slow is done
+            wait_for(lambda: h.screen._queue == ["/help"])
             release.set()
-            wait_for(lambda: "finished slow" in h.output and h.idle())
+            wait_for(lambda: "finished slow" in h.output and "Keys:" in h.output and h.idle())
 
         h.run(driver)
         assert "running /slow" in seen["header"]

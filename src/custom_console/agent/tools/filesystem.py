@@ -1,16 +1,23 @@
 """`file_system_*` tools: explore and change files (disks, WSL, reMarkable).
 
 Inside the free zone (the folder the agent was started in and its subfolders)
-every one of these tools runs without asking. Outside it they keep their usual
-level: reads are level 1, anything that changes something is level 2.
+every one of these tools runs without asking, but for changes to its protected
+paths (see `zone`). Outside it they keep their usual level: reads are level 1,
+anything that changes something is level 2.
+
+Searches (glob, grep) list the files of a git repository with git itself, so
+what .gitignore leaves out (builds, caches, virtual environments) is not searched.
 """
 
 import ast
 import codecs
+import difflib
 import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
-from typing import Callable, Iterator, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 
 from ...fs import Backend, BinaryFileError
 from ..diffs import clip_diff, count_changes, make_diff, new_file_diff
@@ -25,6 +32,11 @@ MAX_WALKED_ENTRIES = 100_000
 MAX_LINE_CHARS = 300
 DIFF_LINES_SHOWN = 300  # folded under the tool's line until the user unfolds it
 DIFF_LINES_ASKED = 14
+MAX_EDITS = 50  # replacements in one file_system_multi_edit
+CLOSEST_MIN_RATIO = 0.6  # how alike a passage must be to be shown when old_text is not found
+CLOSEST_MAX_FILE_LINES = 20_000
+CLOSEST_MAX_TEXT_LINES = 200
+GIT_LIST_TIMEOUT = 15
 
 # Folders that only contain noise for glob and grep.
 SKIPPED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".mypy_cache", ".pytest_cache", ".ruff_cache"}
@@ -66,11 +78,51 @@ def save_text(path: str, file: TextFile) -> None:
         handle.write(data)
 
 
+def closest_passage(text: str, old: str) -> str:
+    """The passage of `text` most like `old` (as many lines), with its line numbers, to show the model
+    what it should have copied; "" when nothing is alike enough (or the file is too long to look)."""
+    lines, wanted = text.split("\n"), old.strip("\n").split("\n")
+    size = len(wanted)
+    if not old.strip() or size > CLOSEST_MAX_TEXT_LINES or len(lines) > CLOSEST_MAX_FILE_LINES:
+        return ""
+    target = "\n".join(line.strip() for line in wanted)
+    best, where = 0.0, -1
+    for start in range(max(1, len(lines) - size + 1)):
+        window = "\n".join(line.strip() for line in lines[start : start + size])
+        matcher = difflib.SequenceMatcher(None, window, target, autojunk=False)
+        if matcher.real_quick_ratio() <= best or matcher.quick_ratio() <= best:
+            continue
+        ratio = matcher.ratio()
+        if ratio > best:
+            best, where = ratio, start
+    if where < 0 or best < CLOSEST_MIN_RATIO:
+        return ""
+    shown = "\n".join(f"{where + 1 + i:>6}\t{line}" for i, line in enumerate(lines[where : where + size]))
+    return f"\nThe closest passage (lines {where + 1}-{where + size}, {best:.0%} alike; the numbers are not part of the file):\n{shown}"
+
+
+def _match_trailing_spaces(text: str, old: str) -> Optional[Tuple[int, int]]:
+    """Where `old` is in `text` as whole lines when trailing spaces are ignored, if exactly once."""
+    lines, wanted = text.split("\n"), [line.rstrip() for line in old.split("\n")]
+    size = len(wanted)
+    found = [
+        start
+        for start in range(len(lines) - size + 1)
+        if [line.rstrip() for line in lines[start : start + size]] == wanted
+    ]
+    if len(found) != 1:
+        return None
+    begin = sum(len(line) + 1 for line in lines[: found[0]])
+    return begin, begin + len("\n".join(lines[found[0] : found[0] + size]))
+
+
 def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> Tuple[str, int]:
     """`text` with `old` replaced by `new`, and the number of replacements.
 
     Without `replace_all`, `old` must occur exactly once: the model has to give
-    enough context to say which occurrence it means.
+    enough context to say which occurrence it means. Spaces at the end of lines
+    are not required to match (the model rarely sees them); anything else is,
+    and when nothing matches the error shows the closest passage.
     """
     old, new = old.replace("\r\n", "\n"), new.replace("\r\n", "\n")
     if not old:
@@ -79,8 +131,15 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> Tupl
         raise ValueError("old_text and new_text are identical: nothing to change.")
     count = text.count(old)
     if count == 0:
+        relaxed = _match_trailing_spaces(text, old)
+        if relaxed is not None:
+            begin, end = relaxed
+            return text[:begin] + new + text[end:], 1
         hint = " Check the indentation and whitespace." if old.strip() and old.strip() in text else ""
-        raise ValueError("old_text was not found in the file." + hint + " Read the file again and copy the text exactly.")
+        raise ValueError(
+            "old_text was not found in the file." + hint + " Copy the text exactly as it is in the file."
+            + closest_passage(text, old)
+        )
     if count > 1 and not replace_all:
         raise ValueError(
             f"old_text appears {count} times. Include more surrounding lines to make it unique, "
@@ -91,14 +150,88 @@ def apply_edit(text: str, old: str, new: str, replace_all: bool = False) -> Tupl
     return text.replace(old, new, 1), 1
 
 
+def apply_edits(text: str, edits: List[Dict[str, Any]]) -> Tuple[str, int]:
+    """`text` with every edit applied in order (each on the result of the previous), and the total
+    number of replacements. Raises on the first edit that cannot be made, naming it."""
+    if not edits:
+        raise ValueError("No edit given.")
+    if len(edits) > MAX_EDITS:
+        raise ValueError(f"At most {MAX_EDITS} edits at once.")
+    total = 0
+    for number, edit in enumerate(edits, start=1):
+        if not isinstance(edit, dict):
+            raise ValueError(f"Edit {number}: expected an object with old_text and new_text, got {edit!r}.")
+        try:
+            text, count = apply_edit(
+                text,
+                str(edit.get("old_text", "")),
+                str(edit.get("new_text", "")),
+                bool(edit.get("replace_all", False)),
+            )
+        except ValueError as error:
+            raise ValueError(f"Edit {number} of {len(edits)}: {error} Nothing was changed.") from None
+        total += count
+    return text, total
+
+
 # --------------------------------------------------------------------------- #
 # Walking and matching
 # --------------------------------------------------------------------------- #
 
 
+def git_listing(root: str) -> Optional[List[str]]:
+    """The files below `root` that git does not ignore (tracked, or new and not in .gitignore), relative
+    to `root` with "/" separators; None when `root` is not in a git repository (or git is missing)."""
+    git = shutil.which("git")
+    if git is None:
+        return None
+    try:
+        done = subprocess.run(
+            [git, "-C", root, "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+            capture_output=True,
+            timeout=GIT_LIST_TIMEOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    return sorted({path for path in done.stdout.decode("utf-8", errors="replace").split("\0") if path})
+
+
 def walk_entries(root: str, is_cancelled: Callable[[], bool] = lambda: False) -> Iterator[Tuple[str, str, bool]]:
     """``(relative path, absolute path, is_dir)`` of everything below `root`,
-    with "/" separators, skipping folders that are only noise."""
+    with "/" separators, skipping folders that are only noise; in a git repository,
+    only what git does not ignore."""
+    listed = git_listing(root)
+    if listed is not None:
+        yield from _git_entries(root, listed, is_cancelled)
+        return
+    yield from _walk_disk(root, is_cancelled)
+
+
+def _git_entries(root: str, files: List[str], is_cancelled: Callable[[], bool]) -> Iterator[Tuple[str, str, bool]]:
+    folders = set()
+    kept = []
+    for relative in files:
+        parts = relative.split("/")
+        if any(part in SKIPPED_DIRS for part in parts[:-1]):
+            continue
+        kept.append(relative)
+        folders.update("/".join(parts[:depth]) for depth in range(1, len(parts)))
+    for count, relative in enumerate(sorted(folders)):
+        if count > MAX_WALKED_ENTRIES or is_cancelled():
+            return
+        yield relative, os.path.join(root, *relative.split("/")), True
+    for count, relative in enumerate(kept):
+        if count > MAX_WALKED_ENTRIES or is_cancelled():
+            return
+        absolute = os.path.join(root, *relative.split("/"))
+        if os.path.lexists(absolute):  # a tracked file deleted since the last commit is not there
+            yield relative, absolute, False
+
+
+def _walk_disk(root: str, is_cancelled: Callable[[], bool]) -> Iterator[Tuple[str, str, bool]]:
     seen = 0
     for current, dirs, names in os.walk(root):
         if is_cancelled():
@@ -243,12 +376,31 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         edited, _count = apply_edit(current, old_text, new_text, replace_all)
         return f"Agent wants to edit {path}:\n{clip_diff(make_diff(current, edited, path), DIFF_LINES_ASKED)}"
 
-    # -- navigation ------------------------------------------------------------ #
+    def preview_edits(path: str, edits: List[Dict[str, Any]]) -> str:
+        local = files.local_path(path, "edit")
+        current = load_text(local).text
+        edited, _count = apply_edits(current, edits)
+        return f"Agent wants to edit {path}:\n{clip_diff(make_diff(current, edited, path), DIFF_LINES_ASKED)}"
 
-    @guarded(ctx, PermissionLevel.NONE)
-    def file_system_pwd() -> ToolResult:
-        """Return the current working directory (a local path, "/" or "reMarkable:/...")."""
-        return ToolResult.ok(files.location)
+    def change_file(path: str, change: Callable[[str], Tuple[str, int]]) -> ToolResult:
+        """Read `path`, apply `change` to its text, save it (line endings and BOM kept) and report."""
+        local = files.local_path(path, "edit")
+        if not os.path.isfile(local):
+            raise FileNotFoundError(f"{path} is not a file.")
+        ctx.reads.check(local)
+
+        current = load_text(local)
+        edited, count = change(current.text)
+        ctx.snapshot(local)
+        save_text(local, TextFile(edited, current.newline, current.bom))
+        ctx.reads.mark(local)
+
+        diff = make_diff(current.text, edited, path)
+        added, removed = count_changes(diff)
+        return ToolResult.ok(
+            {"path": local, "replacements": count, "lines_added": added, "lines_removed": removed},
+            diff=clip_diff(diff, DIFF_LINES_SHOWN),
+        )
 
     @guarded(ctx, reading("path"))
     def file_system_list(path: str = ".", show_hidden: bool = False) -> ToolResult:
@@ -411,38 +563,58 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
         max_chars: int = 20000,
+        line_numbers: bool = False,
     ) -> ToolResult:
-        """Read a text file. Read a file before editing it.
+        """Read a text file. Read a file before editing it. A long file is cut: the answer
+        then says which lines were shown and where to go on with mode "range".
 
         Args:
             path: file to read.
             mode: "full" = whole file; "range" = lines start_line..end_line (1-based,
-                inclusive); "summary" = outline of a Python file (classes/functions),
-                or the first 50 lines of any other file.
+                inclusive; end_line may be left out); "summary" = outline of a Python
+                file (classes/functions), or the first 50 lines of any other file.
             start_line: first line for "range".
-            end_line: last line for "range".
-            max_chars: the answer is truncated beyond this many characters.
+            end_line: last line for "range" (default: the end of the file).
+            max_chars: the answer is cut beyond this many characters (there is also a
+                limit set by the context window).
+            line_numbers: put each line's number before it, followed by a tab. The numbers
+                are not part of the file: never copy them into an edit.
         """
         read = files.read(path, max_bytes=MAX_READ_BYTES)
-        text = read.text
+        all_lines = read.text.split("\n")
+        first = 1
 
         if mode == "range":
-            if start_line is None or end_line is None:
-                raise ValueError("start_line and end_line are required in range mode.")
-            if start_line < 1 or end_line < start_line:
+            if start_line is None:
+                raise ValueError("start_line is required in range mode.")
+            end = len(all_lines) if end_line is None else end_line
+            if start_line < 1 or end < start_line:
                 raise ValueError("Require 1 <= start_line <= end_line.")
-            text = "\n".join(text.splitlines()[start_line - 1 : end_line])
+            if start_line > len(all_lines):
+                raise ValueError(f"The file has only {len(all_lines)} lines.")
+            first, lines = start_line, all_lines[start_line - 1 : end]
         elif mode == "summary":
-            if path.lower().endswith(".py"):
-                text = python_outline(text)
-            else:
-                text = "\n".join(text.splitlines()[:SUMMARY_LINES])
-        elif mode != "full":
+            lines = python_outline(read.text).split("\n") if path.lower().endswith(".py") else all_lines[:SUMMARY_LINES]
+        elif mode == "full":
+            lines = all_lines
+        else:
             raise ValueError(f"Unknown mode {mode!r}.")
 
-        text, truncated = clip(text, max_chars)
+        numbered = line_numbers and mode != "summary"
+        shown = [f"{first + i:>6}\t{line}" for i, line in enumerate(lines)] if numbered else lines
+        limit = max(1, min(int(max_chars), ctx.max_chars()))
+        text, truncated = clip("\n".join(shown), limit)
         if truncated:
-            text += truncation_notice(max_chars)
+            whole = text.count("\n")  # lines shown entirely
+            text = text[: text.rfind("\n")] if whole else text
+            if mode == "summary":
+                text += truncation_notice(limit)
+            else:
+                last = first + max(whole, 1) - 1
+                text += (
+                    f"\n[... cut at {limit} characters: lines {first}-{last} of {len(all_lines)} shown. "
+                    f'Read on with mode="range", start_line={last + 1} ...]'
+                )
         if read.truncated:
             text += f"\n[... file larger than {MAX_READ_BYTES} bytes, only the start was read ...]"
         try:
@@ -500,6 +672,7 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
     def file_system_edit(path: str, old_text: str, new_text: str, replace_all: bool = False) -> ToolResult:
         """Replace exact text in a file. The file must have been read first. old_text must
         match the file exactly (including indentation) and be unique, unless replace_all.
+        When it is not found, the error shows the closest passage of the file.
 
         Args:
             path: file to edit.
@@ -507,23 +680,20 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
             new_text: the replacement text.
             replace_all: replace every occurrence of old_text.
         """
-        local = files.local_path(path, "edit")
-        if not os.path.isfile(local):
-            raise FileNotFoundError(f"{path} is not a file.")
-        ctx.reads.check(local)
+        return change_file(path, lambda text: apply_edit(text, old_text, new_text, replace_all))
 
-        current = load_text(local)
-        edited, count = apply_edit(current.text, old_text, new_text, replace_all)
-        ctx.snapshot(local)
-        save_text(local, TextFile(edited, current.newline, current.bom))
-        ctx.reads.mark(local)
+    @guarded(ctx, writing("path"), describe=preview_edits)
+    def file_system_multi_edit(path: str, edits: List[Dict[str, Any]]) -> ToolResult:
+        """Make several replacements in one file at once: all of them, or none if one fails.
+        Same rules as file_system_edit for each; they are applied in order, each on the
+        result of the previous one.
 
-        diff = make_diff(current.text, edited, path)
-        added, removed = count_changes(diff)
-        return ToolResult.ok(
-            {"path": local, "replacements": count, "lines_added": added, "lines_removed": removed},
-            diff=clip_diff(diff, DIFF_LINES_SHOWN),
-        )
+        Args:
+            path: file to edit (read it first).
+            edits: the replacements, each {"old_text": "...", "new_text": "...",
+                "replace_all": false}.
+        """
+        return change_file(path, lambda text: apply_edits(text, edits))
 
     @guarded(ctx, writing("src", "dst"))
     def file_system_copy(src: str, dst: str, recursive: bool = False) -> ToolResult:
@@ -574,7 +744,6 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         return ToolResult.ok(f"Removed {path}.")
 
     return [
-        file_system_pwd,
         file_system_list,
         file_system_cd,
         file_system_tree,
@@ -585,6 +754,7 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         file_system_read,
         file_system_write,
         file_system_edit,
+        file_system_multi_edit,
         file_system_copy,
         file_system_move,
         file_system_remove,

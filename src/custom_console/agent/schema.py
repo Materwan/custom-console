@@ -80,6 +80,60 @@ def _type_schema(hint: Any) -> Dict[str, Any]:
     return {"type": "string"}
 
 
+_TRUE = ("true", "1", "yes", "on")
+_FALSE = ("false", "0", "no", "off", "")
+
+
+def _coerce(hint: Any, value: Any) -> Any:
+    """`value` converted to `hint` when a model sent it in another JSON type ("2" for 2, "true" for
+    true, one item for a list...). Anything that does not convert cleanly is left as it is: the tool
+    then reports the problem."""
+    if value is None or hint is Any or hint is inspect.Parameter.empty:
+        return value
+    origin, args = get_origin(hint), get_args(hint)
+    if origin is Union or origin is types.UnionType:
+        options = [arg for arg in args if arg is not type(None)]
+        return _coerce(options[0], value) if len(options) == 1 else value
+    try:
+        if hint is bool and isinstance(value, str):
+            lowered = value.strip().lower()
+            return True if lowered in _TRUE else False if lowered in _FALSE else value
+        if hint is bool and isinstance(value, int):
+            return bool(value)
+        if hint is int and not isinstance(value, bool):
+            if isinstance(value, str) and value.strip().lstrip("+-").isdigit():
+                return int(value.strip())
+            if isinstance(value, float) and value.is_integer():
+                return int(value)
+        if hint is float and isinstance(value, (str, int)) and not isinstance(value, bool):
+            return float(value)
+        if hint is str and isinstance(value, (int, float)) and not isinstance(value, bool):
+            return str(value)
+        if origin in (list, tuple, set) or hint in (list, tuple, set):
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped.startswith("["):
+                    value = json.loads(stripped)
+            if not isinstance(value, (list, tuple)):
+                value = [value]
+            return [_coerce(args[0], item) for item in value] if args else list(value)
+        if (origin is dict or hint is dict) and isinstance(value, str) and value.strip().startswith("{"):
+            return json.loads(value)
+    except (ValueError, TypeError):
+        return value
+    return value
+
+
+def coerce_arguments(function: Callable[..., Any], arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """The arguments of a call, each converted to its parameter's type hint when it can be."""
+    target = inspect.unwrap(function)
+    try:
+        hints = typing.get_type_hints(target)
+    except Exception:
+        return dict(arguments)
+    return {name: _coerce(hints.get(name, Any), value) for name, value in arguments.items()}
+
+
 def tools_token_estimate(tools: Iterable[Callable[..., Any]]) -> int:
     """Rough size of the tool definitions sent with every request."""
     from .context import estimate_tokens

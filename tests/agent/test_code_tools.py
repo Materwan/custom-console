@@ -111,13 +111,65 @@ class TestRunCommandTool:
         from custom_console.agent.tools import shell as shell_module
 
         seen = {}
-        monkeypatch.setattr(shell_module, "run_shell", lambda command, cwd, timeout, cancelled: seen.update(timeout=timeout) or (0, "", ""))
+        monkeypatch.setattr(shell_module, "run_shell", lambda command, cwd, timeout, cancelled, **_: seen.update(timeout=timeout) or (0, "", ""))
         ctx, _ = make_ctx(auto_level=2)
         tool = by_name(shell_tools(ctx))["run_command"]
         tool("x", timeout=99999)
         assert seen["timeout"] == shell_module.MAX_TIMEOUT
         tool("x", timeout=-5)
         assert seen["timeout"] == 1
+
+    def test_output_is_shown_line_by_line_while_it_runs(self, make_ctx):
+        ctx, _ = make_ctx(auto_level=2)
+        lines = []
+        ctx.progress = lines.append
+        by_name(shell_tools(ctx))["run_command"](f"{PYTHON} -c \"print('a'); print('b')\"")
+        assert lines == ["a", "b"]
+
+    def test_utf8_output_is_read_as_utf8(self, make_ctx):
+        ctx, _ = make_ctx(auto_level=2)
+        result = by_name(shell_tools(ctx))["run_command"](f"{PYTHON} -c \"print('café ✓')\"")
+        assert result.data["output"] == "café ✓"
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="PowerShell")
+    def test_powershell(self, make_ctx):
+        ctx, _ = make_ctx(auto_level=2)
+        result = by_name(shell_tools(ctx))["run_command"]('Write-Output ("é" + (2 + 3))', shell="powershell", timeout=60)
+        assert result.success and result.data["output"] == "é5"
+
+    def test_an_always_answer_covers_the_same_program_and_subcommand_only(self, make_ctx):
+        ctx, log = make_ctx(auto_level=1, answer=True)
+        tool = by_name(shell_tools(ctx))["run_command"]
+        tool("git status")
+        tool("git status && echo x")
+        assert log.rules == ["run_command:git status", None]  # a chained command can never be approved for good
+
+
+class TestBackgroundCommands:
+    def test_a_job_runs_while_the_agent_goes_on_and_its_output_is_read_later(self, make_ctx):
+        ctx, _ = make_ctx(auto_level=2)
+        tools = by_name(shell_tools(ctx))
+        script = "import time; print('ready', flush=True); time.sleep(0.5); print('done')"
+        started = tools["run_command"](f'{PYTHON} -c "{script}"', background=True)
+        assert started.success and started.data["job"] == "1"
+        result = tools["command_output"]("1", wait_seconds=20)
+        assert result.data["status"] == "ended, exit code 0" and result.data["output"] == "ready\ndone"
+        assert tools["command_output"]("1").data["output"] == "(nothing new)"
+
+    def test_a_job_can_be_stopped_and_unknown_jobs_are_reported(self, make_ctx):
+        ctx, _ = make_ctx(auto_level=2)
+        tools = by_name(shell_tools(ctx))
+        tools["run_command"](f'{PYTHON} -c "import time; time.sleep(60)"', background=True)
+        assert tools["command_output"]("1").data["status"] == "running"
+        assert tools["command_stop"]("1").data["status"] == "stopped"
+        assert "No background command" in str(tools["command_output"]("1").error)
+
+    def test_jobs_are_stopped_when_the_console_closes(self, make_ctx):
+        ctx, _ = make_ctx(auto_level=2)
+        tools = by_name(shell_tools(ctx))
+        tools["run_command"](f'{PYTHON} -c "import time; time.sleep(60)"', background=True)
+        ctx.close()
+        assert "No background command" in str(tools["command_output"]("1").error)
 
 
 # --------------------------------------------------------------------------- #
@@ -168,7 +220,7 @@ class TestTodoTool:
     def test_the_tool_returns_the_checklist_for_display_and_a_short_answer_for_the_model(self, ctx):
         result = by_name(todo_tools(ctx))["todo_write"]([{"content": "a", "status": "completed"}, {"content": "b"}])
         assert result.data == "1/2 done" and result.todos == "☑ a\n☐ b"
-        assert result.to_llm() == '{"success":true,"data":"1/2 done"}'
+        assert result.to_llm() == "1/2 done"
 
     def test_an_empty_list_clears_the_checklist(self, ctx):
         tool = by_name(todo_tools(ctx))["todo_write"]

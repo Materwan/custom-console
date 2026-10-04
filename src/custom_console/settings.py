@@ -77,6 +77,7 @@ class Settings:
     clara_user: Optional[str]  # your user name on the server: with clara_password, instead of a shared token
     clara_password: Optional[str]
     clara_user_name: Optional[str]  # how Clara should call you
+    clara_timezone: Optional[str]  # IANA name of this computer's clock, told to the server (None: unknown)
 
     # Agent
     agent_instructions_path: Path
@@ -133,6 +134,11 @@ class Settings:
         return self.agent_dir / "checkpoints"
 
     @property
+    def agent_permissions_dir(self) -> Path:
+        """The "always in this project" answers, one file per working directory."""
+        return self.agent_dir / "permissions"
+
+    @property
     def saved_apps_path(self) -> Path:
         return self.data_dir / "saved_apps.json"
 
@@ -148,6 +154,16 @@ class Settings:
         except OSError:
             return DEFAULT_INSTRUCTIONS
         return text or DEFAULT_INSTRUCTIONS
+
+
+def local_timezone() -> Optional[str]:
+    """The IANA name of this computer's time zone ("Europe/Paris"), or None when it cannot be told."""
+    try:
+        from tzlocal import get_localzone_name
+
+        return get_localzone_name() or None
+    except Exception:
+        return None
 
 
 def load_settings(
@@ -191,6 +207,7 @@ def load_settings(
         clara_user=(_get(env, "CLARA_USER") or "").lower() or None,
         clara_password=_get(env, "CLARA_PASSWORD"),
         clara_user_name=_get(env, "CLARA_USER_NAME"),
+        clara_timezone=_get(env, "CLARA_TIMEZONE") or local_timezone(),
         agent_instructions_path=_path(
             env, "AGENT_INSTRUCTIONS_PATH", root / "config" / "agent_instructions.txt"
         ),

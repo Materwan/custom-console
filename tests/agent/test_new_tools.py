@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import threading
 from types import SimpleNamespace
 
 import pytest
 from fake_clara import FakeClara
+from outcome import outcome
 from fake_clara import ask_tools as tool_requests
 
 from custom_console.agent.context import ContextManager
@@ -15,7 +15,6 @@ from custom_console.agent.journal import JsonlLogger
 from custom_console.agent.permissions import PermissionLevel
 from custom_console.agent.remote import RemoteAgent
 from custom_console.agent.questions import Answer, Choice
-from custom_console.agent.results import ToolResult
 from custom_console.agent.session import AgentSession
 from custom_console.agent.subagent import EXCLUDED_TOOLS, SubAgents, subagent_tools
 from custom_console.agent.tools import build_tools
@@ -168,10 +167,10 @@ def harness(make_ctx, tmp_path):
         task = tool_named(task_tools(ctx), "task")
 
         def call(**arguments):
-            return json.loads(session.tool_hook("task", task, arguments))
+            return outcome(session.tool_hook("task", task, arguments))
 
         def outputs():  # what the console told the server about the sub-agent's tool calls
-            return [json.loads(answer["content"]) for batch in fake.results for answer in batch]
+            return [outcome(answer["content"]) for batch in fake.results for answer in batch]
 
         def offered():
             return {tool["function"]["name"] for tool in fake.bodies[0]["tools"]}
@@ -186,11 +185,11 @@ class TestTask:
         h = harness(calls=[("file_system_read", {"path": "a.py"}), ("file_system_grep", {"pattern": "x"})])
         output = h.call(description="find x", prompt="Where is x defined?")
 
-        assert output == {"success": True, "data": {"report": "Found it in a.py."}}
+        assert output.success and output.text == "report: Found it in a.py."
         [body] = h.fake.bodies
         assert body["message"] == "Where is x defined?" and body["instructions"].endswith("Working directory: /work")
         assert body["ephemeral"] is True and body["conversation"].startswith(f"console:{body['user_id']}:sub-")  # a job, under the user
-        assert [o["success"] for o in h.outputs()] == [True, True]
+        assert [o.success for o in h.outputs()] == [True, True]
         line = h.view.snapshot()[0]
         assert line.text.startswith("✔ task(") and "· 2 tool call(s)" in line.text
         assert line.detail.splitlines()[0].startswith("✔ file_system_read(path='a.py')")
@@ -206,13 +205,13 @@ class TestTask:
         h = harness(calls=[("file_system_write", {"path": "b.py", "content": "y"})])
         h.call(description="d", prompt="p")
         assert "file_system_write" not in h.offered() and "file_system_read" in h.offered()
-        assert "not an available tool" in h.outputs()[0]["error"]  # asking anyway does not work
+        assert "not an available tool" in h.outputs()[0].error  # asking anyway does not work
 
     def test_writes_when_allowed_still_go_through_the_gate(self, harness, tmp_path):
         h = harness(calls=[("file_system_write", {"path": str(tmp_path / "elsewhere.txt"), "content": "y"})])
         h.call(description="d", prompt="p", allow_writes=True)
         assert "file_system_write" in h.offered()
-        assert h.outputs()[0]["success"] and len(h.gate.asked) == 1  # outside the zone: asked
+        assert h.outputs()[0].success and len(h.gate.asked) == 1  # outside the zone: asked
 
     def test_it_never_gets_the_conversation_tools(self, harness):
         h = harness()
@@ -222,20 +221,20 @@ class TestTask:
     def test_a_crash_is_a_failed_result_with_what_was_said(self, harness):
         h = harness(answer=["partial"], error=RuntimeError("model died"))
         output = h.call(description="d", prompt="p")
-        assert output["success"] is False and "model died" in output["error"]
-        assert output["data"] == {"partial_report": "partial"}
+        assert not output.success and "model died" in output.error
+        assert output.rest == "partial_report: partial"
 
     def test_an_interruption_stops_it(self, harness):
         h = harness(cancel_midway=True)
         output = h.call(description="d", prompt="p")
-        assert output["success"] is False and "Interrupted" in output["error"]
+        assert not output.success and "Interrupted" in output.error
 
     def test_an_empty_answer_is_a_failure(self, harness):
-        assert harness(answer=[]).call(description="d", prompt="p")["success"] is False
+        assert not harness(answer=[]).call(description="d", prompt="p").success
 
     def test_an_empty_prompt_is_refused(self, harness):
         h = harness()
-        assert h.call(description="d", prompt=" ")["success"] is False and h.fake.bodies == []
+        assert not h.call(description="d", prompt=" ").success and h.fake.bodies == []
 
 
 # --------------------------------------------------------------------------- #

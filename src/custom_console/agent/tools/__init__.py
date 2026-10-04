@@ -5,7 +5,9 @@ from typing import Callable, List, Tuple
 from ..results import ToolResult
 from .ask import ask_tools
 from .base import ToolContext, guarded
+from .desktop import desktop_tools
 from .filesystem import filesystem_tools
+from .git import git_tools
 from .mail import mail_tools
 from .moodle import moodle_tools
 from .pdf import pdf_tools
@@ -18,12 +20,14 @@ from .web import web_tools
 # Label shown by /tools, and the factory of each group of tools.
 TOOL_GROUPS = (
     ("Files", filesystem_tools),
+    ("Git", git_tools),
     ("Commands", shell_tools),
     ("Checklist", todo_tools),
     ("Questions", ask_tools),
     ("Sub-agents", task_tools),
     ("Documents", pdf_tools),
     ("Web", web_tools),
+    ("Desktop", desktop_tools),
     ("Mail", mail_tools),
     ("Moodle", moodle_tools),
 )

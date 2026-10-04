@@ -24,9 +24,8 @@ from .render import turn_renderables
 from .sessions import ago
 from .slash import CommandResult, SlashCommand, SlashRegistry
 from .turn import TurnView
-from .questions import Choice
-from .ui import MenuItem
-from .usage import format_count, usage_tables
+from .overlays import MenuItem
+from .usage import usage_tables
 
 if TYPE_CHECKING:
     from .console import AgentConsole
@@ -109,9 +108,10 @@ class AgentCommands:
         add(SlashCommand("clear", "new conversation, clear the screen", self.clear))
         add(SlashCommand("restore", "bring back a previous session of this folder", self.restore, "[list|N]", self.complete_restore))
         add(SlashCommand("undo", "undo the file changes of the last turn", self.undo))
+        add(SlashCommand("plan", "plan mode on or off: the agent may only read, and answers with a plan", self.plan, "[on|off]"))
         add(SlashCommand("init", "create the project instructions file", self.init))
         add(SlashCommand("todo", "show the agent's checklist", self.todo))
-        add(SlashCommand("permissions", "show or set the auto-accept level", self.permissions, "[0|1|2]", self.complete_permissions))
+        add(SlashCommand("permissions", "show or set the auto-accept level, the \"always\" answers", self.permissions, "[0|1|2|forget]", self.complete_permissions))
         add(SlashCommand("tools", "choose the tools the agent may use", self.tools, "[list|on|off|reset]", self.complete_tools))
 
         self._register_file_commands(registry)
@@ -175,7 +175,7 @@ class AgentCommands:
             except ClaraError as error:
                 return self._error(str(error))
             if health:  # the model or the provider may have changed
-                self.app._model_changed(str(health.get("model") or self.app.model), str(health.get("provider") or ""))
+                self.app.model_changed(str(health.get("model") or self.app.model), str(health.get("provider") or ""))
             return CommandResult(self.renderer.text(output))
 
         return handler
@@ -405,7 +405,24 @@ class AgentCommands:
             report = checkpoints.undo()
         except LookupError:
             return self._info("Nothing to undo. (Changes made by run_command are not tracked.)")
+        self.app.session.pending_notes.append(
+            "[The user undid the file changes of your last turn that changed files (/undo):\n"
+            + "\n".join(f"- {line}" for line in report)
+            + "\nWhat you remember of these files is outdated: read them again before relying on it.]"
+        )
         return CommandResult(self.renderer.text("\n".join(report), "green"))
+
+    def plan(self, arguments: str) -> CommandResult:
+        word = arguments.strip().lower()
+        if word not in ("", "on", "off"):
+            return self._error("Usage: /plan [on|off]   (no argument: switch)")
+        on = (not self.app.plan_mode) if not word else word == "on"
+        self.app.set_plan_mode(on)
+        if on:
+            message = "Plan mode on: the agent may only read, and answers with a plan. /plan again to let it act."
+        else:
+            message = "Plan mode off: the agent may change files and run commands again (with your permission)."
+        return CommandResult(self.renderer.text(message, "green"))
 
     def init(self, arguments: str) -> CommandResult:
         zone = self.app.tool_context.zone
@@ -419,23 +436,32 @@ class AgentCommands:
             return self._info("No checklist.")
         return CommandResult(self.renderer.text(todos.render() + f"\n({todos.summary()})"))
 
+    PERMISSIONS_USAGE = "Usage: /permissions [0|1|2 | forget]   (forget: ask again for what you answered \"always\")"
+
     def permissions(self, arguments: str) -> CommandResult:
         gate = self.app.tool_context.gate
-        if arguments:
+        word = arguments.strip().lower()
+        if word == "forget":
+            gate.rules.forget()
+            return CommandResult(self.renderer.text("The \"always\" answers are forgotten: those calls ask again.", "green"))
+        if word:
             try:
-                level = int(arguments)
+                level = int(word)
                 PermissionLevel(level)
             except ValueError:
-                return self._error("Usage: /permissions [0|1|2]")
+                return self._error(self.PERMISSIONS_USAGE)
             gate.auto_level = level
             self.app.save_session()
         zone = self.app.tool_context.zone
-        return CommandResult(
-            self.renderer.text(
-                f"Auto-accept level {gate.auto_level}: {permission_label(gate.auto_level)}\n"
-                f"Free zone (no question asked for files there): {zone.describe()}"
-            )
-        )
+        lines = [
+            f"Auto-accept level {gate.auto_level}: {permission_label(gate.auto_level)}",
+            f"Free zone (no question asked for files there): {zone.describe()}",
+        ]
+        if zone.active:
+            lines.append("  except changes to .git, .vscode, .venv, .env files and the project file, which ask")
+        allowed = gate.rules.listed()
+        lines.append("Always allowed: " + (", ".join(allowed) if allowed else "nothing (answer a or p to a question)"))
+        return CommandResult(self.renderer.text("\n".join(lines)))
 
     # -- /tools ----------------------------------------------------------------------------------- #
 
@@ -547,3 +573,5 @@ class AgentCommands:
         for level in PermissionLevel:
             if str(int(level)).startswith(arguments):
                 yield Completion(str(int(level)), start_position=-len(arguments), display_meta=permission_label(level))
+        if "forget".startswith(arguments.lower()):
+            yield Completion("forget", start_position=-len(arguments), display_meta="ask again for the \"always\" answers")

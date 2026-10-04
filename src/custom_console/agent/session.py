@@ -28,6 +28,7 @@ from .usage import UsageLedger
 DETAIL_MAX_LINES = 400  # of what a tool line hides
 DETAIL_MAX_CHARS = 40_000
 SUMMARY_MAX_CHARS = 50
+PROGRESS_MAX_LINES = 200  # of what a running tool printed, kept under its line until it is done
 
 
 def _data_text(data: Any) -> str:
@@ -73,6 +74,9 @@ class AgentSession:
     `run_turn` is meant to run in a worker thread. The remote agent is bound after
     construction (`session.remote = ...`) because the tools it lends to the server are built
     from objects that themselves refer to this session.
+
+    What the model is told with the next message besides it: `pending_notes` (a command the user
+    ran, an undo...; told once), and what `attach(prompt)` gives (files the message mentions).
     """
 
     def __init__(
@@ -87,8 +91,12 @@ class AgentSession:
         reads: Optional[ReadTracker] = None,
         todos: Optional[TodoList] = None,
         clock: Callable[[], datetime] = lambda: datetime.now().astimezone(),
+        location: Callable[[], str] = lambda: "",
     ):
-        self.remote: Optional[RemoteAgent] = None
+        self._remote: Optional[RemoteAgent] = None
+        self.location = location  # the agent's working directory, told with each message
+        self.pending_notes: List[str] = []
+        self.attach: Callable[[str], List[str]] = lambda prompt: []
         self.journal = journal
         self.user_id = user_id
         self.context = context
@@ -106,6 +114,21 @@ class AgentSession:
         self.current_tool: Optional[Segment] = None  # line of the tool running now (for sub-agents)
 
     @property
+    def remote(self) -> RemoteAgent:
+        if self._remote is None:
+            raise RuntimeError("No remote agent bound to the session yet.")
+        return self._remote
+
+    @remote.setter
+    def remote(self, remote: RemoteAgent) -> None:
+        self._remote = remote
+
+    @property
+    def cancel_event(self) -> Optional[threading.Event]:
+        """The event that stops the turn in progress (sub-agents watch it too)."""
+        return self._cancel
+
+    @property
     def cancelled(self) -> bool:
         """True while the turn in progress was interrupted by the user."""
         return self._cancel is not None and self._cancel.is_set()
@@ -121,11 +144,17 @@ class AgentSession:
         if self._view is not None:
             self._view.permission(info, status)
 
+    def tool_progress(self, line: str) -> None:
+        """A line of what the running tool does (a command's output): shown under its line."""
+        view, note = self._view, self.current_tool
+        if view is not None and note is not None:
+            view.add_detail(note, line, keep=PROGRESS_MAX_LINES)
+
     # -- tools ----------------------------------------------------------------- #
 
     def execute_tool(self, name: str, arguments: Dict[str, Any]) -> str:
         """Run the tool the server asked for, here, and give back what the model is told."""
-        tools = {tool.__name__: tool for tool in self.remote.tools()}  # type: ignore[union-attr]
+        tools = {tool.__name__: tool for tool in self.remote.tools()}
         function = tools.get(name)
         if function is None:
 
@@ -185,20 +214,22 @@ class AgentSession:
     def instructions(self) -> str:
         """The agent's system prompt, plus what changes from one turn to the next."""
         extra = self.context.additional_context()
-        base = self.remote.instructions()  # type: ignore[union-attr]
+        base = self.remote.instructions()
         return f"{base}\n\n{extra}" if extra else base
 
     def request_body(self, prompt: str) -> Dict[str, Any]:
-        """The request of a turn. The automatic notes (date, files that changed) go in the
-        `prefix`: the server shows them to the model with the message, keeps them in the history
-        and leaves them out of summaries."""
+        """The request of a turn. The automatic notes (working directory, files that changed,
+        attachments...) go in the `prefix`: the server shows them to the model with the message,
+        keeps them in the history and leaves them out of summaries. The pending notes are told
+        once: they are taken here."""
         stale = self.reads.stale() if self.reads is not None else []
-        return self.remote.client.body(  # type: ignore[union-attr]
+        extra, self.pending_notes = [*self.pending_notes, *self.attach(prompt)], []
+        return self.remote.client.body(
             prompt,
             self.context.session_id,
-            tools=self.remote.schemas(),  # type: ignore[union-attr]
+            tools=self.remote.schemas(),
             instructions=self.instructions(),
-            prefix=turn_notes(self.clock(), stale),
+            prefix=turn_notes(stale, self.location(), extra, now=self.clock()),
         )
 
     def run_turn(self, view: TurnView, cancel: threading.Event) -> Optional[TurnStats]:
@@ -211,10 +242,12 @@ class AgentSession:
         done: Optional[Dict[str, Any]] = None
         try:
             done = run_remote_turn(
-                self.remote.client,  # type: ignore[union-attr]
+                self.remote.client,
                 self.request_body(view.prompt),
                 self.execute_tool,
                 on_text=view.add_text,
+                on_thinking=view.add_thinking,
+                on_server_tool=view.server_tool,
                 on_usage=lambda prompt_tokens, completion_tokens: view.request_finished(completion_tokens),
                 on_note=view.add_note,
                 cancel=cancel,
@@ -226,6 +259,7 @@ class AgentSession:
             view.add_note(f"Agent error: {type(error).__name__}: {error}", STYLE_ERROR)
             self.journal.log_error(f"{type(error).__name__}: {error}")
         finally:
+            view.close_thinking()
             self._view = None  # `_cancel` stays until the next turn so that `cancelled` is readable
 
         if cancel.is_set():
@@ -263,7 +297,7 @@ class AgentSession:
     def refresh_context(self) -> Optional[Dict[str, Any]]:
         """Ask the server how full the conversation's context is (None if it cannot say)."""
         try:
-            info = self.remote.client.context(self.context.session_id)  # type: ignore[union-attr]
+            info = self.remote.client.context(self.context.session_id)
         except ClaraError:
             return None
         self.context.observe(info)
@@ -274,7 +308,7 @@ class AgentSession:
         """Replace the older messages by a summary, on the server. Returns the context usage
         (percent) before and after. Blocking: call it from a worker thread. Raises
         :class:`NothingToCompact` (a LookupError) when the conversation is empty."""
-        result = self.remote.client.compact(self.context.session_id, focus)  # type: ignore[union-attr]
+        result = self.remote.client.compact(self.context.session_id, focus)
         self.refresh_context()
         return float(result["before_percent"]), float(result["after_percent"])
 

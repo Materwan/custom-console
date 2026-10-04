@@ -15,8 +15,10 @@ Behaviour
   /transcript) opens the conversation in a full-screen viewer where each tool
   line unfolds with Enter or a click.
 * Permission questions, checklists (`ask_menu`) and the agent's questions
-  (`ask_choice`) appear in the same place and are answered there.
+  (`ask_choice`) appear in the same place and are answered there (see
+  `overlays`). What the user was typing is put aside meanwhile, and comes back.
 * Typing ``/`` lists the slash commands (and their arguments) above the input.
+* A message sent while the agent works is queued, and sent when it is done.
 
 The agent itself runs in a worker thread (`turn_runner`); everything that
 touches the UI runs on the asyncio loop of the main thread.
@@ -35,12 +37,12 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from prompt_toolkit.application import Application, in_terminal, run_in_terminal
 from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.completion import ThreadedCompleter
+from prompt_toolkit.completion import Completer, ThreadedCompleter, merge_completers
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import History, InMemoryHistory
 from prompt_toolkit.input import Input
@@ -54,12 +56,15 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console, RenderableType
 
-from .permissions import is_yes
+from .overlays import ChoiceQuestion, Menu, MenuItem, Question, TextQuestion, parse_answer
+from .permissions import Decision
 from .questions import Answer, Choice
 from .render import StyledLine, TurnPrinter, live_lines, wrap_line
 from .slash import CommandResult, Renderer, SlashCompleter, SlashRegistry
 from .turn import STYLE_ERROR, TurnStats, TurnView
 from .usage import format_count
+
+__all__ = ["AgentScreen", "MenuItem", "add_basic_commands", "parse_answer"]
 
 TurnRunner = Callable[[TurnView, threading.Event], Optional[TurnStats]]
 Progress = Tuple[int, int, str]  # checklist: items done, items, the item in progress
@@ -70,11 +75,13 @@ SUGGESTION_ROWS = 6
 STREAM_PERIOD = 0.15  # seconds between two looks for finished output to print
 FLASH_SECONDS = 2.5
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-IDLE_HINTS = ("Enter: send · Shift+Tab: new line · /help", "Enter: send · /help", "/help")
+IDLE_HINTS = ("Enter: send · @file attaches · !cmd runs · /help", "Enter: send · /help", "/help")
 
 KEYS_HELP = (
-    "Keys: Enter sends · Shift+Tab new line · Tab completes · Ctrl+O tool details · "
-    "Ctrl+T transcript · Ctrl+C stops the answer · Ctrl+D leaves"
+    "Keys: Enter sends (queued while the agent works) · Shift+Tab new line · Tab completes · "
+    "Ctrl+O tool details · Ctrl+T transcript · Ctrl+C stops the answer · Ctrl+D leaves\n"
+    "In a message: @path attaches a file or folder. A line starting with ! runs a command yourself "
+    "(its output goes with your next message)"
 )
 
 STYLE = Style.from_dict(
@@ -88,12 +95,14 @@ STYLE = Style.from_dict(
         "status": "ansicyan",
         "flash": "bold ansigreen",
         "question": "bold ansiyellow",
+        "question-hint": "ansiyellow italic",
         "input-prompt": "bold ansicyan",
         "diff-add": "ansigreen",
         "diff-del": "ansired",
         "diff-hunk": "ansicyan",
         "diff-ctx": "ansibrightblack",
         "detail": "ansibrightblack",
+        "thinking": "ansibrightblack italic",
         "todo": "",
         "todo-active": "bold ansiyellow",
         "todo-done": "ansibrightblack",
@@ -108,11 +117,6 @@ STYLE = Style.from_dict(
         "choice-description": "ansibrightblack",
     }
 )
-
-
-def parse_answer(text: str, default: bool) -> bool:
-    """Answer to a question: an empty line means the default."""
-    return default if not text.strip() else is_yes(text)
 
 
 def format_elapsed(seconds: float) -> str:
@@ -130,141 +134,6 @@ def _fragments(lines: List[StyledLine]):
             fragments.append(("", "\n"))
         fragments.append((style, text))
     return fragments
-
-
-@dataclass
-class _Question:
-    """A permission question waiting for the user's answer."""
-
-    info: str
-    future: "asyncio.Future[bool]"
-    default: bool = True
-
-    def resolve(self, answer: bool) -> None:
-        if not self.future.done():
-            self.future.set_result(answer)
-
-
-@dataclass
-class _TextQuestion:
-    """A question answered with free text (an API key, when `secret`: typed masked, never kept in the history)."""
-
-    info: str
-    future: "asyncio.Future[Optional[str]]"
-    secret: bool = False
-
-    def resolve(self, answer: Optional[str]) -> None:
-        if not self.future.done():
-            self.future.set_result(answer)
-
-
-@dataclass
-class MenuItem:
-    """A line of a checklist menu (see `AgentScreen.ask_menu`)."""
-
-    key: str
-    label: str
-    detail: str = ""
-    group: str = ""  # items of a group are listed together under its heading
-    checked: bool = True
-
-
-@dataclass
-class _Menu:
-    title: str
-    items: List[MenuItem]
-    future: "asyncio.Future[Optional[Dict[str, bool]]]"
-    cursor: int = 0
-    scroll: int = 0
-
-    def rows(self) -> List[Tuple[str, object]]:
-        """Group headings and items, in display order."""
-        rows: List[Tuple[str, object]] = []
-        previous = None
-        for item in self.items:
-            if item.group and item.group != previous:
-                rows.append(("group", item.group))
-            previous = item.group
-            rows.append(("item", item))
-        return rows
-
-    def members(self, group: str) -> List[MenuItem]:
-        return [item for item in self.items if item.group == group]
-
-    def move(self, delta: int) -> None:
-        self.cursor = max(0, min(len(self.rows()) - 1, self.cursor + delta))
-
-    def toggle(self) -> None:
-        kind, target = self.rows()[self.cursor]
-        if kind == "item":
-            target.checked = not target.checked  # type: ignore[union-attr]
-        else:
-            members = self.members(target)  # type: ignore[arg-type]
-            state = not all(item.checked for item in members)
-            for item in members:
-                item.checked = state
-
-    def toggle_all(self) -> None:
-        state = not all(item.checked for item in self.items)
-        for item in self.items:
-            item.checked = state
-
-    def result(self) -> Dict[str, bool]:
-        return {item.key: item.checked for item in self.items}
-
-    def resolve(self, result: Optional[Dict[str, bool]]) -> None:
-        if not self.future.done():
-            self.future.set_result(result)
-
-
-@dataclass
-class _Choice:
-    """A question of the agent with options (see `AgentScreen.ask_choice`).
-
-    The row after the options, when `allow_other`, is "another answer": what
-    the user types in the input line.
-    """
-
-    question: str
-    options: List[Choice]
-    multiple: bool
-    allow_other: bool
-    future: "asyncio.Future[Optional[Answer]]"
-    cursor: int = 0
-    checked: Set[int] = field(default_factory=set)
-    scroll: int = 0  # first row shown, when the options do not fit
-    visible: int = 0  # rows shown at the last drawing
-
-    @property
-    def other_row(self) -> int:
-        return len(self.options)
-
-    def on_other(self) -> bool:
-        return self.allow_other and self.cursor == self.other_row
-
-    def move(self, delta: int) -> None:
-        last = self.other_row if self.allow_other else len(self.options) - 1
-        self.cursor = max(0, min(last, self.cursor + delta))
-
-    def toggle(self) -> None:
-        if self.cursor < len(self.options):
-            self.checked ^= {self.cursor}
-
-    def answer(self, typed: str) -> Optional[Answer]:
-        """The answer Enter gives, or None when there is nothing to send yet."""
-        typed = typed.strip() if self.allow_other else ""
-        if self.multiple:
-            selected = [option.label for index, option in enumerate(self.options) if index in self.checked]
-            if not selected and not typed and self.cursor < len(self.options):
-                selected = [self.options[self.cursor].label]
-            return Answer(selected, typed) if selected or typed else None
-        if self.on_other():
-            return Answer([], typed) if typed else None
-        return Answer([self.options[self.cursor].label]) if self.options else None
-
-    def resolve(self, answer: Optional[Answer]) -> None:
-        if not self.future.done():
-            self.future.set_result(answer)
 
 
 def add_basic_commands(registry: SlashRegistry) -> None:
@@ -306,7 +175,11 @@ class AgentScreen:
         status: Callable[[], str] = lambda: "",
         todos: Callable[[], Progress] = lambda: (0, 0, ""),
         transcript: Optional[Callable[[], List[TurnView]]] = None,
+        completer: Optional[Completer] = None,
+        bang: Optional[Callable[[str], CommandResult]] = None,
     ) -> None:
+        """`completer` completes what is typed besides /commands (@paths); `bang(command)` runs a
+        line that starts with ``!``."""
         self.title = title
         self.console = console
         self.banner = banner
@@ -326,10 +199,11 @@ class AgentScreen:
         self._busy = False
         self._busy_label = "working"
         self._cancel = threading.Event()
-        self._question: Optional[_Question] = None
-        self._menu: Optional[_Menu] = None
-        self._choice: Optional[_Choice] = None
-        self._text: Optional[_TextQuestion] = None
+        self._question: Optional[Question] = None
+        self._menu: Optional[Menu] = None
+        self._choice: Optional[ChoiceQuestion] = None
+        self._text: Optional[TextQuestion] = None
+        self._queue: List[str] = []  # messages sent while the agent was busy, sent when it is done
         self._details = False  # tool lines are printed with what they hide
         self._flash: Tuple[str, float] = ("", 0.0)  # a short message in the header, until a time
         self._peak = 0  # tallest the layout above the header has been (see module docstring)
@@ -338,12 +212,16 @@ class AgentScreen:
         self._notices_lock = threading.Lock()
         self.viewer = None  # the transcript viewer, while it is open
         self._transcript = transcript or (lambda: list(self._finished))
+        self._bang = bang
+        self._stoppable = False  # the command running now (a !command) stops on Ctrl+C
 
         self._buffer = Buffer(
             history=history or InMemoryHistory(),
             accept_handler=self._accept,
             multiline=True,  # Enter is bound to "send"; Shift+Tab inserts the new lines
-            completer=ThreadedCompleter(SlashCompleter(self.commands)),
+            completer=ThreadedCompleter(
+                merge_completers([SlashCompleter(self.commands), *([completer] if completer else [])])
+            ),
             complete_while_typing=Condition(self._completing),
             on_text_changed=self._text_changed,
         )
@@ -354,7 +232,10 @@ class AgentScreen:
     # ------------------------------------------------------------------ #
 
     def _completing(self) -> bool:
-        return self._overlay_free() and self._buffer.text.startswith("/")
+        if not self._overlay_free():
+            return False
+        text = self._buffer.document.text_before_cursor
+        return text.startswith("/") or self._buffer.document.get_word_before_cursor(WORD=True).startswith("@")
 
     def _overlay_free(self) -> bool:
         """No question, menu or choice is waiting for the user."""
@@ -605,13 +486,16 @@ class AgentScreen:
             return []
         return [("", " " * self._prompt_width())]
 
-    def _question_lines(self, width: int) -> List[str]:
+    def _question_lines(self, width: int) -> List[StyledLine]:
         asked = self._question or self._text
         if asked is None:
             return []
-        lines: List[str] = []
+        lines: List[StyledLine] = []
         for logical in ("? " + asked.info).split("\n"):
-            lines.extend(wrap_line(logical, width))
+            lines.extend(("class:question", piece) for piece in wrap_line(logical, width))
+        hint = asked.hint() if isinstance(asked, Question) else ""
+        if hint:
+            lines.extend(("class:question-hint", piece) for piece in wrap_line(hint, width))
         return lines
 
     def _suggestion_lines(self) -> List[Tuple[str, str]]:
@@ -804,8 +688,7 @@ class AgentScreen:
         return _fragments(live_lines(view, width, self._live_budget(width), self._printer))
 
     def _question_fragments(self):
-        lines = self._question_lines(self._width())
-        return [("class:question", "\n".join(lines))]
+        return _fragments(self._question_lines(self._width()))
 
     def _suggestion_fragments(self):
         return _fragments(self._suggestion_lines())
@@ -838,6 +721,8 @@ class AgentScreen:
                 texts += [f"{frame} {label} · {timing} · {todo}" for todo in self._todo_texts()]
                 texts += [f"{frame} {label} · {timing}", f"{frame} {timing}"]
             texts.append(f"{frame} {label}")
+            if self._queue:
+                texts = [f"{text} · {len(self._queue)} queued" for text in texts[:-1]] + texts[-1:]
         else:
             todos = [todo for todo in self._todo_texts(pending_only=True)][-1:]
             texts = [f"{todo} · {hint}" for todo in todos for hint in IDLE_HINTS] + list(IDLE_HINTS)
@@ -894,7 +779,7 @@ class AgentScreen:
         elif self._question is None:
             label = "> "
         else:
-            label = "Accept (Y|n) > " if self._question.default else "Accept (y|N) > "
+            label = self._question.prompt()
         return [("class:input-prompt", label)]
 
     # ------------------------------------------------------------------ #
@@ -907,14 +792,34 @@ class AgentScreen:
         if self._menu is not None or self._choice is not None or self._text is not None:
             return True
         if self._question is not None:
-            self._question.resolve(parse_answer(text, self._question.default))
+            answer = self._question.answer(text)
+            if answer is None:  # a tool's question needs an explicit answer
+                self._flash = ("type y (yes), n (no) or a (always)", time.monotonic() + FLASH_SECONDS)
+                return False
+            self._question.resolve(answer)
             return False
-        if self._busy:
-            return True  # keep what was typed; press Enter again once the agent is done
         if not text:
             return False
-        self._spawn(self._command(text) if text.startswith("/") else self._run_turn(text))
+        if self._busy:
+            self._queue.append(text)  # sent once the agent is done
+            self._flash = (f"queued: sent when the agent is done ({len(self._queue)} waiting)", time.monotonic() + FLASH_SECONDS)
+            return False
+        self._spawn(self._dispatch(text))
         return False
+
+    async def _dispatch(self, text: str) -> None:
+        """Run what was typed: a /command, a !command, or a message for the agent."""
+        if text.startswith("/"):
+            await self._command(text)
+        elif text.startswith("!") and self._bang is not None:
+            await self._command(text, handler=self._bang)
+        else:
+            await self._run_turn(text)
+
+    def _send_queued(self) -> None:
+        """The agent is done: send the oldest queued message, if any."""
+        if self._queue and not self._busy:
+            self._spawn(self._dispatch(self._queue.pop(0)))
 
     def _interrupt(self) -> None:
         if self._menu is not None:
@@ -926,12 +831,20 @@ class AgentScreen:
             self._buffer.reset()
             self._text.resolve(None)
         if self._question is not None:
-            self._question.resolve(False)
-        if self._busy and self._view is not None:  # only an agent turn can be stopped
+            self._question.resolve(self._question.refuse())
+        if self._busy and (self._view is not None or self._stoppable):  # an agent turn, a !command
             self._cancel.set()
+            if self._queue:
+                self._flash = (f"stopped: {len(self._queue)} queued message(s) dropped", time.monotonic() + FLASH_SECONDS)
+            self._queue.clear()
             self._app.invalidate()
         elif not self._busy and self._buffer.text:
             self._buffer.reset()
+
+    @property
+    def stop_requested(self) -> bool:
+        """Did the user press Ctrl+C during what runs now?"""
+        return self._cancel.is_set()
 
     def toggle_details(self) -> bool:
         """Show or hide what the tool lines hide, from now on. Returns the new state."""
@@ -1040,16 +953,22 @@ class AgentScreen:
     # Commands and turns (event loop)
     # ------------------------------------------------------------------ #
 
-    async def _command(self, text: str) -> None:
+    async def _command(self, text: str, handler: Optional[Callable[[str], CommandResult]] = None) -> None:
+        """Run a /command (or, with `handler`, `handler(text without its first character)`) in a worker
+        thread, then show what it printed."""
         assert self._loop is not None
-        name = text.split()[0]
+        name = text.split()[0] if handler is None else "!"
         self._busy, self._busy_label = True, f"running {name}"
         self._cancel = threading.Event()
+        self._stoppable = handler is not None
         self._app.invalidate()
         prompt: Optional[str] = None
         try:
             try:
-                result = await self._loop.run_in_executor(None, self.commands.run, text)
+                if handler is None:
+                    result = await self._loop.run_in_executor(None, self.commands.run, text)
+                else:
+                    result = await self._loop.run_in_executor(None, handler, text[1:].strip())
             except Exception as error:  # a command must never break the screen
                 message = self.commands.renderer.text(f"{name}: {type(error).__name__}: {error}", "red")
                 result = CommandResult(text=message)
@@ -1065,9 +984,11 @@ class AgentScreen:
                 return
             prompt = result.prompt
         finally:
-            self._busy = False
+            self._busy = self._stoppable = False
         if prompt:
             await self._run_turn(prompt)
+        else:
+            self._send_queued()
 
     async def _stream(self, view: TurnView, printer: TurnPrinter, stop: asyncio.Event) -> None:
         """While the turn runs, print what became final."""
@@ -1109,6 +1030,7 @@ class AgentScreen:
                     self._finished.append(view)
                     self._busy = False
                     self._view = self._printer = None
+                    self._send_queued()
 
     # ------------------------------------------------------------------ #
     # Questions (called from the agent's worker thread)
@@ -1121,18 +1043,27 @@ class AgentScreen:
         return asyncio.run_coroutine_threadsafe(coroutine, self._loop).result()
 
     def ask_permission(self, info: str, default: bool = True) -> bool:
-        """Block the calling (non-UI) thread until the user answers. An empty
-        answer means `default`."""
-        return self._call(self._ask(info, default))
+        """A yes/no confirmation: block the calling (non-UI) thread until the user
+        answers. An empty answer means `default`."""
+        return self._call(self._ask(Question(info, default=default)))
 
-    async def _ask(self, info: str, default: bool) -> bool:
-        question = _Question(info, asyncio.get_running_loop().create_future(), default)
+    def ask_tool_permission(self, info: str, rule: Optional[str] = None, *, project: bool = False) -> Decision:
+        """A tool's permission question: y, n (with a reason), or "always" for `rule`
+        (`a`: this session; `p`, when `project`: in this project). An empty answer
+        answers nothing. Blocks the calling (non-UI) thread."""
+        return self._call(self._ask(Question(info, tool=True, rule=rule, project=project)))
+
+    async def _ask(self, question: Question):
+        question.future = asyncio.get_running_loop().create_future()
+        draft = self._buffer.document  # what the user was typing: put aside, not taken as the answer
+        self._buffer.reset()
         self._question = question
         self._app.invalidate()
         try:
             return await question.future
         finally:
             self._question = None
+            self._buffer.reset(document=draft)
             self._app.invalidate()
 
     def ask_choice(
@@ -1153,7 +1084,7 @@ class AgentScreen:
     async def _ask_choice(
         self, question: str, options: List[Choice], multiple: bool, allow_other: bool, initial: int = 0
     ) -> Optional[Answer]:
-        choice = _Choice(question, options, multiple, allow_other, asyncio.get_running_loop().create_future())
+        choice = ChoiceQuestion(question, options, multiple, allow_other, asyncio.get_running_loop().create_future())
         draft = self._buffer.document  # what the user was typing: kept for later
         self._buffer.reset()
         self._choice = choice
@@ -1174,7 +1105,7 @@ class AgentScreen:
         return self._call(self._ask_text(info, secret))
 
     async def _ask_text(self, info: str, secret: bool) -> Optional[str]:
-        question = _TextQuestion(info, asyncio.get_running_loop().create_future(), secret)
+        question = TextQuestion(info, asyncio.get_running_loop().create_future(), secret)
         draft = self._buffer.document
         self._buffer.reset()
         self._text = question
@@ -1196,7 +1127,7 @@ class AgentScreen:
         return self._call(self._choose(title, items))
 
     async def _choose(self, title: str, items: List[MenuItem]) -> Optional[Dict[str, bool]]:
-        menu = _Menu(title, [replace(item) for item in items], asyncio.get_running_loop().create_future())
+        menu = Menu(title, [replace(item) for item in items], asyncio.get_running_loop().create_future())
         self._menu = menu
         self._app.invalidate()
         try:
