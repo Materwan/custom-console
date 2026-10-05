@@ -43,7 +43,7 @@ project root (see `.env.example`; empty values mean "use the default").
 | `CLARA_URL` | `http://127.0.0.1:8765` | The Clara server the agent talks to |
 | `CLARA_USER`, `CLARA_PASSWORD` | – | Your user name and password on that server (the administrator makes them with `/user add`): `ai agent` signs in by itself, and the server knows it is you |
 | `CLARA_TOKEN` | – | Instead of a user: a chat token (`CLARA_TOKENS` there). Required by `ai agent` when there is no `CLARA_USER` |
-| `CLARA_ADMIN_TOKEN` | – | Optional: lets `/model` and `/provider` run in the server's console (not needed when `CLARA_USER` is an administrator) |
+| `CLARA_ADMIN_TOKEN` | – | Optional: lets `/server-model`, `/models` and `/provider` run in the server's console (not needed when `CLARA_USER` is an administrator) |
 | `CLARA_USER_NAME` | – | How Clara should call you |
 | `CLARA_TIMEZONE` | this computer's | Your time zone (IANA name, `Europe/Paris`), sent with each message: the server tells the model the date and time in it |
 | `OLLAMA_HOST` | `http://localhost:11434` | The local Ollama of `ai list` / `ai start` (not used by the agent) |
@@ -129,9 +129,12 @@ and the answer goes back on the same stream. So files, shell, PDF, Moodle and ma
 this machine, and the permissions, the free zone and `/undo` work exactly as before.
 
 Which model runs, and where (Ollama on the server's computer, or ollama.com with an API
-key), is the server's business: `/provider` and `/model` run **the server's own commands**,
-and need `CLARA_ADMIN_TOKEN` (the server's remote-admin token). The header and `/usage`
-follow whatever model the server used for each turn.
+key), is the server's business, but you choose among the models an administrator offers:
+`/model` lists them with what a token of each costs in credits and sets the one the console
+is answered by (it is yours, kept by the server, separately from your other clients). The
+server's own commands, `/provider`, `/server-model` and `/models` (which models users may
+choose, their weights), need `CLARA_ADMIN_TOKEN` (the server's remote-admin token). The
+header and `/usage` follow whatever model the server used for each turn.
 
 ### Terminal behaviour
 
@@ -190,7 +193,9 @@ Typing `/` lists them above the input, with what they do.
 
 | Command | What it does |
 |---|---|
-| `/model [NAME]` | the server's `/model`: list the models of its provider, or switch (needs `CLARA_ADMIN_TOKEN`) |
+| `/model [N\|NAME\|default]` | the models an administrator offers you, with their cost in credits per token; choose the one the console is answered by (`default`: the server's own) |
+| `/server-model [NAME]` | the server's `/model`: list the models of its provider, or switch its own (needs `CLARA_ADMIN_TOKEN`) |
+| `/models [list\|enable\|disable\|weight\|discord ...]` | the server's `/models`: which models users may choose, what they cost, Discord's model (needs `CLARA_ADMIN_TOKEN`) |
 | `/provider [local\|cloud]` | the server's `/provider`: show where it runs the model, or switch (needs `CLARA_ADMIN_TOKEN`) |
 | `/remind [daily\|weekly\|monthly] [@SURFACES] WHEN TEXT` | a reminder for you, shown on your Clara clients at that time (see below) |
 | `/reminders` `/unremind ID` | your reminders that have not fired yet; cancel one |

@@ -73,6 +73,8 @@ class FakeClara(ClaraClient):
         self.reminder_list: List[Dict[str, Any]] = []  # what /remind created
         self.announced: List[Dict[str, Any]] = []  # reminders the next connection of the stream delivers
         self.notify_after_value: Optional[int] = None  # what /notify-after set (None: the server's default)
+        self.offered_models: List[Dict[str, Any]] = []  # what an administrator lets this user choose
+        self.model_choice: Optional[str] = None  # what /model chose (None: the server's own)
 
     def _check(self) -> None:
         if self.down:
@@ -133,6 +135,19 @@ class FakeClara(ClaraClient):
         self._check()
         self.notify_after_value = seconds
         return self.settings()
+
+    def models(self) -> Dict[str, Any]:
+        self._check()
+        default = {"ref": f"{self.provider}:{self.model}", "name": self.model, "provider": self.provider,
+                   "provider_label": "Local host", "weight": 0.4}
+        chosen = next((m for m in self.offered_models if m["ref"] == self.model_choice), None)
+        return {"models": self.offered_models, "default": default, "current": chosen or default,
+                "choices": {"console": chosen["ref"]} if chosen else {}}
+
+    def choose_model(self, ref: Optional[str]) -> Dict[str, Any]:
+        self._check()
+        self.model_choice = ref
+        return self.models()
 
     def reminders(self) -> List[Dict[str, Any]]:
         self._check()

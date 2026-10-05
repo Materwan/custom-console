@@ -262,6 +262,16 @@ class ClaraClient:
             body["user_name"] = self.user_name
         return self._request("PATCH", "/v1/settings", json=body).json()
 
+    def models(self) -> Dict[str, Any]:
+        """The models this user may choose (`models`: `ref`, `name`, `provider_label`, `weight`, the credits a token
+        costs), the server's own (`default`), what they chose (`choices`, by surface) and the model in use
+        (`current`)."""
+        return self._request("GET", "/v1/models", params=self._identity()).json()
+
+    def choose_model(self, ref: Optional[str]) -> Dict[str, Any]:
+        """Choose the model Clara answers this user with in the console (None: the server's own)."""
+        return self._request("PUT", "/v1/models/choice", json={**self._identity(), "model": ref}).json()
+
     def reminders(self) -> List[Dict[str, Any]]:
         """This user's reminders that have not fired yet."""
         return self._request("GET", "/v1/reminders", params=self._identity()).json()["reminders"]

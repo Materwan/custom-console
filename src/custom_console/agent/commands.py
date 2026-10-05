@@ -66,6 +66,22 @@ def synopsis(parser: argparse.ArgumentParser) -> str:
     return " ".join(parts)
 
 
+def pick_model(info: dict, argument: str) -> Optional[str]:
+    """The model `argument` names (a number of the list, a name or `provider:name`): its reference, or None for
+    the server's own. ValueError when it is not one of those offered."""
+    word = argument.strip()
+    if word.lower() in ("default", "0", "server"):
+        return None
+    models = info["models"]
+    if word.isdigit() and 1 <= int(word) <= len(models):
+        return models[int(word) - 1]["ref"]
+    found = [m for m in models if word.lower() in (m["ref"].lower(), m["name"].lower())]
+    if len(found) != 1:
+        several = " (several have that name: write provider:name)" if found else ""
+        raise ValueError(f"{word!r} is not one of the models offered{several}.")
+    return found[0]["ref"]
+
+
 def bar(fraction: float, width: int = BAR_WIDTH) -> str:
     filled = max(0, min(width, round(fraction * width)))
     return "█" * filled + "░" * (width - filled)
@@ -89,7 +105,9 @@ class AgentCommands:
 
     def register(self, registry: SlashRegistry) -> None:
         add = registry.add
-        add(SlashCommand("model", "show or change the server's model (needs CLARA_ADMIN_TOKEN)", self._on_server("model"), "[MODEL]", self._complete_on_server("model")))
+        add(SlashCommand("model", "show or choose the model Clara answers you with (among those an administrator offers)", self.model, "[N|NAME|default]", self.complete_model))
+        add(SlashCommand("server-model", "show or change the server's own model (needs CLARA_ADMIN_TOKEN)", self._on_server("model"), "[MODEL]", self._complete_on_server("model")))
+        add(SlashCommand("models", "which models users may choose, what they cost, Discord's (needs CLARA_ADMIN_TOKEN)", self._on_server("models"), "[list|refresh|enable|disable|weight|discord ...]", self._complete_on_server("models")))
         add(
             SlashCommand(
                 "provider",
@@ -155,7 +173,51 @@ class AgentCommands:
     def complete_file_command(self, name: str, arguments: str) -> Iterator[Completion]:
         yield from self.shell.completer.get_completions(Document(f"{name} {arguments}"), None)
 
-    # -- /model, /provider: the server's own commands ------------------------------------ #
+    # -- /model: the model Clara answers you with ------------------------------------------- #
+
+    def _model_cost(self, model: dict) -> str:
+        weight = f"{model['weight']:.3f}".rstrip("0").rstrip(".")
+        return f"{weight} {'credit' if model['weight'] == 1 else 'credits'} per token"
+
+    def model(self, arguments: str) -> CommandResult:
+        """Show the models on offer, or choose one by its number, its name or `provider:name` (`default`: the
+        server's own)."""
+        word = arguments.strip()
+        try:
+            info = self.app.client.models()
+            if word:
+                self.app.client.choose_model(pick_model(info, word))
+                info = self.app.client.models()
+        except ValueError as error:
+            return self._error(str(error))
+        except ClaraError as error:
+            return self._error(str(error))
+        current = info["current"]
+        self.app.model_changed(str(current["name"]), str(current["provider"]))
+        lines = [f"Clara answers you here with {current['name']} ({current['provider_label']}), {self._model_cost(current)}."]
+        if info["models"]:
+            default = info["default"]
+            lines.append(f"  0. default: {default['name']} ({default['provider_label']}), {self._model_cost(default)}")
+            for number, model in enumerate(info["models"], 1):
+                mark = "*" if model["ref"] == current["ref"] else " "
+                lines.append(f"{mark} {number}. {model['name']} ({model['provider_label']}), {self._model_cost(model)}")
+            lines.append("Choose one with /model N or /model NAME; /model default goes back to the server's own.")
+        else:
+            lines.append("An administrator has not offered other models.")
+        return CommandResult(self.renderer.text("\n".join(lines), "green" if word else None))
+
+    def complete_model(self, arguments: str) -> Iterator[Completion]:
+        if " " in arguments:
+            return
+        try:
+            names = [m["name"] for m in self.app.client.models()["models"]]
+        except ClaraError:
+            return
+        for choice in ["default", *names]:
+            if choice.lower().startswith(arguments.lower()):
+                yield Completion(choice, start_position=-len(arguments))
+
+    # -- /provider, /server-model: the server's own commands ------------------------------------ #
 
     def _server_commands(self) -> list:
         """The server's console commands (for completion), asked once and kept."""

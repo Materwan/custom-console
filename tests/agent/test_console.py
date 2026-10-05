@@ -364,10 +364,10 @@ class TestSlashCommands:
             s.wait_output("Ctrl+C")
 
         out = session.run(driver)
-        for name in ("/model", "/provider", "/usage", "/context", "/compact", "/undo", "/init", "/ls", "/cd", "/cp", "/rm", "/bye"):
+        for name in ("/model", "/server-model", "/models", "/provider", "/usage", "/context", "/compact", "/undo", "/init", "/ls", "/cd", "/cp", "/rm", "/bye"):
             assert name in out
 
-    def test_model_and_provider_are_the_servers_commands(self, tmp_path):
+    def test_server_model_and_provider_are_the_servers_commands(self, tmp_path):
         session = Session(tmp_path)
         session.clara.admin_output["/provider"] = "* local  Local host"
 
@@ -377,13 +377,68 @@ class TestSlashCommands:
             session.clara.model, session.clara.provider = "gpt-oss:120b", "cloud"  # what the server does
             s.send("/provider cloud")
             s.wait_output("ran /provider cloud")
-            s.send("/model gpt-oss:120b")
-            s.wait_output("ran /model gpt-oss:120b")
+            s.send("/server-model gpt-oss:120b")
+            s.wait_output("ran /model gpt-oss:120b")  # the server's own /model
 
         session.run(driver)
         assert session.clara.admin_calls == ["/provider", "/provider cloud", "/model gpt-oss:120b"]
         assert session.console_.model == "gpt-oss:120b" and session.console_.provider_name == "cloud"
         assert "gpt-oss:120b" in session.console_.screen.title and "(cloud)" in session.console_.screen.title
+
+    def test_models_is_the_servers_catalogue_command(self, tmp_path):
+        session = Session(tmp_path)
+        session.clara.admin_output["/models"] = "Server default: local:fake"
+
+        def driver(s):
+            s.send("/models")
+            s.wait_output("Server default: local:fake")
+
+        session.run(driver)
+        assert session.clara.admin_calls == ["/models"]
+
+    def test_model_chooses_among_the_models_an_administrator_offers(self, tmp_path):
+        session = Session(tmp_path)
+        session.clara.offered_models = [
+            {"ref": "cloud:big", "name": "big", "provider": "cloud", "provider_label": "Ollama API key", "weight": 8.75},
+            {"ref": "local:small", "name": "small", "provider": "local", "provider_label": "Local host", "weight": 0.125},
+        ]
+
+        def driver(s):
+            s.send("/model")
+            s.wait_output("1. big (Ollama API key), 8.75 credits per token")
+            s.send("/model 1")
+            s.wait_output("answers you here with big")
+            s.send("/model nonsense")
+            s.wait_output("is not one of the models offered")
+            s.send("/model SMALL")
+            s.wait_output("answers you here with small")
+            s.send("/model default")
+            s.wait_output("answers you here with fake-model")
+
+        session.run(driver)
+        assert session.clara.model_choice is None
+        assert session.clara.admin_calls == []  # never the server's console: this is the user's own choice
+
+    def test_the_title_follows_the_model_chosen_and_nothing_is_offered_by_default(self, tmp_path):
+        session = Session(tmp_path)
+        session.clara.offered_models = [
+            {"ref": "cloud:big", "name": "big", "provider": "cloud", "provider_label": "Ollama API key", "weight": 8.75},
+        ]
+
+        def driver(s):
+            s.send("/model big")
+            s.wait_output("answers you here with big")
+
+        session.run(driver)
+        assert session.console_.model == "big" and "big" in session.console_.screen.title
+        (tmp_path / "other").mkdir()
+        quiet = Session(tmp_path / "other")
+
+        def ask(s):
+            s.send("/model")
+            s.wait_output("An administrator has not offered other models")
+
+        quiet.run(ask)
 
     def test_the_model_the_server_used_is_followed_after_each_turn(self, tmp_path):
         def respond(body):
