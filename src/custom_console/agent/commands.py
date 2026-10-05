@@ -19,7 +19,17 @@ from ..shell.commands import build_file_registry
 from ..shell.printer import QuietPrinter
 from ..shell.repl import Shell
 from .permissions import PermissionLevel, permission_label
-from .reminders import REPEATS, local_time, parse_remind, take_targets
+from .reminders import (
+    REPEATS,
+    TASK_HELP,
+    describe_task,
+    describe_task_detail,
+    local_time,
+    parse_remind,
+    parse_task,
+    parse_when_list,
+    take_targets,
+)
 from .render import turn_renderables
 from .sessions import ago
 from .slash import CommandResult, SlashCommand, SlashRegistry
@@ -120,6 +130,8 @@ class AgentCommands:
         add(SlashCommand("remind", "a notification for you at a time, on your Clara clients", self.remind, "[daily|weekly|monthly] [@SURFACES] WHEN TEXT", self.complete_remind))
         add(SlashCommand("reminders", "your reminders that have not fired yet", self.reminders))
         add(SlashCommand("unremind", "cancel one of your reminders", self.unremind, "ID", self.complete_unremind))
+        add(SlashCommand("tasks", "your to-do list kept by Clara: reminders sent and next reminder of each task", self.tasks, "[all|done]", self.complete_tasks))
+        add(SlashCommand("task", "one task in full, or add, finish, reopen, delete or change one", self.task, "ID | add | done | reopen | delete | set ...", self.complete_task))
         add(SlashCommand("notify-after", "how long a task takes before you are notified when it is done", self.notify_after, "[SECONDS|off|default]", self.complete_notify_after))
         add(SlashCommand("usage", "tokens used: this session and in total", self.usage))
         add(SlashCommand("context", "how full the context window is", self.context))
@@ -321,6 +333,98 @@ class AgentCommands:
         for reminder in found:
             if str(reminder["id"]).startswith(arguments):
                 yield Completion(str(reminder["id"]), start_position=-len(arguments), display_meta=reminder["text"][:60])
+
+    # -- /tasks, /task: the to-do list Clara keeps for you ---------------------------------------- #
+
+    def tasks(self, arguments: str) -> CommandResult:
+        status = arguments.strip().lower() or "open"
+        if status not in ("open", "done", "all"):
+            return self._error("Usage: /tasks [all|done]")
+        try:
+            found = self.app.client.tasks(status)["tasks"]
+        except ClaraError as error:
+            return self._error(str(error))
+        if not found:
+            return self._info("No task." if status == "all" else f"No {status} task.")
+        table = Table(title="Tasks", title_justify="left")
+        table.add_column("#", justify="right")
+        table.add_column("Task", overflow="fold")
+        table.add_column("Due")
+        table.add_column("Reminders sent", justify="right")
+        table.add_column("Next reminder")
+        for task in found:
+            nxt = "done" if task["status"] == "done" else local_time(task["next_reminder"]) if task["next_reminder"] else "none"
+            table.add_row(
+                str(task["id"]), task["title"], local_time(task["due_at"]) if task.get("due_at") else "",
+                str(task["reminders_sent"]), nxt,
+            )
+        return CommandResult(self.renderer.render(table))
+
+    def task(self, arguments: str) -> CommandResult:
+        word, _, rest = arguments.strip().partition(" ")
+        word, rest = word.lower(), rest.strip()
+        client, now = self.app.client, datetime.now().astimezone()
+        try:
+            if word.isdigit() and not rest:
+                return CommandResult(self.renderer.text(describe_task_detail(client.task(int(word))), "dim"))
+            if word == "add":
+                targets, rest = take_targets(rest)
+                title, description, due, reminders = parse_task(rest, now)
+                task = client.add_task(
+                    title, description, due.isoformat(timespec="seconds") if due else None,
+                    [at.isoformat(timespec="seconds") for at in reminders], targets,
+                )
+                return CommandResult(self.renderer.text("Task added.\n" + describe_task_detail(task), "green"))
+            if word in ("done", "reopen", "delete") and rest.isdigit():
+                if word == "delete":
+                    client.delete_task(int(rest))
+                    return CommandResult(self.renderer.text("Task deleted.", "green"))
+                task = client.change_task(int(rest), status="done" if word == "done" else "open")
+                return CommandResult(self.renderer.text(describe_task(task), "green"))
+            if word == "set":
+                number, _, rest = rest.partition(" ")
+                field, _, value = rest.strip().partition(" ")
+                field, value = field.lower(), value.strip()
+                if not number.isdigit() or field not in ("title", "description", "due", "remind") or not value:
+                    return self._error("Usage: /task set ID title|description|due|remind VALUE   (due and remind take WHEN, or none)")
+                if field == "due":
+                    moments = parse_when_list(value, now)
+                    change: dict = {"due": moments[0].isoformat(timespec="seconds") if moments else None}
+                elif field == "remind":
+                    change = {"reminders": [at.isoformat(timespec="seconds") for at in parse_when_list(value, now)]}
+                else:
+                    change = {field: value}
+                return CommandResult(self.renderer.text(describe_task(client.change_task(int(number), **change)), "green"))
+        except (ValueError, ClaraError) as error:
+            return self._error(str(error))
+        return self._error(
+            f"{TASK_HELP}\n       /task ID | done ID | reopen ID | delete ID | set ID title|description|due|remind VALUE"
+        )
+
+    def complete_tasks(self, arguments: str) -> Iterator[Completion]:
+        if " " in arguments:
+            return
+        for word, meta in {"all": "open and done", "done": "finished tasks"}.items():
+            if word.startswith(arguments.lower()):
+                yield Completion(word, start_position=-len(arguments), display_meta=meta)
+
+    def complete_task(self, arguments: str) -> Iterator[Completion]:
+        words = arguments.split(" ")
+        if len(words) == 1:
+            options = {"add": "a new task", "done": "mark one as done", "reopen": "open a done one again",
+                       "delete": "delete one for good", "set": "change one"}
+            for word, meta in options.items():
+                if word.startswith(words[0].lower()):
+                    yield Completion(word, start_position=-len(words[0]), display_meta=meta)
+        if len(words) == 1 or (len(words) == 2 and words[0].lower() in ("done", "reopen", "delete", "set")):
+            try:
+                found = self.app.client.tasks("all")["tasks"]
+            except ClaraError:
+                return
+            last = words[-1]
+            for task in found:
+                if str(task["id"]).startswith(last):
+                    yield Completion(str(task["id"]), start_position=-len(last), display_meta=task["title"][:60])
 
     # -- /notify-after: when a finished task notifies you ------------------------------------- #
 

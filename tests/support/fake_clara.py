@@ -8,6 +8,7 @@ event, after which the console posts the results to `fake.results`).
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from custom_console.agent.clara import ClaraClient, ClaraError, NothingToCompact
@@ -75,6 +76,7 @@ class FakeClara(ClaraClient):
         self.notify_after_value: Optional[int] = None  # what /notify-after set (None: the server's default)
         self.offered_models: List[Dict[str, Any]] = []  # what an administrator lets this user choose
         self.model_choice: Optional[str] = None  # what /model chose (None: the server's own)
+        self.task_list: Dict[int, Dict[str, Any]] = {}  # the user's to-do list, as the server describes each task
 
     def _check(self) -> None:
         if self.down:
@@ -148,6 +150,59 @@ class FakeClara(ClaraClient):
         self._check()
         self.model_choice = ref
         return self.models()
+
+    def _picked(self, reminders: Optional[List[str]]) -> List[str]:
+        """What the server keeps: the reminders given, or (as Clara would) tomorrow at 09:00 UTC."""
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        return sorted(reminders or [tomorrow.isoformat(timespec="seconds")])
+
+    def add_task(
+        self, title: str, description: str = "", due: Optional[str] = None, reminders: Optional[List[str]] = None,
+        targets: Optional[List[str]] = None, sent: int = 0, status: str = "open",
+    ) -> Dict[str, Any]:
+        self._check()
+        if not title.strip():
+            raise ClaraError("Clara server: A task needs a title. (HTTP 422)")
+        task_id = max(self.task_list, default=0) + 1
+        queue = self._picked(reminders) if status == "open" else []
+        self.task_list[task_id] = {
+            "id": task_id, "title": title, "description": description, "status": status, "due_at": due,
+            "reminders_sent": sent, "max_reminders": 10, "next_reminder": queue[0] if queue else None,
+            "reminders": queue, "targets": list(targets or []),
+        }
+        return self.task_list[task_id]
+
+    def tasks(self, status: str = "open") -> Dict[str, Any]:
+        self._check()
+        found = [t for t in self.task_list.values() if status == "all" or t["status"] == status]
+        return {"tasks": found, "max_reminders": 10}
+
+    def task(self, task_id: int) -> Dict[str, Any]:
+        self._check()
+        if task_id not in self.task_list:
+            raise ClaraError("Clara server: No such task of yours. (HTTP 404)")
+        return self.task_list[task_id]
+
+    def change_task(self, task_id: int, **fields: Any) -> Dict[str, Any]:
+        task = self.task(task_id)
+        for key in ("title", "description"):
+            if key in fields:
+                task[key] = fields[key]
+        if "due" in fields:
+            task["due_at"] = fields["due"]
+        if fields.get("status") == "done":
+            task.update(status="done", reminders=[], next_reminder=None)
+        elif fields.get("status") == "open":
+            queue = self._picked(fields.get("reminders"))
+            task.update(status="open", reminders=queue, next_reminder=queue[0])
+        elif "reminders" in fields:
+            queue = sorted(fields["reminders"])
+            task.update(reminders=queue, next_reminder=queue[0] if queue else None)
+        return task
+
+    def delete_task(self, task_id: int) -> None:
+        self.task(task_id)
+        self.task_list.pop(task_id)
 
     def reminders(self) -> List[Dict[str, Any]]:
         self._check()

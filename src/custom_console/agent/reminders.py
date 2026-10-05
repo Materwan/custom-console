@@ -39,43 +39,106 @@ def take_targets(argument: str) -> Tuple[List[str], str]:
     return [], argument
 
 
+def take_when(words: List[str], now: datetime) -> Tuple[datetime, List[str]]:
+    """The moment the words start with (+30m, 09:30, tomorrow 09:30, 2026-10-05 09:30) and the words after it.
+    `now` is the local time, with its offset."""
+    head = words[0].lower() if words else ""
+    relative = re.fullmatch(r"\+(\d+)([mhd])", head)
+    if relative:
+        unit = {"m": "minutes", "h": "hours", "d": "days"}[relative[2]]
+        return now + timedelta(**{unit: int(relative[1])}), words[1:]
+    if head == "tomorrow" and len(words) > 1:
+        hour, minute = _clock(words[1])
+        return (now + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0), words[2:]
+    if re.fullmatch(r"\d{4}-\d\d-\d\d", head) and len(words) > 1:
+        hour, minute = _clock(words[1])
+        try:
+            return datetime.fromisoformat(head).replace(hour=hour, minute=minute).astimezone(), words[2:]
+        except ValueError:
+            raise ValueError(f"Not a date: {head!r}.") from None
+    if ":" in head:
+        hour, minute = _clock(head)
+        due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return (due if due > now else due + timedelta(days=1)), words[1:]
+    raise ValueError(f"Cannot read the time {head!r}. {WHEN_HELP}")
+
+
 def parse_remind(argument: str, now: datetime) -> Tuple[datetime, str, str]:
     """``(when, repeat, text)`` from the arguments of /remind. `now` is the local time, with its offset."""
     words = argument.split()
     repeat = words.pop(0).lower() if words and words[0].lower() in REPEATS else ""
     if not words:
         raise ValueError(f"Usage: /remind [daily|weekly|monthly] WHEN TEXT   ({WHEN_HELP})")
-    head = words[0].lower()
-    relative = re.fullmatch(r"\+(\d+)([mhd])", head)
-    if relative:
-        unit = {"m": "minutes", "h": "hours", "d": "days"}[relative[2]]
-        due, rest = now + timedelta(**{unit: int(relative[1])}), words[1:]
-    elif head == "tomorrow" and len(words) > 1:
-        hour, minute = _clock(words[1])
-        due = (now + timedelta(days=1)).replace(hour=hour, minute=minute, second=0, microsecond=0)
-        rest = words[2:]
-    elif re.fullmatch(r"\d{4}-\d\d-\d\d", head) and len(words) > 1:
-        hour, minute = _clock(words[1])
-        try:
-            due = datetime.fromisoformat(head).replace(hour=hour, minute=minute).astimezone()
-        except ValueError:
-            raise ValueError(f"Not a date: {head!r}.") from None
-        rest = words[2:]
-    elif ":" in head:
-        hour, minute = _clock(head)
-        due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        due, rest = (due if due > now else due + timedelta(days=1)), words[1:]
-    else:
-        raise ValueError(f"Cannot read the time {head!r}. {WHEN_HELP}")
+    due, rest = take_when(words, now)
     text = " ".join(rest)
     if not text:
         raise ValueError("A reminder needs a text.")
     return due, repeat, text
 
 
+TASK_HELP = "Usage: /task add [@SURFACES] [due WHEN] [remind WHEN]... TITLE [| DESCRIPTION]"
+
+
+def parse_task(argument: str, now: datetime) -> Tuple[str, str, Optional[datetime], List[datetime]]:
+    """``(title, description, due, reminders)`` from the arguments of /task add: ``[due WHEN] [remind WHEN]...
+    TITLE [| DESCRIPTION]``."""
+    words = argument.split()
+    due: Optional[datetime] = None
+    reminders: List[datetime] = []
+    while words and words[0].lower() in ("due", "remind"):
+        keyword = words.pop(0).lower()
+        if not words:
+            raise ValueError(f"{TASK_HELP}   ({keyword} needs a time: {WHEN_HELP})")
+        moment, words = take_when(words, now)
+        if keyword == "due":
+            due = moment
+        else:
+            reminders.append(moment)
+    title, _, description = " ".join(words).partition("|")
+    if not title.strip():
+        raise ValueError("A task needs a title.")
+    return title.strip(), description.strip(), due, reminders
+
+
+def parse_when_list(text: str, now: datetime) -> List[datetime]:
+    """The moments of a comma-separated list (``+1h, tomorrow 09:00``); ``none`` is an empty list."""
+    if text.strip().lower() in ("none", "off", "-"):
+        return []
+    moments = []
+    for part in text.split(","):
+        moment, rest = take_when(part.split(), now)
+        if rest:
+            raise ValueError(f"Unexpected after the time: {' '.join(rest)!r} (separate several times with commas).")
+        moments.append(moment)
+    return moments
+
+
 def local_time(moment: str) -> str:
     """An ISO moment from the server, as local ``YYYY-MM-DD HH:MM``."""
     return datetime.fromisoformat(moment).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def describe_task(task: Dict[str, Any]) -> str:
+    """One line: the number, title, deadline, reminders sent and the next reminder."""
+    parts = [f"[{task['id']}] {task['title']}"]
+    if task["status"] == "done":
+        parts.append("done")
+    if task.get("due_at"):
+        parts.append(f"due {local_time(task['due_at'])}")
+    sent = task["reminders_sent"]
+    parts.append(f"{sent} reminder{'s' if sent != 1 else ''} sent")
+    if task["status"] == "open":
+        parts.append(f"next reminder {local_time(task['next_reminder'])}" if task["next_reminder"] else "no reminder to come")
+    return "  ·  ".join(parts)
+
+
+def describe_task_detail(task: Dict[str, Any]) -> str:
+    lines = [describe_task(task), f"Description: {task['description'] or '(none)'}"]
+    if len(task["reminders"]) > 1:
+        lines.append("Reminders to come: " + ", ".join(local_time(at) for at in task["reminders"]))
+    if task["targets"]:
+        lines.append("Shown on: " + ", ".join(task["targets"]))
+    return "\n".join(lines)
 
 
 def notice(event: Dict[str, Any], now: datetime) -> str:

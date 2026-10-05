@@ -26,6 +26,7 @@ class State:
         self.deleted = []
         self.closed_early = threading.Event()
         self.reminder_bodies = []
+        self.task_requests = []  # (method, path, body) of each /v1/tasks request
         self.notification_bodies = []
         self.stream_paths = []
         self.logins = []  # bodies of POST /v1/auth/login
@@ -88,6 +89,14 @@ class Handler(BaseHTTPRequestHandler):
                         "sent_at": "2026-10-02T10:00:00+00:00", "source": "server"})
             self.event({"type": "server", "state": "stopping", "message": "Clara is stopping"})
             return self.event({"type": "something-else"})
+        if self.path.startswith("/v1/tasks"):
+            if self.allowed(CHAT):
+                self.state.task_requests.append(("GET", self.path, {}))
+                if self.path.startswith("/v1/tasks/9"):
+                    return self.reply(404, {"detail": "No such task of yours."})
+                task = {"id": 4, "title": "Taxes", "status": "open", "reminders_sent": 1}
+                self.reply(200, {"tasks": [task], "max_reminders": 10} if self.path.startswith("/v1/tasks?") else task)
+            return
         if self.path.startswith("/v1/reminders"):
             if self.allowed(CHAT):
                 self.reply(200, {"reminders": [{"id": 3, "text": "Bins", "due_at": "2026-10-05T07:00:00+00:00", "repeat": "weekly"}]})
@@ -98,6 +107,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.allowed(CHAT):
             self.state.deleted.append(self.path)
             self.reply(200, {"deleted_messages": 2})
+
+    def do_PATCH(self):
+        body = self.json_body()
+        if self.allowed(CHAT):
+            self.state.task_requests.append(("PATCH", self.path, body))
+            self.reply(200, {"id": 4, "title": body.get("title", "Taxes"), "status": body.get("status", "open")})
 
     def do_POST(self):
         self.body = self.json_body()  # always read it: answering with the request unread resets the connection
@@ -129,6 +144,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.body["text"] == "past":
                 return self.reply(422, {"detail": "That moment is already past."})
             return self.reply(201, {"id": 7, "text": self.body["text"], "due_at": self.body["at"], "repeat": self.body["repeat"]})
+        if self.path == "/v1/tasks":
+            if self.allowed(CHAT):
+                self.state.task_requests.append(("POST", self.path, self.body))
+                if not self.body["title"].strip():
+                    return self.reply(422, {"detail": "A task needs a title."})
+                self.reply(201, {"id": 4, "title": self.body["title"], "status": "open", "reminders": self.body["reminders"]})
+            return
         if self.path == "/v1/notifications":
             if self.allowed(CHAT):
                 self.state.notification_bodies.append(self.body)
@@ -413,6 +435,46 @@ class TestReminders:
         url, _ = server
         with pytest.raises(ClaraError, match="401"):
             list(client_for(url, token="nope").reminder_events())
+
+
+class TestTasks:
+    def test_a_task_is_sent_with_who_set_it(self, server):
+        url, state = server
+        task = client_for(url).add_task(
+            "Send the invoice", "to ACME", "2026-10-07T18:00:00+02:00", ["2026-10-05T09:00:00+02:00"], ["app"]
+        )
+        assert task["id"] == 4
+        assert state.task_requests == [(
+            "POST", "/v1/tasks",
+            {"surface": "console", "user_id": "erwan", "title": "Send the invoice", "description": "to ACME",
+             "due": "2026-10-07T18:00:00+02:00", "reminders": ["2026-10-05T09:00:00+02:00"], "targets": ["app"],
+             "user_name": "Erwan"},
+        )]
+
+    def test_without_reminders_none_are_sent_so_that_clara_chooses(self, server):
+        url, state = server
+        client_for(url).add_task("Water the plants")
+        body = state.task_requests[-1][2]
+        assert body["reminders"] == [] and body["due"] is None
+
+    def test_a_refused_task_says_why(self, server):
+        url, _ = server
+        with pytest.raises(ClaraError, match="needs a title.*HTTP 422"):
+            client_for(url).add_task(" ")
+
+    def test_tasks_are_listed_read_changed_and_deleted(self, server):
+        url, state = server
+        client = client_for(url)
+        assert [t["title"] for t in client.tasks("all")["tasks"]] == ["Taxes"]
+        assert state.task_requests[-1][1] == "/v1/tasks?surface=console&user_id=erwan&status=all"
+        assert client.task(4)["reminders_sent"] == 1
+        assert client.change_task(4, title="Taxes 2025", due=None)["title"] == "Taxes 2025"
+        assert state.task_requests[-1][2] == {"surface": "console", "user_id": "erwan", "title": "Taxes 2025", "due": None}
+        assert client.change_task(4, status="done")["status"] == "done"
+        client.delete_task(4)
+        assert state.deleted == ["/v1/tasks/4?surface=console&user_id=erwan"]
+        with pytest.raises(ClaraError, match="No such task.*HTTP 404"):
+            client.task(9)
 
 
 class TestPassword:

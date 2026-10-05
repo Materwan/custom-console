@@ -279,6 +279,38 @@ class ClaraClient:
     def cancel_reminder(self, reminder_id: int) -> None:
         self._request("DELETE", f"/v1/reminders/{reminder_id}", params=self._identity())
 
+    # -- the to-do list ---------------------------------------------------------------------------- #
+
+    def tasks(self, status: str = "open") -> Dict[str, Any]:
+        """This user's tasks (`status`: open, done or all): `tasks` (`id`, `title`, `description`, `status`, `due_at`,
+        `reminders_sent`, `next_reminder`, `reminders`...) and `max_reminders`."""
+        return self._request("GET", "/v1/tasks", params={**self._identity(), "status": status}).json()
+
+    def task(self, task_id: int) -> Dict[str, Any]:
+        return self._request("GET", f"/v1/tasks/{int(task_id)}", params=self._identity()).json()
+
+    def add_task(
+        self, title: str, description: str = "", due: Optional[str] = None, reminders: Optional[List[str]] = None,
+        targets: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """A task for this user. `due` and `reminders` are ISO 8601 times with their offset; without any reminder
+        Clara picks them on the server."""
+        body: Dict[str, Any] = {
+            **self._identity(), "title": title, "description": description, "due": due,
+            "reminders": list(reminders or []), "targets": list(targets or []),
+        }
+        if self.user_name:
+            body["user_name"] = self.user_name
+        return self._request("POST", "/v1/tasks", json=body).json()
+
+    def change_task(self, task_id: int, **fields: Any) -> Dict[str, Any]:
+        """Change a task: `title`, `description`, `due` (None: no deadline), `reminders` (ISO times; [] stops them),
+        `status` ("done" or "open")."""
+        return self._request("PATCH", f"/v1/tasks/{int(task_id)}", json={**self._identity(), **fields}).json()
+
+    def delete_task(self, task_id: int) -> None:
+        self._request("DELETE", f"/v1/tasks/{int(task_id)}", params=self._identity())
+
     def reminder_events(self) -> Iterator[Dict[str, Any]]:
         """What the server announces to this user, for as long as the connection holds: ``reminder`` and
         ``notification`` events (what came while this client was away first) and ``server`` events

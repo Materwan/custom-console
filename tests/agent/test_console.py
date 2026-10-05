@@ -775,6 +775,132 @@ class TestRmdocCommand:
         assert (work / "Course.pdf").read_bytes().startswith(b"%PDF") and (work / "out.pdf").exists()
 
 
+class TestTasks:
+    def test_a_task_is_added_with_a_deadline_reminders_and_a_description(self, tmp_path):
+        session = Session(tmp_path)
+
+        def driver(s):
+            s.send("/task add due tomorrow 18:00 remind +1h remind +3h Send the invoice | to ACME")
+            s.wait_output("Task added.")
+
+        out = session.run(driver)
+        [task] = session.clara.task_list.values()
+        assert (task["title"], task["description"], len(task["reminders"])) == ("Send the invoice", "to ACME", 2)
+        assert datetime.fromisoformat(task["due_at"]).tzinfo is not None  # the console's own offset travels
+        assert "Description: to ACME" in out and "Reminders to come:" in out
+
+    def test_a_task_without_reminders_is_left_to_clara(self, tmp_path):
+        session = Session(tmp_path)
+
+        def driver(s):
+            s.send("/task add Water the plants")
+            s.wait_output("Task added.")
+
+        session.run(driver)
+        [task] = session.clara.task_list.values()
+        assert task["reminders"] != [] and task["due_at"] is None  # the server chose
+
+    def test_the_list_shows_reminders_sent_and_the_next_one(self, tmp_path):
+        session = Session(tmp_path)
+        session.clara.add_task("Taxes", reminders=["2026-10-05T09:00:00+02:00"], sent=2)
+        session.clara.add_task("Done one", status="done")
+
+        def driver(s):
+            s.send("/tasks")
+            s.wait_output("Taxes")
+            s.send("/tasks all")
+            s.wait_output("Done one")
+
+        out = session.run(driver)
+        assert "Reminders sent" in out and "Next reminder" in out and "2026-10-05" in out
+
+    def test_one_task_is_described_by_its_number(self, tmp_path):
+        session = Session(tmp_path)
+        session.clara.add_task("Taxes", "Gather the papers", reminders=["2026-10-05T09:00:00+02:00", "2026-10-07T09:00:00+02:00"])
+
+        def driver(s):
+            s.send("/task 1")
+            s.wait_output("Gather the papers")
+            s.send("/task 9")
+            s.wait_output("No such task")
+
+        out = session.run(driver)
+        assert "Reminders to come:" in out
+
+    def test_a_task_is_finished_reopened_changed_and_deleted(self, tmp_path):
+        session = Session(tmp_path)
+        session.clara.add_task("Pay rent", due="2030-01-01T00:00:00+00:00", reminders=["2030-01-02T09:00:00+00:00"])
+
+        def driver(s):
+            s.send("/task done 1")
+            s.wait_output("done")
+            assert session.clara.task_list[1]["status"] == "done"
+            s.send("/task reopen 1")
+            s.wait_output("next reminder")
+            s.send("/task set 1 title Pay the rent")
+            s.wait_output("Pay the rent")
+            s.send("/task set 1 due none")
+            s.send("/task set 1 remind +5h, +6h")
+            s.wait_output("next reminder")
+            s.send("/task delete 1")
+            s.wait_output("Task deleted.")
+
+        session.run(driver)
+        assert session.clara.task_list == {}
+
+    def test_what_cannot_be_read_is_explained_and_changes_nothing(self, tmp_path):
+        session = Session(tmp_path)
+
+        def driver(s):
+            s.send("/task add")
+            s.wait_output("needs a title")
+            s.send("/task add due")
+            s.wait_output("needs a time")
+            s.send("/task add remind someday Tea")
+            s.wait_output("Cannot read the time")
+            s.send("/task set 1 colour red")
+            s.wait_output("Usage: /task set")
+            s.send("/tasks soon")
+            s.wait_output("Usage: /tasks")
+            s.send("/task")
+            s.wait_output("Usage: /task add")
+
+        session.run(driver)
+        assert session.clara.task_list == {}
+
+    def test_the_servers_refusal_is_shown(self, tmp_path):
+        session = Session(tmp_path)
+
+        def driver(s):
+            session.clara.down = True
+            s.send("/task add Tea")
+            s.wait_output("Cannot reach the Clara server")
+            s.send("/tasks")
+            s.wait_output("Cannot reach the Clara server")
+
+        session.run(driver)
+        assert session.clara.task_list == {}
+
+    def test_tasks_and_their_numbers_complete(self, tmp_path):
+        from prompt_toolkit.document import Document
+
+        from custom_console.agent.slash import SlashCompleter
+
+        session = Session(tmp_path)
+        session.clara.add_task("Taxes")
+        session.clara.add_task("Rent")
+        completer = SlashCompleter(session.console_.screen.commands)
+
+        def complete(line):
+            return [c.text for c in completer.get_completions(Document(line), None)]
+
+        session.pipe_ctx.__exit__(None, None, None)
+        assert complete("/task ") == ["add", "done", "reopen", "delete", "set", "1", "2"]
+        assert complete("/task de") == ["delete"] and complete("/task done ") == ["1", "2"] and complete("/task set 2") == ["2"]
+        assert complete("/task add ") == []
+        assert complete("/tasks ") == ["all", "done"]
+
+
 class TestReminders:
     def announced(self, text, **fields):
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")

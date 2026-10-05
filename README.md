@@ -199,6 +199,8 @@ Typing `/` lists them above the input, with what they do.
 | `/provider [local\|cloud]` | the server's `/provider`: show where it runs the model, or switch (needs `CLARA_ADMIN_TOKEN`) |
 | `/remind [daily\|weekly\|monthly] [@SURFACES] WHEN TEXT` | a reminder for you, shown on your Clara clients at that time (see below) |
 | `/reminders` `/unremind ID` | your reminders that have not fired yet; cancel one |
+| `/tasks [all\|done]` | your to-do list, kept by Clara: each task with the reminders sent and the next one (see below) |
+| `/task ID` `/task add` `done` `reopen` `delete` `set` | one task in full; add, finish, reopen, delete or change one (see below) |
 | `/notify-after [SECONDS\|off\|default]` | how long a task (a turn, tools included) takes before you are notified on your Clara clients when it is done; `off`: never; `default`: the server's delay. Kept by the server, so it is the same on every client |
 | `/usage` | tokens used by this session, today, the last 7 days and in total, per model |
 | `/context` | how full the context window is: system prompt, tools, project file, summary, messages |
@@ -249,6 +251,33 @@ where it is shown.
 
 The time you type is your computer's local time; a repeating reminder keeps the UTC offset it was
 set with, so it does not follow daylight-saving changes.
+
+### Tasks
+
+Clara keeps a **to-do list** for you on the server (the same on the web site, the desktop app, `clara-chat`
+and Discord). Every task has a title, a description, an optional deadline and **reminders**: when you give
+none, Clara picks them; and each time a reminder is sent she looks at the task again (its title, description and
+the number of reminders already sent) and may move the next ones, so you are not nagged the same way forever.
+A reminder arrives like any notification (`🔔 Task: Taxes: ...`). After `CLARA_TASK_MAX_REMINDERS` reminders
+(10 by default) a task is left alone until you finish it or ask for more. These are not the agent's own
+checklist (`/todo`) nor its `task` sub-agents.
+
+```
+/tasks                               what is to do: reminders sent and next reminder of each
+/tasks all                           with the finished ones (also: /tasks done)
+/task 4                              one task in full: description and every reminder to come
+/task add Buy milk                   a task; Clara picks the reminders
+/task add due tomorrow 18:00 remind +1h remind tomorrow 09:00 Send the invoice | to ACME
+/task add @app Water the plants      reminders only on the desktop app
+/task done 4        /task reopen 4   (reopening has Clara pick the reminders again)
+/task set 4 title Send the new invoice      also: description TEXT
+/task set 4 due tomorrow 18:00              or: due none
+/task set 4 remind +2h, tomorrow 09:00      the reminders to come, comma-separated; or: remind none
+/task delete 4
+```
+
+You can also just ask Clara ("add a task: send the invoice by Friday", "what is on my list?", "when will you
+remind me about the taxes?", "I did the taxes").
 
 ### The free zone and permissions
 
@@ -446,7 +475,7 @@ src/custom_console/
     mentions.py                  @path attachments and their completion
     slash.py  commands.py        slash commands: registry, completion, /compact /usage /undo...
     clara.py  remote.py          the Clara server: HTTP client, and a turn with tools run here
-    reminders.py                 /remind parsing, the notice, the background listener
+    reminders.py                 /remind and /task parsing, the notice, the background listener
     schema.py                    the JSON description of each tool, from its signature
     session.py                   a turn: streaming, tool hook, journal, usage
     subagent.py                  sub-agents run by the `task` tool (ephemeral jobs on the server)
