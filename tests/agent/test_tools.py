@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-import json
+import os
 
-import pytest
 
-from custom_console.agent.permissions import UserPermissionDenied
-from custom_console.fs import virtual
+
 from custom_console.agent.tools import build_tools
 from custom_console.agent.tools import mail as mail_module
 from custom_console.agent.tools import pdf as pdf_module
 from custom_console.agent.tools import web as web_module
-from custom_console.agent.tools.filesystem import filesystem_tools, python_outline
 from custom_console.agent.tools.mail import build_message, mail_tools
 from custom_console.agent.tools.moodle import (
     compact_announcements,
@@ -20,7 +17,6 @@ from custom_console.agent.tools.moodle import (
 )
 from custom_console.agent.tools.pdf import pdf_tools
 from custom_console.agent.tools.web import compact_weather, web_tools
-from custom_console.agent.tools.workspace_tools import workspace_tools
 
 
 MARKDOWN = "# Title\n\n$x^2$"
@@ -38,7 +34,8 @@ def by_name(tools):
 class TestBuildTools:
     def test_default_set(self, ctx):
         names = {t.__name__ for t in build_tools(ctx)}
-        assert {"file_system_read", "workspace_file_write", "pdf_to_markdown", "get_weather"} <= names
+        assert {"file_system_read", "file_system_edit", "run_command", "todo_write", "pdf_to_markdown", "rmdoc_to_pdf", "get_weather"} <= names
+        assert not any(name.startswith("workspace_file_") for name in names)
         assert "moodle_list_courses" in names
         assert "send_email" not in names  # no SMTP server configured
 
@@ -58,185 +55,14 @@ class TestBuildTools:
         ctx, _ = make_ctx(SMTP_HOST="smtp.example.com")
         assert "send_email" in {t.__name__ for t in build_tools(ctx)}
 
-    def test_instructions_cover_every_registered_tool_family(self, ctx):
+    def test_instructions_mention_every_registered_tool_family(self, ctx):
         from pathlib import Path
 
         text = (Path(__file__).parents[2] / "config" / "agent_instructions.txt").read_text(encoding="utf-8")
-        names = {tool.__name__ for tool in build_tools(ctx)}
-        # The tools describe themselves; the instructions only say which family is for what.
-        for family in ("file_system_", "workspace_file_"):
-            assert any(name.startswith(family) for name in names) and f"`{family}*`" in text
-        assert "pdf_to_markdown" in names and "pdf_to_markdown" in text
-
-
-# --------------------------------------------------------------------------- #
-# file_system_*
-# --------------------------------------------------------------------------- #
-
-
-@pytest.fixture
-def fs(ctx, files_dir):
-    (files_dir / "a.txt").write_text("one\ntwo\nthree\nfour\n")
-    (files_dir / "sub").mkdir()
-    (files_dir / "sub" / "deep.py").write_text(
-        '"""Module."""\nimport os\n\nclass Box(Base):\n    """A box."""\n    def open(self, lid):\n        pass\n\n'
-        "async def fetch(url, *rest, flag=1, **kw):\n    pass\n"
-    )
-    return by_name(filesystem_tools(ctx))
-
-
-class TestFileSystemTools:
-    def test_pwd(self, fs, files_dir):
-        assert fs["file_system_pwd"]().data == str(files_dir).replace("\\", "/")
-
-    def test_list(self, fs):
-        assert fs["file_system_list"]().data == ["a.txt", "sub/"]
-        assert fs["file_system_list"](path="sub").data == ["deep.py"]
-
-    def test_list_errors_are_results_not_exceptions(self, fs):
-        result = fs["file_system_list"](path="nope")
-        assert not result.success and isinstance(result.error, FileNotFoundError)
-
-    def test_read_full(self, fs):
-        assert fs["file_system_read"]("a.txt").data == "one\ntwo\nthree\nfour\n"
-
-    def test_read_range_is_one_based_inclusive_and_keeps_newlines(self, fs):
-        assert fs["file_system_read"]("a.txt", mode="range", start_line=2, end_line=3).data == "two\nthree"
-
-    @pytest.mark.parametrize(
-        "kwargs",
-        [{"mode": "range"}, {"mode": "range", "start_line": 0, "end_line": 2}, {"mode": "range", "start_line": 3, "end_line": 2}, {"mode": "bogus"}],
-    )
-    def test_read_invalid_arguments(self, fs, kwargs):
-        result = fs["file_system_read"]("a.txt", **kwargs)
-        assert not result.success and isinstance(result.error, ValueError)
-
-    def test_read_summary_of_a_python_file(self, fs):
-        outline = fs["file_system_read"](str("sub/deep.py"), mode="summary").data
-        assert "class Box(Base):" in outline and "def open(self, lid)" in outline
-
-    def test_read_summary_of_other_files_is_the_head(self, fs, files_dir):
-        (files_dir / "long.txt").write_text("\n".join(f"l{i}" for i in range(200)))
-        summary = fs["file_system_read"]("long.txt", mode="summary").data
-        assert summary.splitlines()[0] == "l0" and len(summary.splitlines()) == 50
-
-    def test_read_truncation_notice(self, fs):
-        data = fs["file_system_read"]("a.txt", max_chars=5).data
-        assert data.startswith("one\nt") and "truncated at 5 chars" in data and 'mode="range"' in data
-
-    def test_read_binary_file_fails_cleanly(self, fs, files_dir):
-        (files_dir / "b.bin").write_bytes(b"\x00\x01")
-        assert not fs["file_system_read"]("b.bin").success
-
-    def test_stat(self, fs):
-        assert set(fs["file_system_stat"]("a.txt").data) == {"readable", "writable", "executable"}
-        assert fs["file_system_stat"]("a.txt").data["readable"] is True
-
-    def test_find(self, fs):
-        assert fs["file_system_find"]("deep").data == ["sub/deep.py"]
-        assert fs["file_system_find"]("deep", depth=1).data == []
-
-    def test_cd_changes_where_relative_paths_resolve(self, fs):
-        assert "Changed directory" in fs["file_system_cd"]("sub").data
-        assert fs["file_system_list"]().data == ["deep.py"]
-
-    def test_tree(self, fs):
-        text = fs["file_system_tree"](depth=2).data
-        assert "sub/" in text and "deep.py" in text
-
-    def test_copy(self, fs, files_dir):
-        assert fs["file_system_copy"]("a.txt", "b.txt").success
-        assert (files_dir / "b.txt").read_text() == "one\ntwo\nthree\nfour\n"
-        assert not fs["file_system_copy"]("sub", "sub2").success  # needs recursive
-        assert fs["file_system_copy"]("sub", "sub2", recursive=True).success
-
-    def test_read_only_level_blocks_the_write_tools(self, make_ctx, files_dir):
-        ctx, log = make_ctx(auto_level=1, answer=False)
-        (files_dir / "a.txt").write_text("x")
-        tools = by_name(filesystem_tools(ctx))
-        assert tools["file_system_list"]().success  # auto-accepted read
-        denied = tools["file_system_copy"]("a.txt", "b.txt")
-        assert isinstance(denied.error, UserPermissionDenied) and not (files_dir / "b.txt").exists()
-        assert len(log.asked) == 1 and "file system copy" in log.asked[0]
-
-
-def test_python_outline():
-    source = "class A(B):\n    def f(self, x): ...\n    async def g(self): ...\n\ndef top(a, *args, k=1, **kw): ..."
-    assert python_outline(source).splitlines() == [
-        "class A(B):  [L1]",
-        "    def f(self, x)  [L2]",
-        "    async def g(self)  [L3]",
-        "def top(a, *args, k, **kw)  [L5]",
-    ]
-    assert python_outline("x = 1") == "(no class or function)"
-    assert "Syntax error" in python_outline("def (:")
-
-
-# --------------------------------------------------------------------------- #
-# workspace_file_*
-# --------------------------------------------------------------------------- #
-
-
-@pytest.fixture
-def wt(ctx):
-    return by_name(workspace_tools(ctx))
-
-
-class TestWorkspaceTools:
-    def test_write_read_list_move_delete(self, wt):
-        assert wt["workspace_file_write"]("tmp", "a/n.txt", "hello").data == "tmp/a/n.txt"
-        assert wt["workspace_file_read"]("tmp", "a/n.txt").data == "hello"
-        assert wt["workspace_file_list"]("tmp").data == ["a/"]
-        assert wt["workspace_file_move"]("tmp", "a/n.txt", "result", "n.txt").data == "result/n.txt"
-        assert wt["workspace_file_delete"]("result", "n.txt").data == "result/n.txt"
-        assert wt["workspace_file_list"]("result").data == []
-
-    def test_sandbox_escape_is_a_failed_result(self, wt):
-        for result in (
-            wt["workspace_file_read"]("tmp", "../../secret"),
-            wt["workspace_file_write"]("tmp", "../x", "data"),
-            wt["workspace_file_delete"]("tmp", ".."),
-            wt["workspace_file_list"]("nowhere"),
-        ):
-            assert not result.success and isinstance(result.error, ValueError)
-
-    def test_workspace_root_cannot_be_deleted(self, wt):
-        assert "root" in str(wt["workspace_file_delete"]("tmp", ".").error)
-
-    def test_large_reads_are_truncated(self, wt):
-        wt["workspace_file_write"]("tmp", "big.txt", "x" * 60_000)
-        data = wt["workspace_file_read"]("tmp", "big.txt").data
-        assert len(data) < 51_000 and "truncated" in data
-
-    def test_get_copies_files_and_folders_from_the_system(self, ctx, wt, files_dir):
-        (files_dir / "doc.txt").write_text("content")
-        (files_dir / "folder").mkdir()
-        (files_dir / "folder" / "inner.txt").write_text("inner")
-
-        assert wt["workspace_file_get"]("doc.txt", "result").success
-        assert wt["workspace_file_get"]("folder", "result").success
-        assert ctx.workspace.read("result", "doc.txt")[0] == "content"
-        assert ctx.workspace.read("result", "folder/inner.txt")[0] == "inner"
-
-    def test_get_works_even_after_navigating_to_the_remarkable(self, ctx, wt, files_dir):
-        (files_dir / "doc.txt").write_text("content")
-        ctx.files.mode = ctx.files.MODE_REMARKABLE  # relative paths would now mean "remote"
-        result = wt["workspace_file_get"](virtual.local_to_virtual(str(files_dir / "doc.txt")), "result")
-        assert result.success, result.error
-        assert ctx.workspace.read("result", "doc.txt")[0] == "content"
-
-    def test_read_does_not_depend_on_the_current_location(self, ctx, wt):
-        wt["workspace_file_write"]("tmp", "x.txt", "data")
-        ctx.files.mode = ctx.files.MODE_REMARKABLE
-        assert wt["workspace_file_read"]("tmp", "x.txt").data == "data"
-        assert wt["workspace_file_list"]("tmp").data == ["x.txt"]
-
-    def test_workspace_reads_and_lists_are_read_level(self, make_ctx):
-        ctx, log = make_ctx(auto_level=1, answer=False)
-        tools = by_name(workspace_tools(ctx))
-        assert tools["workspace_file_list"]("tmp").success
-        assert not tools["workspace_file_write"]("tmp", "a", "b").success
-        assert len(log.asked) == 1
+        unexplained = {"get_location", "get_weather", "send_email"}  # their own description is enough
+        for tool in build_tools(ctx):
+            if tool.__name__ not in unexplained and not tool.__name__.startswith("moodle_"):
+                assert tool.__name__ in text, tool.__name__
 
 
 # --------------------------------------------------------------------------- #
@@ -245,33 +71,45 @@ class TestWorkspaceTools:
 
 
 class TestPdfTool:
-    def test_converts_a_workspace_pdf(self, ctx, monkeypatch):
-        ctx.workspace.write("tmp", "docs/paper.pdf", "%PDF fake")
+    def test_converts_a_pdf_next_to_it(self, make_ctx, files_dir, monkeypatch):
+        ctx, _ = make_ctx(zone=True, auto_level=0)
+        (files_dir / "docs").mkdir()
+        (files_dir / "docs" / "paper.pdf").write_text("%PDF fake")
         seen = {}
 
         def fake_convert(path, pages=None):
             seen.update(path=path, pages=pages)
-            return "# Title\n\n$x^2$"
+            return MARKDOWN
 
         monkeypatch.setattr(pdf_module, "convert_pdf", fake_convert)
-        result = by_name(pdf_tools(ctx))["pdf_to_markdown"]("tmp", "docs/paper.pdf", pages=[0, 1])
+        result = by_name(pdf_tools(ctx))["pdf_to_markdown"]("docs/paper.pdf", pages=[0, 1])
 
-        assert result.data == {"output": "tmp/docs/paper.md", "characters": len(MARKDOWN)}
-        assert ctx.workspace.read("tmp", "docs/paper.md")[0] == MARKDOWN
+        output = files_dir / "docs" / "paper.md"
+        assert result.success and result.data["characters"] == len(MARKDOWN)
+        assert output.read_text(encoding="utf-8") == MARKDOWN
         assert seen["pages"] == [0, 1] and seen["path"].endswith("paper.pdf")
 
-    def test_custom_output_path(self, ctx, monkeypatch):
-        ctx.workspace.write("tmp", "p.pdf", "x")
+    def test_custom_output_path(self, make_ctx, files_dir, monkeypatch):
+        ctx, _ = make_ctx(zone=True, auto_level=0)
+        (files_dir / "p.pdf").write_text("x")
         monkeypatch.setattr(pdf_module, "convert_pdf", lambda path, pages=None: "md")
-        result = by_name(pdf_tools(ctx))["pdf_to_markdown"]("tmp", "p.pdf", output_path="out/p.md")
-        assert result.data["output"] == "tmp/out/p.md"
+        result = by_name(pdf_tools(ctx))["pdf_to_markdown"]("p.pdf", output_path="out/p.md")
+        assert result.success and (files_dir / "out" / "p.md").read_text() == "md"
 
-    def test_rejects_missing_and_non_pdf_files(self, ctx):
+    def test_rejects_missing_and_non_pdf_files(self, ctx, files_dir):
         tool = by_name(pdf_tools(ctx))["pdf_to_markdown"]
-        ctx.workspace.write("tmp", "n.txt", "x")
-        assert isinstance(tool("tmp", "missing.pdf").error, FileNotFoundError)
-        assert "not a PDF" in str(tool("tmp", "n.txt").error)
-        assert isinstance(tool("tmp", "../x.pdf").error, ValueError)
+        (files_dir / "n.txt").write_text("x")
+        assert isinstance(tool("missing.pdf").error, FileNotFoundError)
+        assert "not a PDF" in str(tool("n.txt").error)
+
+    def test_conversion_in_the_free_zone_needs_no_permission_but_elsewhere_does(self, make_ctx, files_dir, tmp_path, monkeypatch):
+        ctx, log = make_ctx(zone=True, auto_level=1, answer=False)
+        monkeypatch.setattr(pdf_module, "convert_pdf", lambda path, pages=None: "md")
+        (files_dir / "in.pdf").write_text("x")
+        (tmp_path / "out.pdf").write_text("x")
+        tool = by_name(pdf_tools(ctx))["pdf_to_markdown"]
+        assert tool("in.pdf").success and not log.asked
+        assert not tool(str(tmp_path / "out.pdf")).success and len(log.asked) == 1
 
 
 class TestWebTools:
@@ -466,7 +304,7 @@ class TestMoodleHelpers:
         ctx.close()
         assert calls[-1] == "closed"
 
-    def test_download_goes_through_the_workspace_sandbox(self, make_ctx, monkeypatch):
+    def test_download_saves_to_a_local_path_and_marks_it_as_known(self, make_ctx, files_dir, monkeypatch):
         ctx, _ = make_ctx()
         from custom_console.agent.tools import moodle as moodle_module
 
@@ -480,6 +318,9 @@ class TestMoodleHelpers:
                 class Client:
                     def download_file(self, url, path):
                         saved.update(url=url, path=path)
+                        os.makedirs(os.path.dirname(path), exist_ok=True)  # the real client does too
+                        with open(path, "wb") as handle:
+                            handle.write(b"pdf")
                         return {"downloaded": True, "path": path, "suggested_filename": "f.pdf", "failure": None}
 
                 return fn(Client())
@@ -490,8 +331,8 @@ class TestMoodleHelpers:
         monkeypatch.setattr(moodle_module, "MoodleRunner", FakeRunner)
         tool = by_name(moodle_module.moodle_tools(ctx))["moodle_download_file"]
 
-        ok = tool("/pluginfile.php/1/f.pdf", "tmp", "dl/f.pdf")
-        assert ok.data["path"] == "tmp/dl/f.pdf" and saved["path"].endswith("f.pdf")
-        escaped = tool("/pluginfile.php/1/f.pdf", "tmp", "../../evil.pdf")
-        assert isinstance(escaped.error, ValueError)
-        assert json.loads(ok.to_llm())["downloaded"] is True
+        ok = tool("/pluginfile.php/1/f.pdf", "dl/f.pdf")
+        assert ok.data["path"].endswith("dl/f.pdf") and saved["path"] == ok.data["path"]
+        assert (files_dir / "dl" / "f.pdf").read_bytes() == b"pdf"
+        assert "downloaded: true" in ok.to_llm().splitlines()
+        ctx.reads.check(saved["path"])  # the agent may edit what it downloaded

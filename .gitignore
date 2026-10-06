@@ -18,3 +18,5 @@ dist/
 # Editors / scratch
 .vscode/
 *.rmdoc
+*.ico
+*.ini

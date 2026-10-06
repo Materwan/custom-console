@@ -11,9 +11,13 @@ def test_defaults_are_relative_to_the_root(tmp_path):
     s = load({}, tmp_path)
     assert s.project_root == tmp_path.resolve()
     assert s.data_dir == (tmp_path / "data").resolve()
-    assert s.agent_db_path == s.data_dir / "agent" / "memory.db"
     assert s.agent_log_path == s.data_dir / "logs" / "agent.jsonl"
-    assert s.workspace_roots == {"result": s.agent_dir / "result", "tmp": s.agent_dir / "tmp"}
+    assert s.agent_usage_path == s.agent_dir / "usage.jsonl"
+    assert s.agent_sessions_dir == s.agent_dir / "sessions" and s.agent_keep_sessions == 5
+    assert s.agent_checkpoints_dir == s.agent_dir / "checkpoints"
+    assert s.agent_project_file == "AGENT.md"
+    assert s.clara_url == "http://127.0.0.1:8765" and s.clara_token is None and s.clara_admin_token is None
+    assert s.clara_user_name is None and s.agent_user_id == "default_user"
     assert s.agent_permission_level == 1
     assert s.rmapi_path is None and not s.rmapi_available
     assert s.moodle_enabled and s.smtp_host is None
@@ -36,6 +40,11 @@ def test_overrides(tmp_path):
         "MOODLE_ENABLED": "false",
         "SMTP_PORT": "2525",
         "WSL_DISTRO": "Debian",
+        "AGENT_PROJECT_FILE": "NOTES.md",
+        "CLARA_URL": "http://server:9000/",
+        "CLARA_TOKEN": "chat-token",
+        "CLARA_ADMIN_TOKEN": "admin-token",
+        "CLARA_USER_NAME": "Erwan",
     }
     s = load(env, tmp_path)
     assert s.data_dir == (tmp_path / "elsewhere").resolve()
@@ -44,6 +53,13 @@ def test_overrides(tmp_path):
     assert s.moodle_enabled is False
     assert s.smtp_port == 2525
     assert s.wsl_distro == "Debian"
+    assert s.agent_project_file == "NOTES.md"
+    assert (s.clara_url, s.clara_token, s.clara_admin_token, s.clara_user_name) == (
+        "http://server:9000",
+        "chat-token",
+        "admin-token",
+        "Erwan",
+    )
 
 
 def test_invalid_integer_is_reported_with_the_variable_name(tmp_path):
@@ -79,3 +95,10 @@ def test_dotenv_file_is_loaded_without_overriding_the_environment(tmp_path, monk
     assert s.default_model == "from-dotenv"
     assert s.wsl_distro == "FromEnv"
     monkeypatch.delenv("AGENT_DEFAULT_MODEL", raising=False)
+
+
+def test_a_user_who_signs_in_speaks_as_themselves(tmp_path):
+    s = load({"CLARA_USER": " Erwan ", "CLARA_PASSWORD": "pw", "AGENT_USER_ID": "someone-else"}, tmp_path)
+    assert (s.clara_user, s.clara_password, s.agent_user_id) == ("erwan", "pw", "erwan")
+    s = load({}, tmp_path)
+    assert (s.clara_user, s.clara_password, s.agent_user_id) == (None, None, "default_user")

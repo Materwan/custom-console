@@ -21,6 +21,13 @@ def build_registry() -> CommandRegistry:
     return registry
 
 
+def build_file_registry() -> CommandRegistry:
+    """Only the file commands (cd, ls, cat...): what the agent offers as /commands."""
+    registry = CommandRegistry()
+    files.register(registry)
+    return registry
+
+
 __all__ = [
     "APP",
     "MODEL",
@@ -31,5 +38,6 @@ __all__ = [
     "HelpRequested",
     "ShellContext",
     "ShellParser",
+    "build_file_registry",
     "build_registry",
 ]

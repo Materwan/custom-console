@@ -3,9 +3,10 @@ from __future__ import annotations
 import pytest
 
 from custom_console.agent.cache import JsonCache
+from custom_console.agent.checkpoints import Checkpoints
 from custom_console.agent.permissions import PermissionGate
 from custom_console.agent.tools import ToolContext
-from custom_console.agent.workspace import Workspace
+from custom_console.agent.zone import FreeZone
 from custom_console.fs import FileManager
 from custom_console.settings import load_settings
 
@@ -16,10 +17,12 @@ class GateLog:
     def __init__(self, answer: bool = True):
         self.answer = answer
         self.asked = []
+        self.rules = []  # what an "always" answer would have covered, for each question
         self.recorded = []
 
-    def ask(self, info: str) -> bool:
+    def ask(self, info: str, rule=None):
         self.asked.append(info)
+        self.rules.append(rule)
         return self.answer
 
     def record(self, info: str, status: str) -> None:
@@ -28,9 +31,12 @@ class GateLog:
 
 @pytest.fixture
 def make_ctx(tmp_path):
-    """Factory: `make_ctx(auto_level=2, answer=True, **env)` -> (ToolContext, GateLog)."""
+    """Factory: `make_ctx(auto_level=2, answer=True, zone=False, **env)` -> (ToolContext, GateLog).
 
-    def factory(auto_level: int = 2, answer: bool = True, **env):
+    With `zone=True` the folder the agent starts in (`tmp_path/files`) is the free zone.
+    """
+
+    def factory(auto_level: int = 2, answer: bool = True, zone: bool = False, **env):
         root = tmp_path / "project"
         root.mkdir(exist_ok=True)
         settings = load_settings(env, root=root, use_dotenv=False)
@@ -41,8 +47,9 @@ def make_ctx(tmp_path):
             settings=settings,
             files=FileManager(start_dir=str(start)),
             gate=PermissionGate(auto_level, log.ask, log.record),
-            workspace=Workspace(settings.workspace_roots),
             cache=JsonCache(settings.agent_cache_path),
+            zone=FreeZone(start) if zone else FreeZone(),
+            checkpoints=Checkpoints(tmp_path / "checkpoints"),
         )
         return ctx, log
 

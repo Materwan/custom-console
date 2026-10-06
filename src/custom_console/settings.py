@@ -66,16 +66,26 @@ class Settings:
     remarkable_sync_dir: Path
     wsl_distro: str
 
-    # Ollama / agent
+    # Local Ollama (the `ai list` / `ai start` commands; the agent itself talks to Clara)
     ollama_host: str
     default_model: str
+
+    # The Clara server: it runs the model, the memory and the conversations
+    clara_url: str
+    clara_token: Optional[str]  # chat token (CLARA_TOKENS on the server)
+    clara_admin_token: Optional[str]  # optional: lets /model and /provider reach the server's console
+    clara_user: Optional[str]  # your user name on the server: with clara_password, instead of a shared token
+    clara_password: Optional[str]
+    clara_user_name: Optional[str]  # how Clara should call you
+    clara_timezone: Optional[str]  # IANA name of this computer's clock, told to the server (None: unknown)
+
+    # Agent
     agent_instructions_path: Path
     agent_permission_level: int
     agent_user_id: str
     agent_session_id: str
-    agent_long_term_memory: bool  # an extra model call per turn extracts memories
-    agent_max_output_tokens: int  # cap of one answer
-    agent_history_tool_calls: int  # old tool calls (and results) kept in the context
+    agent_keep_sessions: int  # saved sessions kept per working directory (/restore)
+    agent_project_file: str  # instructions file looked up in the agent's free zone
 
     # Moodle
     moodle_enabled: bool
@@ -96,10 +106,6 @@ class Settings:
         return self.data_dir / "agent"
 
     @property
-    def agent_db_path(self) -> Path:
-        return self.agent_dir / "memory.db"
-
-    @property
     def agent_cache_path(self) -> Path:
         return self.agent_dir / "cache.json"
 
@@ -112,12 +118,25 @@ class Settings:
         return self.data_dir / "logs" / "agent.jsonl"
 
     @property
-    def workspace_roots(self) -> dict[str, Path]:
-        """Sandboxed folders the agent may freely read/write."""
-        return {
-            "result": self.agent_dir / "result",
-            "tmp": self.agent_dir / "tmp",
-        }
+    def agent_usage_path(self) -> Path:
+        return self.agent_dir / "usage.jsonl"
+
+    @property
+    def agent_sessions_dir(self) -> Path:
+        return self.agent_dir / "sessions"
+
+    @property
+    def agent_tools_path(self) -> Path:
+        return self.agent_dir / "tools.json"
+
+    @property
+    def agent_checkpoints_dir(self) -> Path:
+        return self.agent_dir / "checkpoints"
+
+    @property
+    def agent_permissions_dir(self) -> Path:
+        """The "always in this project" answers, one file per working directory."""
+        return self.agent_dir / "permissions"
 
     @property
     def saved_apps_path(self) -> Path:
@@ -137,6 +156,16 @@ class Settings:
         return text or DEFAULT_INSTRUCTIONS
 
 
+def local_timezone() -> Optional[str]:
+    """The IANA name of this computer's time zone ("Europe/Paris"), or None when it cannot be told."""
+    try:
+        from tzlocal import get_localzone_name
+
+        return get_localzone_name() or None
+    except Exception:
+        return None
+
+
 def load_settings(
     env: Optional[Mapping[str, str]] = None,
     *,
@@ -148,7 +177,9 @@ def load_settings(
     When ``env`` is omitted, a ``.env`` file found in ``root`` is loaded first
     (without overriding variables that are already set).
     """
-    root = (root or Path(os.environ.get("CUSTOM_CONSOLE_HOME") or PROJECT_ROOT)).resolve()
+    root = (
+        root or Path(os.environ.get("CUSTOM_CONSOLE_HOME") or PROJECT_ROOT)
+    ).resolve()
 
     if env is None:
         if use_dotenv:
@@ -170,15 +201,22 @@ def load_settings(
         wsl_distro=_text(env, "WSL_DISTRO", "Ubuntu"),
         ollama_host=_text(env, "OLLAMA_HOST", "http://localhost:11434").rstrip("/"),
         default_model=_text(env, "AGENT_DEFAULT_MODEL", "gemma4"),
+        clara_url=_text(env, "CLARA_URL", "http://127.0.0.1:8765").rstrip("/"),
+        clara_token=_get(env, "CLARA_TOKEN"),
+        clara_admin_token=_get(env, "CLARA_ADMIN_TOKEN"),
+        clara_user=(_get(env, "CLARA_USER") or "").lower() or None,
+        clara_password=_get(env, "CLARA_PASSWORD"),
+        clara_user_name=_get(env, "CLARA_USER_NAME"),
+        clara_timezone=_get(env, "CLARA_TIMEZONE") or local_timezone(),
         agent_instructions_path=_path(
             env, "AGENT_INSTRUCTIONS_PATH", root / "config" / "agent_instructions.txt"
         ),
         agent_permission_level=_int(env, "AGENT_PERMISSION_LEVEL", 1),
-        agent_user_id=_text(env, "AGENT_USER_ID", "default_user"),
+        # a user who signs in speaks as themselves: the server takes nothing else
+        agent_user_id=(_get(env, "CLARA_USER") or "").lower() or _text(env, "AGENT_USER_ID", "default_user"),
         agent_session_id=_text(env, "AGENT_SESSION_ID", "console_session"),
-        agent_long_term_memory=_flag(env, "AGENT_LONG_TERM_MEMORY", False),
-        agent_max_output_tokens=_int(env, "AGENT_MAX_OUTPUT_TOKENS", 4096),
-        agent_history_tool_calls=_int(env, "AGENT_HISTORY_TOOL_CALLS", 3),
+        agent_keep_sessions=max(1, _int(env, "AGENT_KEEP_SESSIONS", 5)),
+        agent_project_file=_text(env, "AGENT_PROJECT_FILE", "AGENT.md"),
         moodle_enabled=_flag(env, "MOODLE_ENABLED", True),
         moodle_base_url=_text(env, "MOODLE_BASE_URL", "https://moodle.epita.fr").rstrip(
             "/"

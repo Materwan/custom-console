@@ -3,14 +3,15 @@ from __future__ import annotations
 import json
 import threading
 import time
-from types import SimpleNamespace
 
 import pytest
-from agno.metrics import RunMetrics
-from agno.run.agent import RunOutput
+from fake_clara import FakeClara, say
 
 from custom_console.agent.cache import JsonCache
+from custom_console.agent.context import ContextManager
+from custom_console.agent.usage import UsageLedger
 from custom_console.agent.journal import JsonlLogger
+from custom_console.agent.remote import RemoteAgent
 from custom_console.agent.results import ToolResult
 from custom_console.agent.session import AgentSession
 from custom_console.agent.turn import TurnView
@@ -108,80 +109,97 @@ class TestJsonCache:
 # --------------------------------------------------------------------------- #
 
 
-class FakeAgent:
-    """Stands in for an agno Agent: `run` yields the configured chunks."""
-
-    def __init__(self, chunks, error=None):
-        self.chunks, self.error, self.calls = chunks, error, []
-
-    def run(self, prompt, **kwargs):
-        self.calls.append((prompt, kwargs))
-        for chunk in self.chunks:
-            yield chunk
-        if self.error:
-            raise self.error
-
-
-def content(text, event="RunContent"):
-    return SimpleNamespace(event=event, content=text)
-
-
 @pytest.fixture
 def session(tmp_path):
-    return AgentSession(JsonlLogger(tmp_path / "log.jsonl"), "user-1", "session-1")
+    session = AgentSession(
+        JsonlLogger(tmp_path / "log.jsonl"),
+        "user-1",
+        ContextManager(base_session_id="session-1"),
+        UsageLedger(tmp_path / "usage.jsonl"),
+        model="test-model",
+    )
+    session.remote = RemoteAgent(FakeClara(), lambda: [], lambda: "Be useful.")
+    return session
+
+
+def play(session, *events):
+    """Make the fake server answer the next turn with `events`."""
+    session.remote.client.respond = lambda body: list(events)
+    return session.remote.client
 
 
 class TestRunTurn:
     def test_streams_text_and_returns_stats(self, session, tmp_path):
-        final = RunOutput(content="Hello world", metrics=RunMetrics(input_tokens=4, output_tokens=6, total_tokens=10))
-        session.agent = FakeAgent([content("Hello "), content("world"), final])
+        fake = play(session, *say("Hello world", prompt=4, completion=6, tokens=10))
         view = TurnView("hi")
 
         stats = session.run_turn(view, threading.Event())
 
         assert view.answer_text() == "Hello world"
         assert (stats.input_tokens, stats.output_tokens, stats.total_tokens) == (4, 6, 10)
-        prompt, kwargs = session.agent.calls[0]
-        assert prompt == "hi" and kwargs["stream"] is True and kwargs["yield_run_output"] is True
-        assert (kwargs["user_id"], kwargs["session_id"]) == ("user-1", "session-1")
-        assert [e["type"] for e in read_entries(tmp_path / "log.jsonl")] == ["prompt", "answer", "turn"]
+        [body] = fake.bodies
+        assert body["message"] == "hi" and body["conversation"] == "session-1" and body["user_id"] == "tester"
+        assert "prefix" not in body  # nothing to note: no working directory, no file changed
+        assert body["instructions"] == "Be useful."
+        assert [e["type"] for e in read_entries(tmp_path / "log.jsonl")] == ["prompt", "answer"]
 
-    def test_non_content_events_are_ignored(self, session):
-        session.agent = FakeAgent(
-            [content("real"), content("TOOL NOISE", event="ToolCallStarted"), content("!", event="RunContent")]
+    def test_the_text_arrives_in_pieces(self, session):
+        play(
+            session,
+            {"type": "token", "text": "Hello "},
+            {"type": "token", "text": "world"},
+            *say("", prompt=1, completion=2)[1:],
         )
         view = TurnView("hi")
         session.run_turn(view, threading.Event())
-        assert view.answer_text() == "real!"
+        assert view.answer_text() == "Hello world"
 
-    def test_chunks_without_string_content_are_ignored(self, session):
-        session.agent = FakeAgent([SimpleNamespace(content=None), SimpleNamespace(content=42), SimpleNamespace(content="ok")])
+    def test_unknown_events_are_ignored(self, session):
+        play(session, {"type": "turn", "id": "t"}, {"type": "mystery"}, *say("real"))
         view = TurnView("hi")
         session.run_turn(view, threading.Event())
-        assert view.answer_text() == "ok"
+        assert view.answer_text() == "real"
 
-    def test_no_metrics_means_no_stats(self, session):
-        session.agent = FakeAgent([content("x")])
-        assert session.run_turn(TurnView("hi"), threading.Event()) is None
+    def test_a_stream_that_ends_early_is_reported_not_raised(self, session):
+        play(session, {"type": "token", "text": "partial"})  # no `done`
+        view = TurnView("hi")
+        assert session.run_turn(view, threading.Event()) is None
+        assert view.answer_text() == "partial"
+        assert any("closed the stream" in s.text and s.style == "error" for s in view.snapshot())
 
-    def test_agent_errors_are_reported_not_raised(self, session, tmp_path):
-        session.agent = FakeAgent([content("partial")], error=RuntimeError("model crashed"))
+    def test_server_errors_are_reported_not_raised(self, session, tmp_path):
+        play(session, {"type": "token", "text": "partial"}, {"type": "error", "message": "model crashed"})
         view = TurnView("hi")
         session.run_turn(view, threading.Event())
         assert view.answer_text() == "partial"
         assert any("model crashed" in s.text and s.style == "error" for s in view.snapshot())
         assert "error" in [e["type"] for e in read_entries(tmp_path / "log.jsonl")]
 
+    def test_an_unreachable_server_is_reported_not_raised(self, session):
+        session.remote.client.down = True
+        view = TurnView("hi")
+        session.run_turn(view, threading.Event())
+        assert any("Cannot reach the Clara server" in s.text and s.style == "error" for s in view.snapshot())
+
+    def test_unexpected_exceptions_are_reported_not_raised(self, session):
+        def broken(body):
+            raise KeyError("oops")
+
+        session.remote.client.respond = broken
+        view = TurnView("hi")
+        session.run_turn(view, threading.Event())
+        assert any("KeyError" in s.text and s.style == "error" for s in view.snapshot())
+
     def test_cancel_stops_streaming_and_leaves_a_note(self, session):
         cancel = threading.Event()
 
-        def chunks():
-            yield content("one ")
+        def events():
+            yield {"type": "token", "text": "one "}
             cancel.set()
-            yield content("two ")
-            yield content("three ")
+            yield {"type": "token", "text": "two "}
+            yield {"type": "token", "text": "three "}
 
-        session.agent = SimpleNamespace(run=lambda *a, **k: chunks())
+        session.remote.client.respond = lambda body: events()
         view = TurnView("hi")
         session.run_turn(view, cancel)
 
@@ -189,7 +207,7 @@ class TestRunTurn:
         assert view.snapshot()[-1].text == "Interrupted by the user."
 
     def test_state_is_released_after_the_turn(self, session):
-        session.agent = FakeAgent([content("x")])
+        play(session, *say("x"))
         session.run_turn(TurnView("hi"), threading.Event())
         session.record_permission("late", "accepted")  # must not raise without a current view
 
@@ -200,11 +218,11 @@ class TestToolHook:
         session._view, session._cancel = view, cancel
         return view, cancel
 
-    def test_success_is_shown_journaled_and_returned_as_compact_json(self, session, tmp_path):
+    def test_success_is_shown_journaled_and_returned_as_text(self, session, tmp_path):
         view, _ = self.hook_env(session, tmp_path)
         output = session.tool_hook("file_system_list", lambda **kw: ToolResult.ok(["a", "b"]), {"path": "."})
 
-        assert json.loads(output) == ["a", "b"]
+        assert output == "a\nb"
         note = view.snapshot()[0]
         assert note.text.startswith("✔ file_system_list(path='.')")
         entry = read_entries(tmp_path / "log.jsonl")[0]
@@ -213,7 +231,7 @@ class TestToolHook:
     def test_failed_result_is_flagged(self, session, tmp_path):
         view, _ = self.hook_env(session, tmp_path)
         output = session.tool_hook("t", lambda **kw: ToolResult.fail(FileNotFoundError("x")), {})
-        assert output == "ERROR FileNotFoundError: x"
+        assert output == "Error: FileNotFoundError: x"
         assert view.snapshot()[0].text.startswith("✘ t()") and view.snapshot()[0].style == "error"
         assert read_entries(tmp_path / "log.jsonl")[0]["error"] == "x"
 
@@ -223,7 +241,7 @@ class TestToolHook:
         def explode(**kwargs):
             raise RuntimeError("kaboom")
 
-        assert session.tool_hook("t", explode, {"a": 1}) == "ERROR RuntimeError: kaboom"
+        assert session.tool_hook("t", explode, {"a": 1}) == "Error: RuntimeError: kaboom"
 
     def test_plain_return_values_are_wrapped(self, session, tmp_path):
         self.hook_env(session, tmp_path)
@@ -234,7 +252,7 @@ class TestToolHook:
         cancel.set()
         ran = []
         output = session.tool_hook("t", lambda **kw: ran.append(1), {})
-        assert ran == [] and output.startswith("ERROR") and "Interrupted" in output
+        assert ran == [] and output.startswith("Error: ") and "Interrupted" in output
 
     def test_works_without_a_current_view(self, session, tmp_path):
         assert session.tool_hook("t", lambda **kw: ToolResult.ok(1), {}) == "1"

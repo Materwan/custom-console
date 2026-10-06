@@ -132,8 +132,9 @@ class Shell:
                 self._run_external(name, args)
             else:
                 command.handler(self.context, command.parser.parse_args(args))
-        except HelpRequested:
-            pass
+        except HelpRequested as request:
+            if request.text:
+                self.printer.text(request.text)
         except KeyboardInterrupt:
             self.printer.warning(f"{name}: interrupted")
         except Exception as error:  # a command must never kill the shell

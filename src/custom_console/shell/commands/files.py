@@ -1,4 +1,4 @@
-"""File system commands: cd, ls, tree, cat, stat, find, cp, rm, pwd."""
+"""File system commands: cd, ls, tree, cat, stat, find, cp, rm, pwd, rmdoc2pdf."""
 
 from __future__ import annotations
 
@@ -6,8 +6,9 @@ import argparse
 
 from rich.text import Text
 
+from ...fs.rmdoc import RmdocError, rmdoc_to_pdf
 from ..printer import COLOR_PATH, permission_flags
-from .base import PATH, Command, CommandRegistry, ShellContext, ShellParser
+from .base import PATH, Command, CommandError, CommandRegistry, ShellContext, ShellParser
 
 
 def _paths(parser: ShellParser, *, required: bool = False) -> None:
@@ -150,6 +151,34 @@ def _rm(ctx: ShellContext, args: argparse.Namespace) -> None:
         ctx.files.remove(path, args.recursive)
 
 
+# -- rmdoc2pdf ------------------------------------------------------------------- #
+
+
+def _rmdoc_args(parser: ShellParser) -> None:
+    parser.add_argument("source", metavar=PATH, help="the .rmdoc file (copied from the reMarkable)")
+    parser.add_argument("output", nargs="?", metavar=PATH, help="PDF to create (default: next to the source)")
+    parser.add_argument(
+        "-o", "--original", action="store_true", help="only extract the original PDF, without the handwriting"
+    )
+    parser.add_argument("-f", "--force", action="store_true", help="replace the PDF if it exists")
+
+
+def _rmdoc2pdf(ctx: ShellContext, args: argparse.Namespace) -> None:
+    source = ctx.files.local_path(args.source, "rmdoc2pdf")
+    target = ctx.files.local_path(args.output, "rmdoc2pdf") if args.output else None
+    try:
+        with ctx.printer.status("Converting..."):
+            result = rmdoc_to_pdf(source, target, handwriting=not args.original, overwrite=args.force)
+    except (RmdocError, ImportError) as error:
+        raise CommandError(str(error)) from error
+    detail = f"{result.pages} page(s)"
+    if result.handwriting:
+        detail += f", handwriting on {result.annotated_pages}"
+    ctx.printer.success(f"{result.output} ({detail}).")
+    for note in result.notes:
+        ctx.printer.warning(note)
+
+
 def register(registry: CommandRegistry) -> None:
     registry.add(Command("cd", "Change the current directory", _cd, _cd_args))
     registry.add(Command("pwd", "Print the current location", _pwd))
@@ -160,3 +189,4 @@ def register(registry: CommandRegistry) -> None:
     registry.add(Command("find", "Find entries by name (regex)", _find, _find_args))
     registry.add(Command("cp", "Copy files (local, WSL, reMarkable)", _cp, _cp_args))
     registry.add(Command("rm", "Remove files or directories", _rm, _rm_args))
+    registry.add(Command("rmdoc2pdf", "Convert a reMarkable .rmdoc into a PDF", _rmdoc2pdf, _rmdoc_args))

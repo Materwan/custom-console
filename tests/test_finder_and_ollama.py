@@ -167,8 +167,8 @@ def test_format_size():
 
 
 class FakeResponse:
-    def __init__(self, payload, error=None):
-        self.payload, self.error = payload, error
+    def __init__(self, payload, error=None, status_code=200):
+        self.payload, self.error, self.status_code = payload, error, status_code
 
     def raise_for_status(self):
         if self.error:
@@ -189,15 +189,34 @@ class TestOllamaClient:
                 ]
             },
             "/api/ps": {"models": [{"name": "phi3:latest"}]},
+            "/api/show": {"model_info": {"general.architecture": "llama", "llama.context_length": 131072}},
         }
         requested = []
 
-        def fake_get(url, timeout):
-            requested.append(url)
+        def fake_request(method, url, headers, timeout, **kwargs):
+            requested.append((method, url, headers, kwargs.get("json")))
             return FakeResponse(routes[url[url.index("/api"):]])
 
-        monkeypatch.setattr(ollama_module.requests, "get", fake_get)
+        monkeypatch.setattr(ollama_module.requests, "request", fake_request)
         return requested
+
+    def test_the_api_key_is_sent_and_every_model_is_remote(self, server):
+        client = OllamaClient("https://ollama.com", api_key="secret", remote=True)
+        model = client.info("llama3")
+        assert model.remote and model.context_length == 131072  # asked to /api/show
+        assert server[0][2] == {"Authorization": "Bearer secret"}
+        assert server[-1][:2] == ("POST", "https://ollama.com/api/show") and server[-1][3] == {"model": "llama3:8b"}
+
+    def test_a_local_server_gets_no_key_and_no_extra_call(self, server):
+        assert not OllamaClient().info("llama3").remote
+        assert [call[2] for call in server] == [{}] and len(server) == 1
+
+    def test_a_refused_key_is_reported_as_such(self, monkeypatch):
+        monkeypatch.setattr(
+            ollama_module.requests, "request", lambda method, url, headers, timeout, **kw: FakeResponse({}, status_code=401)
+        )
+        with pytest.raises(OllamaUnavailableError, match="refused the API key"):
+            OllamaClient("https://ollama.com", api_key="bad").installed()
 
     def test_installed_running_and_find(self, server):
         client = OllamaClient("http://host:1/")
@@ -207,16 +226,16 @@ class TestOllamaClient:
         assert [m.name for m in client.running()] == ["phi3:latest"]
         assert client.find("llama3") == "llama3:8b"
         assert client.is_running("phi3") and not client.is_running("llama3")
-        assert server[0] == "http://host:1/api/tags"
+        assert server[0][:2] == ("GET", "http://host:1/api/tags")
 
     @pytest.mark.parametrize(
         "error", [requests.ConnectionError("refused"), requests.Timeout("slow")]
     )
     def test_unreachable_server_raises_a_dedicated_error(self, monkeypatch, error):
-        def boom(url, timeout):
+        def boom(method, url, headers, timeout, **kwargs):
             raise error
 
-        monkeypatch.setattr(ollama_module.requests, "get", boom)
+        monkeypatch.setattr(ollama_module.requests, "request", boom)
         with pytest.raises(OllamaUnavailableError, match="cannot reach Ollama"):
             OllamaClient().installed()
 
@@ -225,6 +244,6 @@ class TestOllamaClient:
             def json(self):
                 raise ValueError("no json")
 
-        monkeypatch.setattr(ollama_module.requests, "get", lambda url, timeout: BadJson({}))
+        monkeypatch.setattr(ollama_module.requests, "request", lambda method, url, headers, timeout, **kw: BadJson({}))
         with pytest.raises(OllamaUnavailableError):
             OllamaClient().running()

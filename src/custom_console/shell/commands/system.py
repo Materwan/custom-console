@@ -34,7 +34,7 @@ def _help(ctx: ShellContext, args: argparse.Namespace) -> None:
         command = ctx.registry.get(args.command)
         if command is None:
             raise CommandError(f"unknown command '{args.command}'")
-        command.parser.print_help()
+        ctx.printer.text(command.parser.format_help())
         return
 
     width = max(len(name) for name in ctx.registry.names())

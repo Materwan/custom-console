@@ -12,7 +12,7 @@ class JsonlLogger:
     """Appends one JSON object per line.
 
     Every entry has a UTC ISO-8601 ``timestamp`` and a ``type`` ("prompt",
-    "answer", "tool_call", "turn" or "error"). The file is rotated to ``<name>.1``
+    "answer", "tool_call" or "error"). The file is rotated to ``<name>.1``
     once it exceeds `max_bytes`. Logging never raises: a failing journal must
     not break the agent.
     """
@@ -43,10 +43,6 @@ class JsonlLogger:
 
     def log_answer(self, answer: str) -> None:
         self._write({"type": "answer", "answer": answer})
-
-    def log_turn(self, **fields: Any) -> None:
-        """Usage of one turn: tokens, tool calls, result characters, duration (token baseline)."""
-        self._write({"type": "turn", **fields})
 
     def log_error(self, message: str) -> None:
         self._write({"type": "error", "error": message})
