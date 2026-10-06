@@ -38,6 +38,9 @@ project root (see `.env.example`; empty values mean "use the default").
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server |
 | `AGENT_DEFAULT_MODEL` | `gemma4` | Model used by `ai agent` / `ai start` |
 | `AGENT_PERMISSION_LEVEL` | `1` | Tools auto-accepted by the agent (see below) |
+| `AGENT_LONG_TERM_MEMORY` | `false` | Extract long-term memories after each turn (costs one extra model call per turn) |
+| `AGENT_MAX_OUTPUT_TOKENS` | `4096` | Cap of one answer |
+| `AGENT_HISTORY_TOOL_CALLS` | `3` | Tool calls of earlier turns kept in the context |
 | `AGENT_INSTRUCTIONS_PATH` | `config/agent_instructions.txt` | The agent's system prompt |
 | `MOODLE_ENABLED` / `MOODLE_BASE_URL` / `MOODLE_STATE_PATH` | `true` / EPITA / `config/cookies/moodle_state.json` | Moodle tools |
 | `SMTP_HOST` `SMTP_PORT` `SMTP_USER` `SMTP_PASSWORD` `SMTP_FROM` | – | The e-mail tool exists only when `SMTP_HOST` is set |
@@ -81,18 +84,32 @@ ai agent [-n NAME] [-m MODEL] [-p 0|1|2] [--no-memory]
 
 ### Terminal behaviour
 
-The input line is pinned at the bottom of the terminal. While the agent answers, its
-text streams **as plain text** in a live area above the input. When the answer is
-complete, that area disappears and the whole turn is printed again, rendered as
-**Markdown**, into the normal scrollback (so you can scroll, select and copy it).
-Tool calls and permission decisions appear as dim lines in the same flow.
+The agent console is **full-screen**: the conversation scrolls in its own pane, and the
+header rule and the input line are **fixed at the bottom of the window**, whatever the
+scroll position. While the agent answers, its turn is rendered live in the pane (Markdown,
+tool calls and permission decisions as dim lines); permission questions appear just above
+the input. New output follows the bottom unless you scrolled up (the header then says so).
+When you leave, the conversation is written back to the normal scrollback.
 
 | Key | Action |
 |---|---|
 | `Enter` | send (while the agent is busy, the text stays in the input line) |
+| `PgUp` / `PgDn`, mouse wheel | scroll the conversation (`Shift`+drag selects text to copy) |
+| `Tab` / `/` | complete commands and their first argument |
 | `Ctrl+C` | stop the answer in progress (the partial answer is kept); clears the input when idle; refuses a pending permission question |
-| `Ctrl+D` / `/bye` | leave the agent |
-| `/clear` `/help` | clear the screen / show the commands |
+| `Ctrl+D` | leave the agent |
+
+### Commands
+
+| Command | |
+|---|---|
+| `/model [number\|name\|default]` | list the installed Ollama models (loaded / cloud / capabilities, `●` = active) or answer with another one; the conversation continues. Models without tool support are refused |
+| `/new` | start a fresh conversation (new history, screen cleared) |
+| `/permissions [0\|1\|2]` | show or change which tools run without asking |
+| `/tokens` | tokens of the last answer and of the conversation |
+| `/clear` `/help` `/bye` | clear the screen / list the commands / leave |
+
+Administering Ollama itself (`ai list`, `ai start`) stays in the shell, not in the agent.
 
 ### Permissions
 
@@ -119,9 +136,11 @@ input line (`Enter` or `y` = yes).
   (needs the `moodle` extra; the first use opens a browser for the SSO login). Disable
   with `MOODLE_ENABLED=false` if you do not need them: every tool costs prompt tokens.
 
-Every prompt, answer and tool call is appended to `<DATA_DIR>/logs/agent.jsonl`
-(rotated at 5 MB). Conversation history and memories live in
+Every prompt, answer, tool call and turn (tokens, tool calls) is appended to
+`<DATA_DIR>/logs/agent.jsonl` (rotated at 5 MB). Conversation history lives in
 `<DATA_DIR>/agent/memory.db` unless you use `--no-memory`.
+
+Token usage: see [TOKENS.md](TOKENS.md) (baseline, changelog, `scripts/token_baseline.py`).
 
 ## Layout
 
@@ -134,7 +153,8 @@ src/custom_console/
   apps/                          application finder and launcher
   llm/                           Ollama client
   agent/
-    ui.py  render.py  turn.py    terminal UI (live plain text -> Markdown), turn model
+    ui.py  render.py  turn.py    full-screen terminal UI (fixed input, scrollable pane), turn model
+    commands.py                  /model /new /permissions /tokens
     session.py  factory.py       agno wiring: streaming, tool hook, journal
     permissions.py  results.py   permission gate, ToolResult
     workspace.py  cache.py  journal.py

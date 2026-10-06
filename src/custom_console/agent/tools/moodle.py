@@ -54,16 +54,8 @@ def moodle_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, PermissionLevel.READ)
     def moodle_list_courses(force_refresh: bool = False) -> ToolResult:
-        """List every Moodle course visible to the user, with its numeric id.
-
-        Always call this first to resolve a course id from its name before any
-        tool needing a course_id: never guess or scrape ids.
-
-        Args:
-            force_refresh: bypass the 24h cache.
-
-        Returns a list of {id, title, url}.
-        """
+        """Moodle courses {id, title, url}. Call first to get a course_id: never guess one.
+        Cached 24h; force_refresh bypasses it."""
         if not force_refresh:
             cached = ctx.cache.get(COURSES_CACHE_KEY, max_age=COURSES_CACHE_TTL)
             if cached is not None:
@@ -74,13 +66,7 @@ def moodle_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, PermissionLevel.READ)
     def moodle_get_course_structure(course_id: str) -> ToolResult:
-        """Extract the sections, resources and visible due dates of a course.
-
-        Args:
-            course_id: numeric Moodle course id (from `moodle_list_courses`; never guess it).
-
-        Returns text: one "##" line per section, then one line per resource.
-        """
+        """Sections, resources and due dates of a course (id from `moodle_list_courses`)."""
         data = runner.run(lambda moodle: moodle.get_course_structure(course_id))
         return ToolResult.ok(compact_course_structure(data))
 
@@ -89,23 +75,11 @@ def moodle_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         url: str,
         selector: Optional[str] = None,
         include_html: bool = False,
-        max_chars: Optional[int] = 8000,
+        max_chars: Optional[int] = 6000,
     ) -> ToolResult:
-        """Open a Moodle URL and return the cleaned text (or HTML) of an area.
-
-        By default the main content region is used (not the whole <body>):
-        navigation, side blocks and scripts are stripped.
-
-        Args:
-            url: absolute, or relative to the Moodle base (e.g. "/my/").
-            selector: CSS or XPath ("xpath=", "//", "..") of the area to extract.
-            include_html: return the cleaned inner HTML instead of the text.
-            max_chars: truncate the result (None to disable); prefer a narrower
-                `selector` over raising it.
-
-        If the URL is a file (e.g. a PDF) the answer says so: use
-        `moodle_download_file` instead of retrying this tool.
-        """
+        """Cleaned text (or HTML) of a Moodle page's main area; url may be relative ("/my/").
+        selector: CSS or XPath to narrow it (better than raising max_chars). A file URL
+        (PDF...) is reported: use `moodle_download_file`."""
         text = runner.run(
             lambda moodle: moodle.get_page_content(
                 url, selector=selector, include_html=include_html, max_chars=max_chars
@@ -114,59 +88,31 @@ def moodle_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         return ToolResult.ok(text)
 
     @guarded(ctx, PermissionLevel.READ)
-    def moodle_get_announcements(limit: int = 20) -> ToolResult:
-        """Fetch the announcements shown on the Moodle dashboard.
-
-        Args:
-            limit: maximum number of announcements.
-        """
+    def moodle_get_announcements(limit: int = 10) -> ToolResult:
+        """Announcements of the Moodle dashboard."""
         items = runner.run(lambda moodle: moodle.get_announcements(limit=limit))
         return ToolResult.ok(compact_announcements(items))
 
     @guarded(ctx, PermissionLevel.READ)
     def moodle_get_grades() -> ToolResult:
-        """Extract the rows of the Moodle grades overview. Returns one
-        pipe-separated line per row."""
+        """Grades overview, one pipe-separated line per row."""
         rows = runner.run(lambda moodle: moodle.get_grades())
         return ToolResult.ok(compact_grades(rows))
 
     @guarded(ctx, PermissionLevel.WRITE)
     def moodle_click_element(selector: str, wait_until: str = "domcontentloaded") -> ToolResult:
-        """Click an element of the current Moodle page.
-
-        Args:
-            selector: CSS or XPath ("xpath=", "//", "..").
-            wait_until: Playwright wait condition ("domcontentloaded", "load", "networkidle").
-
-        Returns {clicked, url, title}.
-        """
+        """Click an element (CSS or XPath selector) of the current Moodle page.
+        wait_until: domcontentloaded | load | networkidle."""
         return ToolResult.ok(runner.run(lambda moodle: moodle.click_element(selector, wait_until=wait_until)))
 
     @guarded(ctx, PermissionLevel.WRITE)
     def moodle_input_text(selector: str, text: str, submit: bool = False) -> ToolResult:
-        """Fill a text field of the current Moodle page.
-
-        Args:
-            selector: CSS or XPath ("xpath=", "//", "..").
-            text: the text to type.
-            submit: press Enter afterwards and wait for the navigation.
-
-        Returns {filled, url}.
-        """
+        """Type into a field (CSS or XPath selector) of the current Moodle page; submit = press Enter."""
         return ToolResult.ok(runner.run(lambda moodle: moodle.input_text(selector, text, submit=submit)))
 
     @guarded(ctx, PermissionLevel.WRITE)
     def moodle_download_file(file_url: str, save_directory: str, save_relative_path: str) -> ToolResult:
-        """Download a file from Moodle with the active session.
-
-        Args:
-            file_url: URL to download, absolute or relative to the Moodle base.
-            save_directory: workspace to save into: "tmp", unless it is a final deliverable
-                ("result").
-            save_relative_path: file path inside that workspace.
-
-        Returns {downloaded, path, suggested_filename, failure}.
-        """
+        """Download a Moodle file into a workspace ("tmp", or "result" for a deliverable)."""
         target = ctx.workspace.resolve(save_directory, save_relative_path)
         result = runner.run(lambda moodle: moodle.download_file(file_url, str(target)))
         result["path"] = ctx.workspace.describe(target)

@@ -2,14 +2,16 @@
 
 Behaviour
 ---------
-* The input line is pinned at the bottom of the terminal.
-* While the agent answers, its output streams as **plain text** in a live area
-  just above the input. That area is part of the prompt_toolkit layout, not of
-  the terminal scrollback, so when the answer is complete it simply disappears
-  and the turn is printed again, properly rendered as **Markdown**, into the
-  normal scrollback.
-* Permission questions appear in the same place and are answered in the same
-  input line (no second prompt fighting with the display).
+* Full-screen: the conversation lives in a scrollable pane of its own, and the
+  header rule and the input line are **fixed at the bottom of the window**, whatever
+  the scroll position (mouse wheel, PageUp / PageDown). New output follows the
+  bottom unless you scrolled up.
+* While the agent answers, its turn is rendered live in the pane; permission
+  questions appear just above the input and are answered in the input line.
+* ``/commands`` are provided by the caller (`SlashCommand`); ``/help``, ``/clear``
+  and ``/bye`` belong to the screen. Typing ``/`` shows a completion menu.
+* When the screen is left, the conversation is written back to the normal terminal
+  so that it stays in the scrollback.
 
 The agent itself runs in a worker thread (`turn_runner`); everything that
 touches the UI runs on the asyncio loop of the main thread.
@@ -18,53 +20,86 @@ touches the UI runs on the asyncio loop of the main thread.
 from __future__ import annotations
 
 import asyncio
+import io
+import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Sequence, Set, Union
 
-from prompt_toolkit.application import Application, run_in_terminal
+from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.filters import Condition
+from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.history import History, InMemoryHistory
 from prompt_toolkit.input import Input
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
+from prompt_toolkit.layout import (
+    CompletionsMenu,
+    ConditionalContainer,
+    Float,
+    FloatContainer,
+    HSplit,
+    Layout,
+    Window,
+)
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.processors import BeforeInput
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.output import Output
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from rich.console import Console, RenderableType
+from rich.table import Table
 from rich.text import Text
 
 from .permissions import is_yes
-from .render import live_lines, render_turn, wrap_line
+from .render import render_turn, wrap_line
 from .turn import STYLE_ERROR, TurnStats, TurnView
 
 TurnRunner = Callable[[TurnView, threading.Event], Optional[TurnStats]]
+CommandOutput = Union[None, str, RenderableType]
 
 UI_ROWS = 2  # header rule + input line
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-HELP_TEXT = (
-    "/bye     leave the agent (or Ctrl+D)\n"
-    "/clear   clear the screen\n"
-    "/help    show this help\n"
-    "Ctrl+C   stop the answer in progress"
-)
+WHEEL_LINES = 3
 
 STYLE = Style.from_dict(
     {
-        "prompt": "bold ansicyan",
-        "note": "ansibrightblack italic",
-        "tool": "ansibrightblack",
-        "permission": "ansiyellow",
-        "error": "ansired",
+        "input-prompt": "bold ansicyan",
         "rule": "ansibrightblack",
         "status": "ansicyan",
+        "hint": "ansiyellow",
         "question": "bold ansiyellow",
-        "input-prompt": "bold ansicyan",
+        "completion-menu": "bg:ansibrightblack ansiwhite",
+        "completion-menu.completion.current": "bg:ansicyan ansiblack",
     }
+)
+
+
+@dataclass(frozen=True)
+class SlashCommand:
+    """A command typed as ``/name args``.
+
+    `handler(args)` runs in a worker thread (it may block on the network) and
+    returns what to show: a string, a rich renderable, or None.
+    `choices()` are the suggestions for the first argument; it must be cheap.
+    """
+
+    name: str
+    usage: str
+    summary: str
+    handler: Callable[[str], CommandOutput]
+    choices: Callable[[], Sequence[str]] = lambda: ()
+
+
+# Commands that belong to the screen itself (they act on the UI, not on the agent).
+BUILTINS = (
+    ("clear", "", "clear the screen"),
+    ("help", "", "show this help"),
+    ("bye", "", "leave the agent (or Ctrl+D)"),
 )
 
 
@@ -80,34 +115,88 @@ class _Question:
             self.future.set_result(answer)
 
 
+class SlashCompleter(Completer):
+    """Completes ``/name`` then the first argument of that command."""
+
+    def __init__(self, commands: Callable[[], Dict[str, SlashCommand]]):
+        self._commands = commands
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return
+        words = text.split(" ")
+        commands = self._commands()
+        if len(words) == 1:
+            typed = words[0][1:].lower()
+            for name, command in commands.items():
+                if name.startswith(typed):
+                    yield Completion(
+                        f"/{name}",
+                        start_position=-len(words[0]),
+                        display_meta=command.summary,
+                    )
+        elif len(words) == 2:
+            command = commands.get(words[0][1:].lower())
+            if command is not None:
+                typed = words[1].lower()
+                for choice in command.choices():
+                    if choice.lower().startswith(typed):
+                        yield Completion(choice, start_position=-len(words[1]))
+
+
+class _PaneControl(FormattedTextControl):
+    """The conversation pane: a text control that reports mouse events (the wheel scrolls)."""
+
+    def __init__(self, text, on_mouse, **options):
+        super().__init__(text, **options)
+        self._on_mouse = on_mouse
+
+    def mouse_handler(self, mouse_event: MouseEvent):
+        return self._on_mouse(mouse_event)
+
+
 class AgentScreen:
     def __init__(
         self,
         *,
         title: str,
-        console: Console,
         turn_runner: TurnRunner,
         banner: Optional[RenderableType] = None,
+        commands: Sequence[SlashCommand] = (),
         history: Optional[History] = None,
         input: Optional[Input] = None,
         output: Optional[Output] = None,
+        color_system: Optional[str] = "standard",
     ) -> None:
         self.title = title
-        self.console = console
         self.banner = banner
+        self.commands: Dict[str, SlashCommand] = {command.name: command for command in commands}
         self._turn_runner = turn_runner
+        self._color_system = color_system
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._tasks: Set["asyncio.Future"] = set()
         self._view: Optional[TurnView] = None
         self._busy = False
+        self._working = ""  # what a running command is doing, for the header
         self._cancel = threading.Event()
         self._question: Optional[_Question] = None
-        self._live_rows = 0  # rows taken by the live area at the last render
+
+        # The conversation: finished blocks (rendered once per width) + the turn in progress.
+        self._blocks: List[RenderableType] = [banner] if banner is not None else []
+        self._rendered: Dict[int, List[str]] = {}  # width -> ANSI text of each finished block
+        self._live_key: object = None
+        self._live_text = ""
+        self._follow = True
+        self._top = 0  # first visible line of the conversation
+        self._total = 0  # lines of the conversation at the last render
 
         self._buffer = Buffer(
             history=history or InMemoryHistory(),
             accept_handler=self._accept,
+            completer=SlashCompleter(lambda: self.commands),
+            complete_while_typing=True,
             multiline=False,
         )
         self._app = self._build_app(input, output)
@@ -117,9 +206,16 @@ class AgentScreen:
     # ------------------------------------------------------------------ #
 
     def _build_app(self, input: Optional[Input], output: Optional[Output]) -> Application:
-        live = ConditionalContainer(
-            Window(FormattedTextControl(self._live_fragments), dont_extend_height=True),
-            filter=Condition(lambda: self._view is not None),
+        self._pane = Window(
+            _PaneControl(
+                self._pane_text,
+                self._pane_mouse,
+                get_cursor_position=lambda: Point(0, self._top),  # always inside the view
+                focusable=False,
+            ),
+            get_vertical_scroll=lambda window: self._top,
+            wrap_lines=False,
+            always_hide_cursor=True,
         )
         question = ConditionalContainer(
             Window(FormattedTextControl(self._question_fragments), dont_extend_height=True),
@@ -142,19 +238,107 @@ class AgentScreen:
             if not self._busy and self._question is None and not self._buffer.text:
                 event.app.exit()
 
+        @keys.add("pageup")
+        def _page_up(event) -> None:
+            self._scroll_by(-self._page())
+
+        @keys.add("pagedown")
+        def _page_down(event) -> None:
+            self._scroll_by(self._page())
+
+        body = FloatContainer(
+            HSplit([self._pane, question, header, entry]),
+            floats=[Float(xcursor=True, ycursor=True, content=CompletionsMenu(max_height=8, scroll_offset=1))],
+        )
         return Application(
-            layout=Layout(HSplit([live, question, header, entry]), focused_element=entry),
+            layout=Layout(body, focused_element=entry),
             key_bindings=keys,
             style=STYLE,
-            full_screen=False,
-            erase_when_done=True,
-            refresh_interval=0.1,  # animates the spinner
+            full_screen=True,
+            mouse_support=True,
+            refresh_interval=0.1,  # animates the spinner and the live turn
             input=input,
             output=output,
         )
 
     def _size(self):
         return self._app.output.get_size()
+
+    def _width(self) -> int:
+        return max(20, self._size().columns - 1)  # never write in the last column
+
+    def _page(self) -> int:
+        info = self._pane.render_info
+        return max(1, (info.window_height if info else self._size().rows - UI_ROWS) - 1)
+
+    # -- rendering ----------------------------------------------------------- #
+
+    def _render(self, renderables: Sequence[RenderableType], width: int, ansi: bool = True) -> str:
+        """Render to text `width` cells wide (ANSI-styled, or plain)."""
+        console = Console(
+            file=io.StringIO(),
+            width=width,
+            force_terminal=ansi,
+            color_system=self._color_system if ansi else None,
+            legacy_windows=False,
+        )
+        for renderable in renderables:
+            console.print(renderable)
+        return console.file.getvalue()
+
+    def _block_texts(self, width: int) -> List[str]:
+        """ANSI text of every finished block (cached: only new blocks are rendered)."""
+        texts = self._rendered.setdefault(width, [])
+        for block in self._blocks[len(texts) :]:
+            texts.append(self._render([block], width))
+        return texts
+
+    def _live(self, width: int) -> str:
+        view = self._view
+        if view is None:
+            return ""
+        key = (width, tuple((s.kind, len(s.text), s.style) for s in view.snapshot()))
+        if key != self._live_key:  # re-render the turn only when it changed
+            self._live_key, self._live_text = key, self._render([render_turn(view)], width)
+        return self._live_text
+
+    def _pane_text(self):
+        width = self._width()
+        text = "".join(self._block_texts(width)) + self._live(width)
+        self._total = text.count("\n")
+        info = self._pane.render_info
+        height = info.window_height if info else max(1, self._size().rows - UI_ROWS)
+        limit = max(0, self._total - height)
+        self._top = limit if self._follow else min(self._top, limit)
+        return ANSI(text)
+
+    def transcript_text(self, width: int = 80) -> str:
+        """The whole conversation as plain text (what the user has seen)."""
+        parts = list(self._blocks)
+        if self._view is not None:
+            parts.append(render_turn(self._view))
+        return self._render(parts, width, ansi=False)
+
+    # -- scrolling ----------------------------------------------------------- #
+
+    def _scroll_by(self, lines: int) -> None:
+        info = self._pane.render_info
+        height = info.window_height if info else max(1, self._size().rows - UI_ROWS)
+        limit = max(0, self._total - height)
+        self._top = max(0, min(limit, self._top + lines))
+        self._follow = self._top >= limit
+        self._app.invalidate()
+
+    def _pane_mouse(self, event: MouseEvent):
+        if event.event_type == MouseEventType.SCROLL_UP:
+            self._scroll_by(-WHEEL_LINES)
+        elif event.event_type == MouseEventType.SCROLL_DOWN:
+            self._scroll_by(WHEEL_LINES)
+        else:
+            return NotImplemented
+        return None
+
+    # -- fixed bottom rows --------------------------------------------------- #
 
     def _question_lines(self, width: int) -> List[str]:
         if self._question is None:
@@ -164,25 +348,8 @@ class AgentScreen:
             lines.extend(wrap_line(logical, width))
         return lines
 
-    def _live_fragments(self):
-        view = self._view
-        if view is None:
-            return []
-        size = self._size()
-        width = max(1, size.columns - 1)  # never write in the last column
-        room = size.rows - UI_ROWS - len(self._question_lines(width)) - 1
-        lines = live_lines(view, width, max(3, room))
-        self._live_rows = len(lines)
-
-        fragments = []
-        for index, (style, text) in enumerate(lines):
-            if index:
-                fragments.append(("", "\n"))
-            fragments.append((style, text))
-        return fragments
-
     def _question_fragments(self):
-        lines = self._question_lines(max(1, self._size().columns - 1))
+        lines = self._question_lines(self._width())
         return [("class:question", "\n".join(lines))]
 
     def _header_fragments(self):
@@ -192,14 +359,20 @@ class AgentScreen:
             state = "stopping..."
         elif self._busy:
             frame = SPINNER[int(time.monotonic() * 10) % len(SPINNER)]
-            state = f"{frame} {self._view.activity if self._view else 'working'}"
+            state = f"{frame} {self._view.activity if self._view else (self._working or 'working')}"
+        elif not self._follow:
+            state = "↑ scrolled · PgDn: back to the end"
         else:
-            state = "Enter: send · /help · Ctrl+D: quit"
+            state = "Enter: send · /help · PgUp/PgDn: scroll · Ctrl+D: quit"
 
         left = f"── {self.title} ── "
+        room = self._size().columns - 1 - get_cwidth(left) - 1
+        if get_cwidth(state) > room:  # narrow window: keep the start, mark the cut
+            state = state[: max(0, room - 1)] + "…"
         used = get_cwidth(left) + get_cwidth(state) + 1
         fill = max(0, self._size().columns - 1 - used)
-        return [("class:rule", left), ("class:status", state + " "), ("class:rule", "─" * fill)]
+        style = "class:hint" if not self._follow and not self._busy else "class:status"
+        return [("class:rule", left), (style, state + " "), ("class:rule", "─" * fill)]
 
     def _prompt_fragments(self):
         label = "Accept (Y|n) > " if self._question is not None else "> "
@@ -242,62 +415,72 @@ class AgentScreen:
             self._app.exit(exception=task.exception())  # a bug must not vanish silently
 
     # ------------------------------------------------------------------ #
-    # Output above the input line
+    # Output
     # ------------------------------------------------------------------ #
 
-    def _capture(self, *renderables: RenderableType) -> str:
-        """Render to a string (width-aware) so that rows can be counted."""
-        with self.console.capture() as captured:
-            for renderable in renderables:
-                self.console.print(renderable)
-        return captured.get()
+    def print(self, renderable: RenderableType) -> None:
+        """Add a block to the conversation and follow it (event loop thread only)."""
+        self._blocks.append(renderable)
+        self._follow = True
+        self._app.invalidate()
 
-    async def _print_above(self, render: Callable[[], str], pad_to: int = 0) -> None:
-        """Print `render()` above the UI, which is erased and redrawn around it.
+    def _help(self) -> RenderableType:
+        table = Table.grid(padding=(0, 2))
+        for name, usage, summary in BUILTINS:
+            table.add_row(Text(f"/{name} {usage}".rstrip(), style="cyan"), Text(summary))
+        for command in self.commands.values():
+            table.add_row(Text(f"/{command.name} {command.usage}".rstrip(), style="cyan"), Text(command.summary))
+        table.add_row(Text("Ctrl+C", style="cyan"), Text("stop the answer in progress"))
+        table.add_row(Text("PgUp/PgDn", style="cyan"), Text("scroll (also the mouse wheel; Shift+drag selects text)"))
+        return table
 
-        `pad_to` keeps the input pinned to the bottom: when the live area that
-        was just removed was taller than the text replacing it, the difference
-        is filled with blank rows.
-        """
+    def request_clear(self) -> None:
+        """Clear the conversation view; callable from any thread."""
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._clear_now)
 
-        def work() -> None:
-            text = render()
-            missing = pad_to - text.count("\n")
-            if missing > 0:
-                text += "\n" * missing
-            self.console.file.write(text)
-            self.console.file.flush()
-
-        await run_in_terminal(work)
+    def _clear_now(self) -> None:
+        self._reset_screen()
+        self._app.invalidate()
 
     def _reset_screen(self) -> None:
-        """Clear the terminal, show the banner and push the input to the bottom."""
-        self.console.clear()
-        text = self._capture(self.banner) if self.banner is not None else ""
-        pad = max(0, self._size().rows - text.count("\n") - UI_ROWS)
-        self.console.file.write(text + "\n" * pad)
-        self.console.file.flush()
+        self._blocks = [self.banner] if self.banner is not None else []
+        self._rendered.clear()
+        self._follow = True
 
     # ------------------------------------------------------------------ #
     # Commands and turns (event loop)
     # ------------------------------------------------------------------ #
 
     async def _command(self, text: str) -> None:
-        name = text.split()[0].lower()
-        if name in ("/bye", "/exit", "/quit"):
+        name, _, args = text[1:].partition(" ")
+        name = name.lower()
+        if name in ("bye", "exit", "quit"):
             self._app.exit()
-        elif name == "/clear":
-            await run_in_terminal(self._reset_screen)
-        elif name == "/help":
-            await self._print_above(lambda: self._capture(Text(HELP_TEXT, style="dim")))
+        elif name == "clear":
+            self._reset_screen()
+        elif name == "help":
+            self.print(self._help())
+        elif name in self.commands:
+            await self._run_command(self.commands[name], args.strip())
         else:
-            message = Text(f"Unknown command: {name} (try /help)", style="red")
-            await self._print_above(lambda: self._capture(message))
+            self.print(Text(f"Unknown command: /{name} (try /help)", style="red"))
+        self._app.invalidate()
 
-    def _finish(self, view: TurnView) -> str:
-        """Called once the UI is erased: drop the live area, return the final text."""
-        self._view = None
-        return self._capture(render_turn(view))
+    async def _run_command(self, command: SlashCommand, args: str) -> None:
+        assert self._loop is not None
+        self._busy, self._working = True, f"/{command.name}"
+        self._app.invalidate()
+        try:
+            output = await self._loop.run_in_executor(None, command.handler, args)
+        except Exception as error:  # a command must not take the console down
+            output = Text(f"/{command.name}: {error}", style="red")
+        finally:
+            self._busy, self._working = False, ""
+        if isinstance(output, str):
+            output = Text(output)
+        if output is not None:
+            self.print(output)
 
     async def _run_turn(self, text: str) -> None:
         assert self._loop is not None
@@ -305,18 +488,17 @@ class AgentScreen:
         self._cancel = threading.Event()
         self._view = view
         self._busy = True
+        self._follow = True
         self._app.invalidate()
         try:
             view.stats = await self._loop.run_in_executor(None, self._turn_runner, view, self._cancel)
         except Exception as error:  # the runner should not raise, but never hang the UI
             view.add_note(f"Agent error: {error}", STYLE_ERROR)
         finally:
-            rows = self._live_rows
-            try:
-                await self._print_above(lambda: self._finish(view), pad_to=rows)
-            finally:
-                self._busy = False
-                self._view = None
+            self._blocks.append(render_turn(view))  # the finished turn replaces the live one
+            self._view = None
+            self._busy = False
+            self._app.invalidate()
 
     # ------------------------------------------------------------------ #
     # Permission questions (called from the agent's worker thread)
@@ -331,6 +513,7 @@ class AgentScreen:
     async def _ask(self, info: str) -> bool:
         question = _Question(info, asyncio.get_running_loop().create_future())
         self._question = question
+        self._follow = True
         self._app.invalidate()
         try:
             return await question.future
@@ -344,8 +527,14 @@ class AgentScreen:
 
     async def run_async(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._reset_screen()
         await self._app.run_async()
 
     def run(self) -> None:
         asyncio.run(self.run_async())
+        # The full-screen view is gone: leave the conversation in the normal scrollback.
+        try:
+            width = max(20, self._app.output.get_size().columns - 1)
+            sys.stdout.write(self._render(self._blocks, width))
+            sys.stdout.flush()
+        except Exception:
+            pass

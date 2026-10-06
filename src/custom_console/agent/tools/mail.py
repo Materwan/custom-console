@@ -25,13 +25,7 @@ def mail_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, PermissionLevel.WRITE)
     def send_email(recipient: str, subject: str, content: str = "") -> ToolResult:
-        """Send an email.
-
-        Args:
-            recipient: destination address.
-            subject: subject line.
-            content: plain text body.
-        """
+        """Send a plain-text email."""
         sender = settings.smtp_from or settings.smtp_user
         if not sender:
             raise ValueError("Set SMTP_FROM (or SMTP_USER) to send emails.")
@@ -44,6 +38,6 @@ def mail_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
             if settings.smtp_user:
                 smtp.login(settings.smtp_user, settings.smtp_password or "")
             smtp.send_message(message)
-        return ToolResult.ok(f"Email sent to {recipient}.")
+        return ToolResult.ok(f"sent to {recipient}")
 
     return [send_email]

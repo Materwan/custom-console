@@ -58,13 +58,15 @@ class TestBuildTools:
         ctx, _ = make_ctx(SMTP_HOST="smtp.example.com")
         assert "send_email" in {t.__name__ for t in build_tools(ctx)}
 
-    def test_instructions_mention_every_registered_tool_family(self, ctx):
+    def test_instructions_cover_every_registered_tool_family(self, ctx):
         from pathlib import Path
 
         text = (Path(__file__).parents[2] / "config" / "agent_instructions.txt").read_text(encoding="utf-8")
-        for tool in build_tools(ctx):
-            if tool.__name__.startswith(("file_system_", "workspace_file_")) or tool.__name__ == "pdf_to_markdown":
-                assert tool.__name__ in text, tool.__name__
+        names = {tool.__name__ for tool in build_tools(ctx)}
+        # The tools describe themselves; the instructions only say which family is for what.
+        for family in ("file_system_", "workspace_file_"):
+            assert any(name.startswith(family) for name in names) and f"`{family}*`" in text
+        assert "pdf_to_markdown" in names and "pdf_to_markdown" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -120,7 +122,7 @@ class TestFileSystemTools:
 
     def test_read_truncation_notice(self, fs):
         data = fs["file_system_read"]("a.txt", max_chars=5).data
-        assert data.startswith("one\nt") and "truncated to 5 characters" in data
+        assert data.startswith("one\nt") and "truncated at 5 chars" in data and 'mode="range"' in data
 
     def test_read_binary_file_fails_cleanly(self, fs, files_dir):
         (files_dir / "b.bin").write_bytes(b"\x00\x01")
@@ -492,4 +494,4 @@ class TestMoodleHelpers:
         assert ok.data["path"] == "tmp/dl/f.pdf" and saved["path"].endswith("f.pdf")
         escaped = tool("/pluginfile.php/1/f.pdf", "tmp", "../../evil.pdf")
         assert isinstance(escaped.error, ValueError)
-        assert json.loads(ok.to_llm())["data"]["downloaded"] is True
+        assert json.loads(ok.to_llm())["downloaded"] is True

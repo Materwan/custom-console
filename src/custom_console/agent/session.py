@@ -26,6 +26,17 @@ class AgentSession:
         self.session_id = session_id
         self._view: Optional[TurnView] = None
         self._cancel: Optional[threading.Event] = None
+        self.base_session_id = session_id
+        self.turns = 0
+        self.totals = TurnStats()  # usage since the console started
+        self.last: Optional[TurnStats] = None
+        self._tool_calls = 0
+        self._result_chars = 0
+
+    def new_conversation(self) -> None:
+        """Start a fresh history (the long-term memories, if any, are kept)."""
+        self.session_id = f"{self.base_session_id}-{int(time.time())}"
+        self.turns, self.totals, self.last = 0, TurnStats(), None
 
     # -- permission decisions ------------------------------------------------ #
 
@@ -47,6 +58,7 @@ class AgentSession:
 
         note = view.tool_started(function_name, arguments) if view is not None else None
         started = time.monotonic()
+        self._tool_calls += 1
         try:
             outcome = function_call(**arguments)
         except Exception as error:  # a tool must never break the agent loop
@@ -70,7 +82,9 @@ class AgentSession:
             duration,
             error=None if result.success else str(result.error),
         )
-        return result.to_llm()
+        text = result.to_llm()
+        self._result_chars += len(text)
+        return text
 
     # -- turn ----------------------------------------------------------------- #
 
@@ -79,7 +93,9 @@ class AgentSession:
         from agno.run.agent import RunEvent, RunOutput
 
         self._view, self._cancel = view, cancel
+        self._tool_calls = self._result_chars = 0
         self.journal.log_prompt(view.prompt)
+        failed = False
         started = time.perf_counter()
         run_output = None
         try:
@@ -102,6 +118,7 @@ class AgentSession:
                 if isinstance(content, str) and content:
                     view.add_text(content)
         except Exception as error:
+            failed = True
             view.add_note(f"Agent error: {error}", STYLE_ERROR)
             self.journal.log_error(str(error))
         finally:
@@ -112,6 +129,18 @@ class AgentSession:
         self.journal.log_answer(view.answer_text())
 
         metrics = getattr(run_output, "metrics", None)
-        if metrics is None:
-            return None
-        return TurnStats.from_metrics(metrics, time.perf_counter() - started)
+        stats = TurnStats.from_metrics(metrics, time.perf_counter() - started) if metrics is not None else None
+        if stats is not None:
+            self.turns += 1
+            self.totals, self.last = self.totals + stats, stats
+        self.journal.log_turn(
+            input_tokens=stats.input_tokens if stats else 0,
+            output_tokens=stats.output_tokens if stats else 0,
+            total_tokens=stats.total_tokens if stats else 0,
+            tool_calls=self._tool_calls,
+            tool_result_chars=self._result_chars,
+            duration_seconds=round(time.perf_counter() - started, 2),
+            interrupted=cancel.is_set(),
+            error=failed,
+        )
+        return stats

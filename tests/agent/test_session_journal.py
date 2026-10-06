@@ -144,7 +144,7 @@ class TestRunTurn:
         prompt, kwargs = session.agent.calls[0]
         assert prompt == "hi" and kwargs["stream"] is True and kwargs["yield_run_output"] is True
         assert (kwargs["user_id"], kwargs["session_id"]) == ("user-1", "session-1")
-        assert [e["type"] for e in read_entries(tmp_path / "log.jsonl")] == ["prompt", "answer"]
+        assert [e["type"] for e in read_entries(tmp_path / "log.jsonl")] == ["prompt", "answer", "turn"]
 
     def test_non_content_events_are_ignored(self, session):
         session.agent = FakeAgent(
@@ -204,7 +204,7 @@ class TestToolHook:
         view, _ = self.hook_env(session, tmp_path)
         output = session.tool_hook("file_system_list", lambda **kw: ToolResult.ok(["a", "b"]), {"path": "."})
 
-        assert json.loads(output) == {"success": True, "data": ["a", "b"]}
+        assert json.loads(output) == ["a", "b"]
         note = view.snapshot()[0]
         assert note.text.startswith("✔ file_system_list(path='.')")
         entry = read_entries(tmp_path / "log.jsonl")[0]
@@ -213,7 +213,7 @@ class TestToolHook:
     def test_failed_result_is_flagged(self, session, tmp_path):
         view, _ = self.hook_env(session, tmp_path)
         output = session.tool_hook("t", lambda **kw: ToolResult.fail(FileNotFoundError("x")), {})
-        assert json.loads(output)["success"] is False
+        assert output == "ERROR FileNotFoundError: x"
         assert view.snapshot()[0].text.startswith("✘ t()") and view.snapshot()[0].style == "error"
         assert read_entries(tmp_path / "log.jsonl")[0]["error"] == "x"
 
@@ -223,22 +223,21 @@ class TestToolHook:
         def explode(**kwargs):
             raise RuntimeError("kaboom")
 
-        output = json.loads(session.tool_hook("t", explode, {"a": 1}))
-        assert output == {"success": False, "error": "RuntimeError: kaboom"}
+        assert session.tool_hook("t", explode, {"a": 1}) == "ERROR RuntimeError: kaboom"
 
     def test_plain_return_values_are_wrapped(self, session, tmp_path):
         self.hook_env(session, tmp_path)
-        assert json.loads(session.tool_hook("t", lambda **kw: "text", {})) == {"success": True, "data": "text"}
+        assert session.tool_hook("t", lambda **kw: "text", {}) == "text"
 
     def test_tools_do_not_run_after_a_cancel(self, session, tmp_path):
         view, cancel = self.hook_env(session, tmp_path)
         cancel.set()
         ran = []
-        output = json.loads(session.tool_hook("t", lambda **kw: ran.append(1), {}))
-        assert ran == [] and output["success"] is False and "Interrupted" in output["error"]
+        output = session.tool_hook("t", lambda **kw: ran.append(1), {})
+        assert ran == [] and output.startswith("ERROR") and "Interrupted" in output
 
     def test_works_without_a_current_view(self, session, tmp_path):
-        assert json.loads(session.tool_hook("t", lambda **kw: ToolResult.ok(1), {}))["data"] == 1
+        assert session.tool_hook("t", lambda **kw: ToolResult.ok(1), {}) == "1"
 
     def test_permission_decisions_are_shown_in_the_turn(self, session, tmp_path):
         view, _ = self.hook_env(session, tmp_path)

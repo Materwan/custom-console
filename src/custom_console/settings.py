@@ -73,6 +73,9 @@ class Settings:
     agent_permission_level: int
     agent_user_id: str
     agent_session_id: str
+    agent_long_term_memory: bool  # an extra model call per turn extracts memories
+    agent_max_output_tokens: int  # cap of one answer
+    agent_history_tool_calls: int  # old tool calls (and results) kept in the context
 
     # Moodle
     moodle_enabled: bool
@@ -173,6 +176,9 @@ def load_settings(
         agent_permission_level=_int(env, "AGENT_PERMISSION_LEVEL", 1),
         agent_user_id=_text(env, "AGENT_USER_ID", "default_user"),
         agent_session_id=_text(env, "AGENT_SESSION_ID", "console_session"),
+        agent_long_term_memory=_flag(env, "AGENT_LONG_TERM_MEMORY", False),
+        agent_max_output_tokens=_int(env, "AGENT_MAX_OUTPUT_TOKENS", 4096),
+        agent_history_tool_calls=_int(env, "AGENT_HISTORY_TOOL_CALLS", 3),
         moodle_enabled=_flag(env, "MOODLE_ENABLED", True),
         moodle_base_url=_text(env, "MOODLE_BASE_URL", "https://moodle.epita.fr").rstrip(
             "/"

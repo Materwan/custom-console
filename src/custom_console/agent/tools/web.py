@@ -60,14 +60,13 @@ def compact_weather(payload: Dict[str, Any], resolution: str) -> Dict[str, Any]:
 def web_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
     @guarded(ctx, PermissionLevel.READ)
     def get_location() -> ToolResult:
-        """Get the approximate location of this device (from its IP address).
-        Returns city, region, country and "loc" (latitude,longitude)."""
+        """Approximate location of this device (city, region, country, "loc" = lat,lon)."""
         response = requests.get(LOCATION_URL, timeout=5)
         response.raise_for_status()
         data = response.json()
         return ToolResult.ok({key: data.get(key) for key in ("city", "region", "country", "loc")})
 
-    @guarded(ctx, PermissionLevel.READ)
+    @guarded(ctx, PermissionLevel.READ, memo=True)
     def get_weather(
         latitude: float,
         longitude: float,
@@ -76,16 +75,8 @@ def web_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         forecast_days: int = 7,
         timezone: str = "auto",
     ) -> ToolResult:
-        """Get the weather for a position from Open-Meteo.
-
-        Args:
-            latitude: latitude in degrees.
-            longitude: longitude in degrees.
-            resolution: "current", "hourly" or "daily".
-            variables: Open-Meteo variable names; default: a sensible set.
-            forecast_days: 1-16 (ignored for "current").
-            timezone: e.g. "Europe/Paris", or "auto".
-        """
+        """Weather from Open-Meteo. variables: Open-Meteo names (default: a sensible set);
+        forecast_days 1-16, unused for "current"."""
         if resolution not in DEFAULT_WEATHER_VARIABLES:
             raise ValueError(
                 f"Unknown resolution {resolution!r}, expected one of "

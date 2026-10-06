@@ -3,22 +3,24 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import threading
 import time
 from typing import Callable
 
 import pytest
+from prompt_toolkit.document import Document
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
-from rich.console import Console
+from rich.table import Table
 
 from custom_console.agent.turn import TurnStats, TurnView
-from custom_console.agent.ui import AgentScreen
+from custom_console.agent.ui import AgentScreen, SlashCommand, SlashCompleter
 
 CTRL_C = "\x03"
 CTRL_D = "\x04"
 CTRL_U = "\x15"
+PAGE_UP = "\x1b[5~"
+PAGE_DOWN = "\x1b[6~"
 
 
 def wait_for(condition: Callable[[], bool], timeout: float = 5.0) -> None:
@@ -36,17 +38,18 @@ def joined(fragments) -> str:
 class Harness:
     """Runs an AgentScreen and lets a driver thread type into it."""
 
-    def __init__(self, runner, banner=None):
-        self.console = Console(file=io.StringIO(), width=80, force_terminal=False)
+    def __init__(self, runner, banner=None, commands=()):
         self.runner = runner
         self.banner = banner
+        self.commands = commands
         self.screen = None
         self.pipe = None
         self.errors = []
 
     @property
     def output(self) -> str:
-        return self.console.file.getvalue()
+        """The conversation as the user sees it (plain text)."""
+        return self.screen.transcript_text() if self.screen else ""
 
     def idle(self) -> bool:
         return not self.screen._busy and self.screen._question is None
@@ -59,9 +62,9 @@ class Harness:
             self.pipe = pipe
             self.screen = AgentScreen(
                 title="Test Agent",
-                console=self.console,
                 turn_runner=self.runner,
                 banner=self.banner,
+                commands=self.commands,
                 input=pipe,
                 output=DummyOutput(),
             )
@@ -74,6 +77,10 @@ class Harness:
                 except BaseException as error:  # surface driver failures in the test
                     self.errors.append(error)
                 finally:
+                    try:
+                        wait_for(self.idle, timeout=3)  # /bye is only taken between turns
+                    except AssertionError:
+                        pass
                     pipe.send_text(CTRL_U + "/bye\r")
 
             thread = threading.Thread(target=drive, daemon=True)
@@ -104,7 +111,7 @@ class TestTurns:
         assert "**bold**" not in out and "# Answer" not in out  # rendered, not raw
         assert "1 prompt + 2 completion = 3 tokens" in out
 
-    def test_plain_text_streams_in_the_live_area_while_the_agent_works(self):
+    def test_the_turn_is_visible_while_the_agent_works(self):
         release = threading.Event()
         started = threading.Event()
 
@@ -119,15 +126,13 @@ class TestTurns:
         def driver(h):
             h.send("go\r")
             assert started.wait(5)
-            seen["live"] = joined(h.screen._live_fragments())
-            seen["out_before_end"] = h.output
+            seen["live"] = h.output
             release.set()
             wait_for(h.idle)
 
         out = h.run(driver)
-        assert "❯ go" in seen["live"] and "streaming **now**" in seen["live"]  # raw plain text
-        assert "streaming" not in seen["out_before_end"]  # nothing in the scrollback yet
-        assert "streaming" in out and "**now**" not in out  # replaced by the Markdown rendering
+        assert "❯ go" in seen["live"] and "streaming now" in seen["live"]
+        assert "streaming now" in out and "**now**" not in out  # rendered as Markdown
 
     def test_live_area_disappears_when_the_turn_ends(self):
         h = Harness(simple_runner)
@@ -325,7 +330,6 @@ class TestPermissions:
         with create_pipe_input() as pipe:
             screen = AgentScreen(
                 title="t",
-                console=Console(file=io.StringIO()),
                 turn_runner=simple_runner,
                 input=pipe,
                 output=DummyOutput(),
@@ -335,8 +339,9 @@ class TestPermissions:
 
 
 class TestSlashCommands:
-    def test_help_and_unknown_command(self):
-        h = Harness(simple_runner)
+    def test_help_lists_builtin_and_given_commands(self):
+        command = SlashCommand("model", "[name]", "pick a model", lambda args: None)
+        h = Harness(simple_runner, commands=[command])
 
         def driver(h):
             h.send("/help\r")
@@ -346,6 +351,7 @@ class TestSlashCommands:
 
         out = h.run(driver)
         assert "/clear" in out and "Ctrl+C" in out
+        assert "/model [name]" in out and "pick a model" in out
 
     def test_commands_are_not_sent_to_the_agent(self):
         calls = []
@@ -358,40 +364,142 @@ class TestSlashCommands:
         h.run(driver)
         assert calls == []
 
-    def test_clear_redraws_the_banner(self):
+    def test_clear_empties_the_conversation_but_keeps_the_banner(self):
         h = Harness(simple_runner, banner="BANNER-TEXT")
 
         def driver(h):
-            assert h.output.count("BANNER-TEXT") == 1  # printed at startup
+            h.send("hello\r")
+            wait_for(lambda: "tokens" in h.output and h.idle())
             h.send("/clear\r")
-            wait_for(lambda: h.output.count("BANNER-TEXT") == 2)
+            wait_for(lambda: "hello" not in h.output)
+
+        out = h.run(driver)
+        assert "BANNER-TEXT" in out and "Answer" not in out
+
+    def test_a_given_command_runs_with_its_arguments_and_shows_its_output(self):
+        seen = []
+
+        def handler(args):
+            seen.append(args)
+            table = Table()
+            table.add_column("name")
+            table.add_row("llama3")
+            return table
+
+        h = Harness(simple_runner, commands=[SlashCommand("model", "", "", handler)])
+
+        def driver(h):
+            h.send("/model  2\r")
+            wait_for(lambda: "llama3" in h.output and h.idle())
+
+        h.run(driver)
+        assert seen == ["2"]
+
+    def test_text_output_and_errors_of_a_command_are_shown(self):
+        def failing(args):
+            raise RuntimeError("ollama is down")
+
+        h = Harness(
+            simple_runner,
+            commands=[SlashCommand("ok", "", "", lambda a: "all good"), SlashCommand("bad", "", "", failing)],
+        )
+
+        def driver(h):
+            h.send("/ok\r")
+            wait_for(lambda: "all good" in h.output and h.idle())
+            h.send("/bad\r")
+            wait_for(lambda: "/bad: ollama is down" in h.output and h.idle())
+            h.send("again\r")  # the console is still usable
+            wait_for(lambda: "Answer" in h.output)
 
         h.run(driver)
 
-
-class TestLayout:
-    def test_live_area_is_bounded_by_the_terminal_height(self):
+    def test_enter_during_a_command_keeps_the_text(self):
         release = threading.Event()
 
-        def runner(view, cancel):
-            view.add_text("\n".join(f"line {i}" for i in range(500)))
+        def slow(args):
             release.wait(5)
+
+        h = Harness(simple_runner, commands=[SlashCommand("slow", "", "", slow)])
+
+        def driver(h):
+            h.send("/slow\r")
+            wait_for(lambda: h.screen._busy)
+            h.send("hello\r")
+            time.sleep(0.2)
+            assert h.screen._buffer.text == "hello"
+            assert "/slow" in joined(h.screen._header_fragments())
+            release.set()
+            wait_for(h.idle)
+
+        h.run(driver)
+
+    def test_completer_suggests_commands_and_first_arguments(self):
+        command = SlashCommand("model", "", "pick", lambda a: None, lambda: ["gemma4", "llama3"])
+        completer = SlashCompleter(lambda: {"model": command})
+
+        def names(text):
+            return [c.text for c in completer.get_completions(Document(text), None)]
+
+        assert names("/mo") == ["/model"]
+        assert names("/") == ["/model"]
+        assert names("/model ll") == ["llama3"]
+        assert names("/model ") == ["gemma4", "llama3"]
+        assert names("hello") == []
+
+
+class TestLayout:
+    def test_screen_is_full_screen_with_the_input_as_the_last_row(self):
+        h = Harness(simple_runner)
+
+        def driver(h):
+            assert h.screen._app.full_screen
+            windows = h.screen._app.layout.container.content.children  # pane, question, header, entry
+            assert windows[-1].content.buffer is h.screen._buffer
+
+        h.run(driver)
+
+    def test_conversation_follows_the_bottom_and_can_be_scrolled(self):
+        def runner(view, cancel):
+            view.add_text("\n\n".join(f"line {i}" for i in range(200)))
 
         h = Harness(runner)
         seen = {}
 
         def driver(h):
             h.send("go\r")
-            wait_for(lambda: h.screen._view is not None and h.screen._view.snapshot())
-            text = joined(h.screen._live_fragments())
-            seen["rows"] = text.count("\n") + 1
-            seen["last"] = text.splitlines()[-1]
-            release.set()
-            wait_for(h.idle)
+            wait_for(lambda: "line 199" in h.output and h.idle())
+            wait_for(lambda: h.screen._total > 60)  # the pane has rendered the long answer
+            screen = h.screen
+            seen["follow"], seen["bottom"] = screen._follow, screen._top
+            h.send(PAGE_UP)
+            wait_for(lambda: not screen._follow)
+            seen["scrolled"] = screen._top
+            seen["header"] = joined(screen._header_fragments())
+            h.send(PAGE_DOWN * 50)
+            wait_for(lambda: screen._follow)
+            seen["back"] = screen._top
 
         h.run(driver)
-        assert seen["rows"] <= 40  # DummyOutput is 40 rows tall
-        assert seen["last"] == "line 499"
+        assert seen["follow"] and seen["bottom"] > 0
+        assert 0 < seen["scrolled"] < seen["bottom"]
+        assert "scrolled" in seen["header"] and len(seen["header"]) <= 80
+        assert seen["back"] == seen["bottom"]
+
+    def test_new_output_brings_the_view_back_to_the_bottom(self):
+        h = Harness(lambda view, cancel: view.add_text("\n\n".join(str(i) for i in range(100))))
+
+        def driver(h):
+            h.send("go\r")
+            wait_for(lambda: "99" in h.output and h.idle())
+            wait_for(lambda: h.screen._total > 60)  # the pane has rendered the long answer
+            h.send(PAGE_UP)
+            wait_for(lambda: not h.screen._follow)
+            h.send("again\r")
+            wait_for(lambda: h.screen._follow)
+            wait_for(h.idle)  # /bye is only taken between turns
+
+        h.run(driver)
 
     def test_header_shows_the_activity_and_fits_the_width(self):
         release, started = threading.Event(), threading.Event()

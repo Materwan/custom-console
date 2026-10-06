@@ -38,6 +38,14 @@ class TurnStats:
     def tokens_per_second(self) -> float:
         return self.output_tokens / self.duration if self.duration > 0 else 0.0
 
+    def __add__(self, other: "TurnStats") -> "TurnStats":
+        return TurnStats(
+            self.input_tokens + other.input_tokens,
+            self.output_tokens + other.output_tokens,
+            self.total_tokens + other.total_tokens,
+            self.duration + other.duration,
+        )
+
     @classmethod
     def from_metrics(cls, metrics: Any, duration: float) -> "TurnStats":
         """Build from an agno metrics object (missing/None fields count as 0)."""

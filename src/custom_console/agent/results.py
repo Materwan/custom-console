@@ -39,5 +39,12 @@ class ToolResult(Generic[T]):
         return result
 
     def to_llm(self) -> str:
-        """What the model sees: the result as compact JSON text."""
-        return json.dumps(self.to_dict(), ensure_ascii=False, default=str, separators=(",", ":"))
+        """What the model sees, as terse as possible: text as is, other data as
+        compact JSON, a failure as one ``ERROR <type>: <message>`` line (no trace)."""
+        if not self.success:
+            return f"ERROR {type(self.error).__name__}: {self.error}".rstrip(": ")
+        if self.data is None or self.data == "":
+            return "ok"
+        if isinstance(self.data, str):
+            return self.data
+        return json.dumps(self.data, ensure_ascii=False, default=str, separators=(",", ":"))

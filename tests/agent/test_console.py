@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import json
 import threading
 import time
@@ -10,7 +9,6 @@ from types import SimpleNamespace
 
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
-from rich.console import Console
 
 from custom_console.agent.console import AgentConsole, permission_label
 from custom_console.fs import FileManager
@@ -58,7 +56,6 @@ def build(tmp_path, permission_level):
 
     pipe_ctx = create_pipe_input()
     pipe = pipe_ctx.__enter__()
-    console = Console(file=io.StringIO(), width=80, force_terminal=False)
     agent_console = AgentConsole(
         settings=settings,
         model="gemma4:test",
@@ -66,12 +63,11 @@ def build(tmp_path, permission_level):
         permission_level=permission_level,
         files=FileManager(start_dir=str(tmp_path)),
         memory=False,
-        console=console,
         agent_factory=factory,
         input=pipe,
         output=DummyOutput(),
     )
-    return agent_console, settings, created, console, pipe, pipe_ctx
+    return agent_console, settings, created, agent_console.screen.transcript_text, pipe, pipe_ctx
 
 
 def run_with(agent_console, pipe, driver):
@@ -85,6 +81,10 @@ def run_with(agent_console, pipe, driver):
         except BaseException as error:
             errors.append(error)
         finally:
+            try:
+                wait_for(lambda: not agent_console.screen._busy, timeout=3)  # /bye is only taken between turns
+            except AssertionError:
+                pass
             pipe.send_text("\x15/bye\r")
 
     threading.Thread(target=drive, daemon=True).start()
@@ -99,13 +99,13 @@ class TestAgentConsole:
         try:
             def driver():
                 pipe.send_text("hello\r")
-                wait_for(lambda: "Done: hello" in console.file.getvalue())
+                wait_for(lambda: "Done: hello" in console() and not agent_console.screen._busy)
 
             run_with(agent_console, pipe, driver)
         finally:
             pipe_ctx.__exit__(None, None, None)
 
-        out = console.file.getvalue()
+        out = console()
         assert "Tester" in out and "gemma4:test" in out  # banner
         assert "permissions: everything is auto-accepted" in out
         assert created["model"] == "gemma4:test" and created["memory"] is False
@@ -113,7 +113,7 @@ class TestAgentConsole:
         assert not any(name.startswith("moodle_") for name in created["tool_names"])  # MOODLE_ENABLED=false
 
         entries = [json.loads(l) for l in settings.agent_log_path.read_text(encoding="utf-8").splitlines()]
-        assert [e["type"] for e in entries] == ["prompt", "answer"]
+        assert [e["type"] for e in entries] == ["prompt", "answer", "turn"]
         assert entries[0]["prompt"] == "hello"
 
     def test_write_tool_asks_in_the_ui_at_level_1_and_runs_when_accepted(self, tmp_path):
@@ -124,15 +124,15 @@ class TestAgentConsole:
                 wait_for(lambda: agent_console.screen._question is not None)
                 assert "workspace file write" in agent_console.screen._question.info
                 pipe.send_text("y\r")
-                wait_for(lambda: "Done: write a note" in console.file.getvalue())
+                wait_for(lambda: "Done: write a note" in console() and not agent_console.screen._busy)
 
             run_with(agent_console, pipe, driver)
         finally:
             pipe_ctx.__exit__(None, None, None)
 
         assert (settings.workspace_roots["tmp"] / "note.txt").read_text() == "hello"
-        assert json.loads(created["agent"].tool_output) == {"success": True, "data": "tmp/note.txt"}
-        out = console.file.getvalue()
+        assert created["agent"].tool_output == "tmp/note.txt"
+        out = console()
         assert "→ accepted" in out and "✔ workspace_file_write" in out
 
     def test_refusal_prevents_the_tool_from_running(self, tmp_path):
@@ -142,16 +142,15 @@ class TestAgentConsole:
                 pipe.send_text("write a note\r")
                 wait_for(lambda: agent_console.screen._question is not None)
                 pipe.send_text("n\r")
-                wait_for(lambda: "Done: write a note" in console.file.getvalue())
+                wait_for(lambda: "Done: write a note" in console() and not agent_console.screen._busy)
 
             run_with(agent_console, pipe, driver)
         finally:
             pipe_ctx.__exit__(None, None, None)
 
         assert not (settings.workspace_roots["tmp"] / "note.txt").exists()
-        result = json.loads(created["agent"].tool_output)
-        assert result["success"] is False and "UserPermissionDenied" in result["error"]
-        assert "→ refused" in console.file.getvalue()
+        assert created["agent"].tool_output.startswith("ERROR UserPermissionDenied")
+        assert "→ refused" in console()
 
     def test_level_2_does_not_ask(self, tmp_path):
         agent_console, settings, created, console, pipe, pipe_ctx = build(tmp_path, permission_level=2)
@@ -159,7 +158,7 @@ class TestAgentConsole:
         try:
             def driver():
                 pipe.send_text("write a note\r")
-                wait_for(lambda: "Done: write a note" in console.file.getvalue())
+                wait_for(lambda: "Done: write a note" in console() and not agent_console.screen._busy)
                 asked.append(agent_console.screen._question)
 
             run_with(agent_console, pipe, driver)
@@ -168,7 +167,7 @@ class TestAgentConsole:
 
         assert asked == [None]
         assert (settings.workspace_roots["tmp"] / "note.txt").read_text() == "hello"
-        assert "→ auto-accepted" in console.file.getvalue()
+        assert "→ auto-accepted" in console()
 
     def test_tool_context_is_closed_when_the_console_exits(self, tmp_path):
         agent_console, settings, created, console, pipe, pipe_ctx = build(tmp_path, permission_level=1)
@@ -185,7 +184,7 @@ class TestAgentConsole:
         try:
             def driver():
                 pipe.send_text("remember me\r")
-                wait_for(lambda: "Done: remember me" in console.file.getvalue())
+                wait_for(lambda: "Done: remember me" in console() and not agent_console.screen._busy)
 
             run_with(agent_console, pipe, driver)
         finally:

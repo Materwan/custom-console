@@ -33,8 +33,15 @@ class TestToolResult:
 
     def test_to_llm_is_compact_json_with_unicode(self):
         text = ToolResult.ok({"name": "é", "path": object}).to_llm()
-        assert json.loads(text)["data"]["name"] == "é"
+        assert json.loads(text)["name"] == "é"  # no {"success", "data"} envelope
         assert "\\u" not in text and ": " not in text and ", " not in text
+
+    def test_to_llm_is_terse(self):
+        assert ToolResult.ok("plain text").to_llm() == "plain text"  # strings are not JSON-quoted
+        assert ToolResult.ok().to_llm() == "ok" and ToolResult.ok("").to_llm() == "ok"
+        assert ToolResult.ok([]).to_llm() == "[]"
+        assert ToolResult.fail(FileNotFoundError("x.txt")).to_llm() == "ERROR FileNotFoundError: x.txt"
+        assert ToolResult.fail(RuntimeError()).to_llm() == "ERROR RuntimeError"
 
     def test_to_llm_survives_non_json_values(self):
         from pathlib import Path
