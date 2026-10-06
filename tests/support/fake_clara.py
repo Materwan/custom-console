@@ -57,9 +57,8 @@ class FakeClara(ClaraClient):
         provider: str = "local",
         window: int = 8192,
         tokens: int = 0,
-        admin_token: Optional[str] = "admin",
     ) -> None:
-        super().__init__("http://fake-clara", "token", user_id="tester", admin_token=admin_token)
+        super().__init__("http://fake-clara", "token", user_id="tester")
         self.respond = respond or (lambda body: say(f"Done: {body['message'][:20]}"))
         self.model, self.provider, self.window, self.tokens = model, provider, window, tokens
         self.summary, self.messages = "", 0
@@ -67,8 +66,6 @@ class FakeClara(ClaraClient):
         self.results: List[List[Dict[str, str]]] = []  # what the console answered to tool requests
         self.forgotten: List[str] = []
         self.compactions: List[Any] = []
-        self.admin_calls: List[str] = []
-        self.admin_output: Dict[str, str] = {}
         self.down = False  # the server cannot be reached
         self.nothing_to_compact = False
         self.reminder_list: List[Dict[str, Any]] = []  # what /remind created
@@ -220,17 +217,3 @@ class FakeClara(ClaraClient):
         self._check()
         while self.announced:
             yield self.announced.pop(0)
-
-    def admin(self, line: str) -> str:
-        if not self.admin_token:
-            return super().admin(line)
-        self.admin_calls.append(line)
-        return self.admin_output.get(line, f"ran {line}")
-
-    def admin_commands(self) -> List[Dict[str, Any]]:
-        if not self.admin_token:
-            return []
-        return [
-            {"name": "provider", "usage": "[local|cloud]", "summary": "", "choices": ["local", "cloud"]},
-            {"name": "model", "usage": "[name]", "summary": "", "choices": []},
-        ]

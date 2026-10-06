@@ -56,11 +56,10 @@ def git_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, zone_level(ctx, PermissionLevel.READ, "path"))
     def git_status(path: str = ".") -> ToolResult:
-        """The branch, how far it is from its upstream, and the changed, staged and new files
-        of the git repository containing `path`.
+        """Branch, distance from its upstream, changed, staged and new files of the repository.
 
         Args:
-            path: a folder (or file) inside the repository (default: the working directory).
+            path: a folder inside the repository (default: the working directory)
         """
         output = run_git(["status", "--short", "--branch"], folder(path))
         return ToolResult.ok(output or "Nothing to report.")
@@ -73,15 +72,14 @@ def git_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         file: Optional[str] = None,
         context: int = 3,
     ) -> ToolResult:
-        """The changes of the repository as a unified diff: not yet staged (default), staged,
-        or since a revision.
+        """Unified diff of the repository: unstaged (default), staged, or since a revision.
 
         Args:
-            path: a folder inside the repository (default: the working directory).
-            staged: the changes staged for the next commit.
-            revision: compare with this commit or branch instead (e.g. "HEAD~1", "main").
-            file: only this file or folder (relative to `path`).
-            context: lines of context around each change.
+            path: a folder inside the repository
+            staged: the staged changes
+            revision: compare with this commit or branch ("HEAD~1")
+            file: only this file or folder
+            context: lines around each change
         """
         _no_option("revision", revision)
         _no_option("file", file)
@@ -102,13 +100,13 @@ def git_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, zone_level(ctx, PermissionLevel.READ, "path"))
     def git_log(path: str = ".", max_count: int = 10, file: Optional[str] = None, revision: Optional[str] = None) -> ToolResult:
-        """The latest commits: short hash, date, author and subject, newest first.
+        """Latest commits (hash, date, author, subject), newest first.
 
         Args:
-            path: a folder inside the repository (default: the working directory).
-            max_count: how many commits (at most 100).
-            file: only the commits that changed this file or folder.
-            revision: start from this commit or branch (default: the current one).
+            path: a folder inside the repository
+            max_count: how many (at most 100)
+            file: only commits that changed this file or folder
+            revision: start from this commit or branch
         """
         _no_option("revision", revision)
         _no_option("file", file)

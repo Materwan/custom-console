@@ -124,21 +124,6 @@ class TestInput:
         assert seen["rows"] == 3  # 200 characters after "> ", 78 per row
         assert seen["prefix"] == [("", "  ")]  # continuation rows line up with the text
 
-    def test_the_layout_keeps_the_rows_a_long_input_took(self):
-        h = Harness(simple_runner)
-        seen = {}
-
-        def driver(h):
-            h.send("x" * 200)
-            wait_for(lambda: len(h.screen._buffer.text) == 200)
-            h.screen._filler_rows()
-            h.send(CTRL_U)
-            wait_for(lambda: h.screen._buffer.text == "")
-            seen["filler"] = h.screen._filler_rows()
-
-        h.run(driver)
-        assert seen["filler"] == 2  # the input shrank by two rows: the filler keeps it at the bottom
-
     def test_the_input_never_takes_the_whole_screen(self):
         h = Harness(simple_runner)
         seen = {}

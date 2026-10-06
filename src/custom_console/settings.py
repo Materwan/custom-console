@@ -73,7 +73,6 @@ class Settings:
     # The Clara server: it runs the model, the memory and the conversations
     clara_url: str
     clara_token: Optional[str]  # chat token (CLARA_TOKENS on the server)
-    clara_admin_token: Optional[str]  # optional: lets /model and /provider reach the server's console
     clara_user: Optional[str]  # your user name on the server: with clara_password, instead of a shared token
     clara_password: Optional[str]
     clara_user_name: Optional[str]  # how Clara should call you
@@ -203,7 +202,6 @@ def load_settings(
         default_model=_text(env, "AGENT_DEFAULT_MODEL", "gemma4"),
         clara_url=_text(env, "CLARA_URL", "http://127.0.0.1:8765").rstrip("/"),
         clara_token=_get(env, "CLARA_TOKEN"),
-        clara_admin_token=_get(env, "CLARA_ADMIN_TOKEN"),
         clara_user=(_get(env, "CLARA_USER") or "").lower() or None,
         clara_password=_get(env, "CLARA_PASSWORD"),
         clara_user_name=_get(env, "CLARA_USER_NAME"),

@@ -2,12 +2,16 @@
 
 Behaviour
 ---------
-* The input is pinned at the bottom of the terminal. It grows with what is
-  typed (long lines wrap, Shift+Tab starts a new line) and Enter sends it.
+* The screen is full-screen: the conversation scrolls in a pane of its own
+  (mouse wheel, PageUp / PageDown), and the header rule and the input are
+  **fixed at the bottom of the window** whatever the scroll position. The input
+  grows with what is typed (long lines wrap, Shift+Tab starts a new line) and
+  Enter sends it. New output follows the bottom unless you scrolled up.
 * While the agent answers, what is final (finished paragraphs, finished tool
-  lines) is printed into the normal scrollback as it comes, rendered as
-  **Markdown**, so the terminal can be scrolled meanwhile. What still changes
-  is shown as plain text in a live area just above the input (see `render`).
+  lines) is added to the pane as it comes, rendered as **Markdown**. What still
+  changes is shown as plain text in a live area just above the input (see
+  `render`). When the screen is left, the conversation is written back to the
+  normal terminal scrollback.
 * The rule above the input shows the activity, the time spent, the tokens
   generated so far and the progress of the agent's checklist.
 * Tool calls take one line each. Ctrl+O (or /details) shows what they hide
@@ -22,14 +26,6 @@ Behaviour
 
 The agent itself runs in a worker thread (`turn_runner`); everything that
 touches the UI runs on the asyncio loop of the main thread.
-
-Layout height
--------------
-prompt_toolkit redraws a non-full-screen layout from its first row, so when the
-layout gets shorter the input line would drift away from the bottom of the
-terminal. The layout therefore never shrinks while something is on screen: a
-filler at its top keeps the height reached (`_peak`). Text printed above the
-UI takes the place of filler rows, which keeps the input on the last row.
 """
 
 from __future__ import annotations
@@ -40,7 +36,7 @@ import time
 from dataclasses import replace
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
-from prompt_toolkit.application import Application, in_terminal, run_in_terminal
+from prompt_toolkit.application import Application, in_terminal
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, ThreadedCompleter, merge_completers
 from prompt_toolkit.filters import Condition
@@ -48,9 +44,12 @@ from prompt_toolkit.history import History, InMemoryHistory
 from prompt_toolkit.input import Input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.bindings.completion import generate_completions
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.formatted_text import ANSI
 from prompt_toolkit.layout import ConditionalContainer, Dimension, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.processors import BeforeInput, ConditionalProcessor, PasswordProcessor
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.output import Output
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
@@ -74,11 +73,13 @@ MAX_INPUT_ROWS = 10
 SUGGESTION_ROWS = 6
 STREAM_PERIOD = 0.15  # seconds between two looks for finished output to print
 FLASH_SECONDS = 2.5
+WHEEL_LINES = 3
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 IDLE_HINTS = ("Enter: send · @file attaches · !cmd runs · /help", "Enter: send · /help", "/help")
 
 KEYS_HELP = (
     "Keys: Enter sends (queued while the agent works) · Shift+Tab new line · Tab completes · "
+    "PgUp/PgDn or the mouse wheel scroll (Shift+drag selects text) · "
     "Ctrl+O tool details · Ctrl+T transcript · Ctrl+C stops the answer · Ctrl+D leaves\n"
     "In a message: @path attaches a file or folder. A line starting with ! runs a command yourself "
     "(its output goes with your next message)"
@@ -160,6 +161,17 @@ def add_basic_commands(registry: SlashRegistry) -> None:
     registry.add(SlashCommand("bye", "leave the agent (or Ctrl+D)", lambda _: CommandResult(quit=True)), "exit", "quit")
 
 
+class _PaneControl(FormattedTextControl):
+    """The conversation pane: a text control that reports mouse events (the wheel scrolls)."""
+
+    def __init__(self, text, on_mouse, **options):
+        super().__init__(text, **options)
+        self._on_mouse = on_mouse
+
+    def mouse_handler(self, mouse_event: MouseEvent):
+        return self._on_mouse(mouse_event)
+
+
 class AgentScreen:
     def __init__(
         self,
@@ -206,7 +218,10 @@ class AgentScreen:
         self._queue: List[str] = []  # messages sent while the agent was busy, sent when it is done
         self._details = False  # tool lines are printed with what they hide
         self._flash: Tuple[str, float] = ("", 0.0)  # a short message in the header, until a time
-        self._peak = 0  # tallest the layout above the header has been (see module docstring)
+        self._scrollback: List[str] = []  # everything printed, as ANSI text (the pane shows it)
+        self._follow = True  # the pane shows the bottom
+        self._top = 0  # first visible line of the pane
+        self._total = 0  # lines of the pane at the last render
         self._finished: List[TurnView] = []  # this screen's turns (the default transcript)
         self._notices: List[str] = []  # shown once the screen runs (see `notify`)
         self._notices_lock = threading.Lock()
@@ -242,10 +257,18 @@ class AgentScreen:
         return self._question is None and self._menu is None and self._choice is None and self._text is None
 
     def _build_app(self, input: Optional[Input], output: Optional[Output]) -> Application:
-        filler = ConditionalContainer(
-            Window(FormattedTextControl(""), height=lambda: Dimension.exact(self._filler_rows())),
-            filter=Condition(lambda: self._filler_rows() > 0),
+        pane = Window(
+            _PaneControl(
+                self._pane_text,
+                self._pane_mouse,
+                get_cursor_position=lambda: Point(0, self._top),  # always inside the view
+                focusable=False,
+            ),
+            get_vertical_scroll=lambda window: self._top,
+            wrap_lines=False,
+            always_hide_cursor=True,
         )
+        self._pane = pane
         live = ConditionalContainer(
             Window(FormattedTextControl(self._live_fragments), dont_extend_height=True),
             filter=Condition(lambda: self._view is not None),
@@ -316,6 +339,14 @@ class AgentScreen:
         @keys.add("down", filter=in_text)
         def _text_no_history(event) -> None:
             pass  # the history must not be recalled into a secret
+
+        @keys.add("pageup", filter=~in_menu & ~in_choice)
+        def _page_up(event) -> None:
+            self._scroll_by(-self._page())
+
+        @keys.add("pagedown", filter=~in_menu & ~in_choice)
+        def _page_down(event) -> None:
+            self._scroll_by(self._page())
 
         @keys.add("c-o")
         def _details(event) -> None:
@@ -448,11 +479,11 @@ class AgentScreen:
                 buffer.insert_text("\n")
 
         return Application(
-            layout=Layout(HSplit([filler, live, question, menu, choice, suggestions, header, entry]), focused_element=entry),
+            layout=Layout(HSplit([pane, live, question, menu, choice, suggestions, header, entry]), focused_element=entry),
             key_bindings=keys,
             style=STYLE,
-            full_screen=False,
-            erase_when_done=True,
+            full_screen=True,
+            mouse_support=True,
             refresh_interval=0.1,  # animates the spinner and the clock
             input=input,
             output=output,
@@ -526,18 +557,43 @@ class AgentScreen:
             + len(self._suggestion_lines())
         )
 
-    def _measure(self) -> int:
-        """Rows used by the layout besides the header and the first input row."""
-        width = self._width()
-        rows = self._panel_rows(width) + self._input_rows() - 1
-        if self._view is not None:
-            rows += len(live_lines(self._view, width, self._live_budget(width), self._printer))
-        return rows
+    # -- the pane ------------------------------------------------------------------- #
 
-    def _filler_rows(self) -> int:
-        rows = self._measure()
-        self._peak = min(max(self._peak, rows), max(0, self._size().rows - UI_ROWS))
-        return max(0, self._peak - rows)
+    def _pane_text(self):
+        text = "".join(self._scrollback)
+        self._total = text.count("\n")
+        height = self._pane_height()
+        limit = max(0, self._total - height)
+        self._top = limit if self._follow else min(self._top, limit)
+        return ANSI(text)
+
+    def _pane_height(self) -> int:
+        info = self._pane.render_info
+        return info.window_height if info else max(1, self._size().rows - UI_ROWS)
+
+    def _page(self) -> int:
+        return max(1, self._pane_height() - 1)
+
+    def _scroll_by(self, lines: int) -> None:
+        limit = max(0, self._total - self._pane_height())
+        self._top = max(0, min(limit, self._top + lines))
+        self._follow = self._top >= limit
+        self._app.invalidate()
+
+    def _pane_mouse(self, event: MouseEvent):
+        if event.event_type == MouseEventType.SCROLL_UP:
+            self._scroll_by(-WHEEL_LINES)
+        elif event.event_type == MouseEventType.SCROLL_DOWN:
+            self._scroll_by(WHEEL_LINES)
+        else:
+            return NotImplemented
+        return None
+
+    def printed_text(self) -> str:
+        """Everything printed so far, as plain text (without the colours)."""
+        import re
+
+        return re.sub(r"\x1b\[[0-9;]*m", "", "".join(self._scrollback))
 
     def _live_budget(self, width: int) -> int:
         """Rows the live text may take: what the terminal has left."""
@@ -723,6 +779,8 @@ class AgentScreen:
             texts.append(f"{frame} {label}")
             if self._queue:
                 texts = [f"{text} · {len(self._queue)} queued" for text in texts[:-1]] + texts[-1:]
+        elif not self._follow:
+            texts = ["↑ scrolled · PgDn: back to the end", "↑ scrolled", "↑"]
         else:
             todos = [todo for todo in self._todo_texts(pending_only=True)][-1:]
             texts = [f"{todo} · {hint}" for todo in todos for hint in IDLE_HINTS] + list(IDLE_HINTS)
@@ -885,27 +943,12 @@ class AgentScreen:
         return captured.get()
 
     async def _print_above(self, render: Callable[[], str], pad_before: bool = False) -> None:
-        """Print `render()` above the UI, which is erased and redrawn around it.
-
-        The text takes the place of filler rows (see the module docstring),
-        which keeps the input on the last row. With `pad_before`, blank rows
-        go before it instead, to keep a command's output next to the input.
-        """
-
-        def work() -> None:
-            text = render()
-            if not text:
-                return
-            rows = text.count("\n")
-            if pad_before:
-                text = "\n" * max(0, self._peak - rows) + text
-                self._peak = 0
-            else:
-                self._peak = max(0, self._peak - rows)
-            self.console.file.write(text)
-            self.console.file.flush()
-
-        await run_in_terminal(work)
+        """Add `render()` to the pane and follow it (`pad_before` is a leftover of the inline layout)."""
+        text = render()
+        if text:
+            self._scrollback.append(text)
+            self._follow = True
+            self._app.invalidate()
 
     def notify(self, text: str) -> None:
         """Print `text` (already rendered) above the input line, whatever the screen is doing.
@@ -926,13 +969,10 @@ class AgentScreen:
         await self._print_above(lambda: text)
 
     def _reset_screen(self) -> None:
-        """Clear the terminal, show the banner and push the input to the bottom."""
-        self.console.clear()
-        text = self._capture(self.banner) if self.banner is not None else ""
-        pad = max(0, self._size().rows - text.count("\n") - UI_ROWS)
-        self.console.file.write(text + "\n" * pad)
-        self.console.file.flush()
-        self._peak = 0
+        """Clear the pane and show the banner again."""
+        self._scrollback = [self._capture(self.banner)] if self.banner is not None else []
+        self._follow = True
+        self._app.invalidate()
 
     async def _open_transcript(self) -> None:
         """Show the conversation in a full-screen viewer until the user closes it."""
@@ -976,7 +1016,7 @@ class AgentScreen:
             if result.text:
                 await self._print_above(lambda: result.text, pad_before=True)
             if result.clear_screen:
-                await run_in_terminal(self._reset_screen)
+                self._reset_screen()
             if result.transcript:
                 await self._open_transcript()
             if result.quit:
@@ -1151,3 +1191,9 @@ class AgentScreen:
 
     def run(self) -> None:
         asyncio.run(self.run_async())
+        # The full-screen view is gone: leave the conversation in the normal scrollback.
+        try:
+            self.console.file.write("".join(self._scrollback))
+            self.console.file.flush()
+        except Exception:
+            pass

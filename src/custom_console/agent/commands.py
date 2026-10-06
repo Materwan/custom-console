@@ -1,6 +1,6 @@
-"""The agent's slash commands: /model /provider /remind /reminders /unremind /notify-after /usage /context /compact
-/clear /undo /init /todo /permissions, plus the file commands of the shell (/ls /cd /cat ...). /model and /provider
-are the Clara server's own commands, run there."""
+"""The agent's slash commands: /model /remind /reminders /unremind /notify-after /usage /context /compact
+/clear /undo /init /todo /permissions, plus the file commands of the shell (/ls /cd /cat ...). They are the user's own:
+what the server's administrators manage (provider, server model, which models users may choose) is not here."""
 
 from __future__ import annotations
 
@@ -101,7 +101,6 @@ class AgentCommands:
     def __init__(self, app: "AgentConsole") -> None:
         self.app = app
         self.renderer = app.renderer
-        self._remote_commands: Optional[list] = None
 
     # -- helpers ------------------------------------------------------------------ #
 
@@ -116,17 +115,6 @@ class AgentCommands:
     def register(self, registry: SlashRegistry) -> None:
         add = registry.add
         add(SlashCommand("model", "show or choose the model Clara answers you with (among those an administrator offers)", self.model, "[N|NAME|default]", self.complete_model))
-        add(SlashCommand("server-model", "show or change the server's own model (needs CLARA_ADMIN_TOKEN)", self._on_server("model"), "[MODEL]", self._complete_on_server("model")))
-        add(SlashCommand("models", "which models users may choose, what they cost, Discord's (needs CLARA_ADMIN_TOKEN)", self._on_server("models"), "[list|refresh|enable|disable|weight|discord ...]", self._complete_on_server("models")))
-        add(
-            SlashCommand(
-                "provider",
-                "show or change where the server runs the model (needs CLARA_ADMIN_TOKEN)",
-                self._on_server("provider"),
-                "[local|cloud]",
-                self._complete_on_server("provider"),
-            )
-        )
         add(SlashCommand("remind", "a notification for you at a time, on your Clara clients", self.remind, "[daily|weekly|monthly] [@SURFACES] WHEN TEXT", self.complete_remind))
         add(SlashCommand("reminders", "your reminders that have not fired yet", self.reminders))
         add(SlashCommand("unremind", "cancel one of your reminders", self.unremind, "ID", self.complete_unremind))
@@ -228,44 +216,6 @@ class AgentCommands:
         for choice in ["default", *names]:
             if choice.lower().startswith(arguments.lower()):
                 yield Completion(choice, start_position=-len(arguments))
-
-    # -- /provider, /server-model: the server's own commands ------------------------------------ #
-
-    def _server_commands(self) -> list:
-        """The server's console commands (for completion), asked once and kept."""
-        if self._remote_commands is None:
-            try:
-                self._remote_commands = self.app.client.admin_commands()
-            except ClaraError:
-                self._remote_commands = []
-        return self._remote_commands
-
-    def _on_server(self, name: str):
-        """A handler that runs `/name arguments` in the Clara server's console."""
-
-        def handler(arguments: str) -> CommandResult:
-            try:
-                output = self.app.client.admin(f"/{name} {arguments}".strip())
-                health = self.app.client.health() if arguments else None
-            except ClaraError as error:
-                return self._error(str(error))
-            if health:  # the model or the provider may have changed
-                self.app.model_changed(str(health.get("model") or self.app.model), str(health.get("provider") or ""))
-            return CommandResult(self.renderer.text(output))
-
-        return handler
-
-    def _complete_on_server(self, name: str):
-        def completer(arguments: str) -> Iterator[Completion]:
-            if " " in arguments:
-                return
-            for entry in self._server_commands():
-                if entry.get("name") == name:
-                    for choice in entry.get("choices", []):
-                        if choice.startswith(arguments.lower()):
-                            yield Completion(choice, start_position=-len(arguments))
-
-        return completer
 
     # -- /remind, /reminders, /unremind: shown on your own clients ------------------------------ #
 

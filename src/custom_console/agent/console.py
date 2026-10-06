@@ -74,7 +74,6 @@ class AgentConsole:
             settings.clara_token,
             user_id=settings.agent_user_id,
             user_name=settings.clara_user_name,
-            admin_token=settings.clara_admin_token,
             password=settings.clara_password if settings.clara_user else None,
             timezone=settings.clara_timezone,
         )

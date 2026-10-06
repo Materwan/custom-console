@@ -31,14 +31,12 @@ def pdf_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         output_path: Optional[str] = None,
         pages: Optional[List[int]] = None,
     ) -> ToolResult:
-        """Convert a local PDF into a Markdown file, keeping formulas and tables, then read
-        the Markdown with file_system_read. To convert a PDF from the reMarkable, copy it
-        to a local folder first.
+        """Convert a local PDF into a Markdown file (formulas and tables kept), then read it with file_system_read. Copy a reMarkable PDF to a local folder first.
 
         Args:
-            path: the PDF file.
-            output_path: Markdown file to create (default: next to the PDF, with a .md extension).
-            pages: 0-based page numbers to convert (default: all pages).
+            path: the PDF
+            output_path: Markdown file (default: next to the PDF)
+            pages: 0-based page numbers (default: all)
         """
         source = files.local_path(path, "pdf_to_markdown")
         if not os.path.isfile(source):
@@ -62,15 +60,12 @@ def pdf_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         output_path: Optional[str] = None,
         include_handwriting: bool = True,
     ) -> ToolResult:
-        """Convert a reMarkable .rmdoc document into a PDF. A document copied from the
-        reMarkable arrives as an .rmdoc file: use this to get its PDF (the original PDF,
-        with my handwriting and highlights drawn on it; a notebook becomes handwritten pages).
-        Then read the PDF with pdf_to_markdown if you need its text.
+        """Convert a reMarkable .rmdoc (copy it locally first) into a PDF with my handwriting drawn on it. Read its text with pdf_to_markdown.
 
         Args:
-            path: the local .rmdoc file (copy it from the reMarkable first).
-            output_path: PDF file to create (default: next to the .rmdoc, with a .pdf extension).
-            include_handwriting: draw the handwriting on the pages (default); false extracts the original PDF untouched.
+            path: the local .rmdoc
+            output_path: PDF to create (default: next to it)
+            include_handwriting: false extracts the original PDF untouched
         """
         source = files.local_path(path, "rmdoc_to_pdf")
         target = files.local_path(output_path, "rmdoc_to_pdf") if output_path else default_output(source)

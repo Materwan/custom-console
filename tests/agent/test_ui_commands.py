@@ -186,8 +186,11 @@ class TestCommandsInTheScreen:
         h = Harness(simple_runner, banner="BANNER-TEXT", commands=registry_with())
 
         def driver(h):
+            h.send("hello\r")
+            wait_for(lambda: "hello" in h.output and h.idle())
             h.send("/clear\r")
-            wait_for(lambda: h.output.count("BANNER-TEXT") == 2)
+            wait_for(lambda: "hello" not in h.output)
+            assert h.output.count("BANNER-TEXT") == 1
 
         h.run(driver)  # the harness ends with /bye, which must quit the loop
 
@@ -283,80 +286,63 @@ class TestQuestionDefaults:
 
 
 # --------------------------------------------------------------------------- #
-# Layout height
+# The input stays at the bottom: the conversation scrolls in its own pane
 # --------------------------------------------------------------------------- #
 
+PAGE_UP, PAGE_DOWN = "\x1b[5~", "\x1b[6~"
 
-class TestLayoutNeverShrinks:
-    def test_the_filler_keeps_the_height_a_question_made_necessary(self):
-        release, started = threading.Event(), threading.Event()
-        holder = {}
 
-        def runner(view, cancel):
-            view.add_text("a line")
-            holder["h"].screen.ask_permission("First line of the question.\nSecond line.\nThird line.")
-            started.set()
-            release.wait(5)
+def long_answer(view, cancel):
+    view.add_text("\n\n".join(f"line {i}" for i in range(200)))
 
-        h = holder["h"] = Harness(runner)
+
+class TestFixedInput:
+    def test_the_screen_is_full_screen_and_the_input_is_the_last_row(self):
+        h = Harness(simple_runner)
+
+        def driver(h):
+            assert h.screen._app.full_screen
+            children = h.screen._app.layout.container.children
+            assert children[-1].content.buffer is h.screen._buffer  # the input
+            assert children[0] is h.screen._pane  # the conversation fills what is above
+
+        h.run(driver)
+
+    def test_the_pane_follows_the_bottom_and_can_be_scrolled_back(self):
+        h = Harness(long_answer)
         seen = {}
 
         def driver(h):
             h.send("go\r")
-            wait_for(lambda: h.screen._question is not None)
-            h.screen._filler_rows()  # one render while the question is on screen
-            seen["asked_peak"] = h.screen._peak
-            seen["asked_filler"] = h.screen._filler_rows()
-            h.send("y\r")
-            assert started.wait(5)
-            wait_for(lambda: h.screen._question is None)
-            seen["after_filler"] = h.screen._filler_rows()
-            release.set()
-            wait_for(h.idle)
-            seen["idle_peak"] = h.screen._peak
+            wait_for(lambda: "line 199" in h.output and h.idle())
+            wait_for(lambda: h.screen._total > 60)
+            screen = h.screen
+            seen["bottom"] = screen._top
+            h.send(PAGE_UP)
+            wait_for(lambda: not screen._follow)
+            seen["scrolled"] = screen._top
+            seen["header"] = joined(screen._header_fragments())
+            seen["input_still_there"] = screen._app.layout.container.children[-1].content.buffer is screen._buffer
+            h.send(PAGE_DOWN * 50)
+            wait_for(lambda: screen._follow)
+            seen["back"] = screen._top
 
         h.run(driver)
-        assert seen["asked_filler"] == 0 and seen["asked_peak"] >= 4
-        assert seen["after_filler"] == 3  # the three question rows are kept as blank rows
-        assert seen["idle_peak"] < seen["asked_peak"]  # the printed turn took the place of filler rows
+        assert seen["bottom"] > 0 and 0 < seen["scrolled"] < seen["bottom"] and seen["back"] == seen["bottom"]
+        assert "scrolled" in seen["header"] and len(seen["header"]) <= 80
+        assert seen["input_still_there"]
 
-    def test_printed_text_takes_the_place_of_filler_rows(self):
-        release = threading.Event()
-
-        def runner(view, cancel):
-            view.add_text("\n".join(f"row {i}" for i in range(6)))
-            release.wait(5)
-
-        h = Harness(runner)
-        seen = {}
+    def test_new_output_brings_the_pane_back_to_the_bottom(self):
+        h = Harness(long_answer)
 
         def driver(h):
             h.send("go\r")
-            wait_for(lambda: "❯ go" in h.output)  # the prompt is printed as soon as the turn starts
-            wait_for(lambda: h.screen._filler_rows() >= 0 and h.screen._peak >= 6)
-            seen["peak"], seen["printed"] = h.screen._peak, len(h.output)
-            release.set()
+            wait_for(lambda: "line 199" in h.output and h.idle())
+            wait_for(lambda: h.screen._total > 60)
+            h.send(PAGE_UP)
+            wait_for(lambda: not h.screen._follow)
+            h.send("again\r")
+            wait_for(lambda: h.screen._follow)
             wait_for(h.idle)
-            seen["after"] = h.screen._peak
-
-        out = h.run(driver)
-        rows = out[seen["printed"] :].count("\n")
-        # No blank rows go to the scrollback: the filler keeps the input on the last row instead.
-        assert seen["peak"] >= 6 and seen["after"] == max(0, seen["peak"] - rows)
-        assert not out.rstrip(" ").endswith("\n\n\n")
-
-    def test_a_suggestion_list_that_disappears_leaves_its_height_as_blank_space(self):
-        h = Harness(simple_runner, commands=registry_with(model_command()))
-        seen = {}
-
-        def driver(h):
-            h.send("/")
-            wait_for(lambda: h.screen._suggestion_lines())
-            h.screen._filler_rows()
-            seen["peak"] = h.screen._peak
-            h.send("\x15")
-            wait_for(lambda: not h.screen._suggestion_lines())
-            seen["filler"] = h.screen._filler_rows()
 
         h.run(driver)
-        assert seen["peak"] >= 3 and seen["filler"] == seen["peak"]

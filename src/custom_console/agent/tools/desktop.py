@@ -64,11 +64,10 @@ def desktop_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, PermissionLevel.WRITE, rule=open_rule, describe=lambda target: f"Agent wants to open {target}")
     def open_path(target: str) -> ToolResult:
-        """Open a file with its usual application (a PDF in the reader...), a folder in the
-        explorer, or a URL in the browser, on the user's screen.
+        """Open a file with its usual application, a folder in the explorer or a URL, on the user's screen.
 
         Args:
-            target: a path or an http(s)/mailto URL.
+            target: a path or an http(s)/mailto URL
         """
         resolved = target_of(target)
         os.startfile(resolved)  # type: ignore[attr-defined]
@@ -81,11 +80,10 @@ def desktop_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         describe=lambda name: f"Agent wants to start the application {name!r}",
     )
     def launch_app(name: str) -> ToolResult:
-        """Start an application by its name (e.g. "firefox", "code", "spotify"), as the shell's
-        `launch` command does.
+        """Start an application by name ("firefox", "code"), like the shell `launch`.
 
         Args:
-            name: the application's name.
+            name: the application's name
         """
         path = find_application(name, level=APP_SEARCH_LEVEL, saved=SavedApps(ctx.settings.saved_apps_path))
         if not path:
@@ -102,10 +100,10 @@ def desktop_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, PermissionLevel.WRITE, describe=lambda text: f"Agent wants to put {len(text)} characters in your clipboard")
     def clipboard_write(text: str) -> ToolResult:
-        """Put text in the user's clipboard (it replaces what was there), for them to paste.
+        """Put text in the user's clipboard (replaces its content), for them to paste.
 
         Args:
-            text: the text.
+            text: the text
         """
         if len(text) > CLIPBOARD_MAX_CHARS:
             raise ValueError(f"At most {CLIPBOARD_MAX_CHARS} characters.")

@@ -31,12 +31,12 @@ def mail_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, PermissionLevel.WRITE, describe=describe, rule=lambda recipient, **_: f"send_email:{recipient.strip().lower()}")
     def send_email(recipient: str, subject: str, content: str = "") -> ToolResult:
-        """Send an email.
+        """Send a plain-text email.
 
         Args:
-            recipient: destination address.
-            subject: subject line.
-            content: plain text body.
+            recipient: address
+            subject: subject line
+            content: plain text body
         """
         sender = settings.smtp_from or settings.smtp_user
         if not sender:

@@ -16,7 +16,7 @@ def test_defaults_are_relative_to_the_root(tmp_path):
     assert s.agent_sessions_dir == s.agent_dir / "sessions" and s.agent_keep_sessions == 5
     assert s.agent_checkpoints_dir == s.agent_dir / "checkpoints"
     assert s.agent_project_file == "AGENT.md"
-    assert s.clara_url == "http://127.0.0.1:8765" and s.clara_token is None and s.clara_admin_token is None
+    assert s.clara_url == "http://127.0.0.1:8765" and s.clara_token is None
     assert s.clara_user_name is None and s.agent_user_id == "default_user"
     assert s.agent_permission_level == 1
     assert s.rmapi_path is None and not s.rmapi_available
@@ -43,7 +43,6 @@ def test_overrides(tmp_path):
         "AGENT_PROJECT_FILE": "NOTES.md",
         "CLARA_URL": "http://server:9000/",
         "CLARA_TOKEN": "chat-token",
-        "CLARA_ADMIN_TOKEN": "admin-token",
         "CLARA_USER_NAME": "Erwan",
     }
     s = load(env, tmp_path)
@@ -54,10 +53,9 @@ def test_overrides(tmp_path):
     assert s.smtp_port == 2525
     assert s.wsl_distro == "Debian"
     assert s.agent_project_file == "NOTES.md"
-    assert (s.clara_url, s.clara_token, s.clara_admin_token, s.clara_user_name) == (
+    assert (s.clara_url, s.clara_token, s.clara_user_name) == (
         "http://server:9000",
         "chat-token",
-        "admin-token",
         "Erwan",
     )
 

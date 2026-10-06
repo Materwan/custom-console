@@ -222,17 +222,13 @@ def shell_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
     def run_command(
         command: str, timeout: int = DEFAULT_TIMEOUT, shell: Shell = "cmd", background: bool = False
     ) -> ToolResult:
-        """Run a shell command in the working directory and return its output (stdout and
-        stderr together). The command cannot read the keyboard; give it options that avoid
-        prompts. Changes made by commands cannot be undone, so prefer the file_system_*
-        tools to change files.
+        """Run a shell command in the working directory (stdout and stderr together). It cannot read the keyboard: avoid prompts. Not undoable: prefer file_system_* to change files.
 
         Args:
-            command: the command line.
-            timeout: seconds before the command is killed (default 60, at most 600).
-            shell: "cmd" (default) or "powershell".
-            background: start it and return at once (for servers, watchers, long builds); read
-                its output with command_output and stop it with command_stop.
+            command: the command line
+            timeout: seconds before it is killed (default 60, max 600)
+            shell: "cmd" or "powershell"
+            background: return at once (servers, long builds); read it with command_output, stop it with command_stop
         """
         cwd = working_directory()
         if background:
@@ -271,8 +267,8 @@ def shell_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         """What a background command printed since you last asked, and whether it still runs.
 
         Args:
-            job_id: the job number run_command gave.
-            wait_seconds: wait up to this many seconds for it to end first (at most 120).
+            job_id: the number run_command gave
+            wait_seconds: wait for it to end first (max 120)
         """
         process = job(job_id)
         deadline = time.monotonic() + max(0, min(int(wait_seconds), MAX_WAIT))
@@ -285,10 +281,10 @@ def shell_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, PermissionLevel.NONE)
     def command_stop(job_id: str) -> ToolResult:
-        """Stop a background command (and everything it started).
+        """Stop a background command and what it started.
 
         Args:
-            job_id: the job number run_command gave.
+            job_id: the number run_command gave
         """
         process = job(job_id)
         process.stop()

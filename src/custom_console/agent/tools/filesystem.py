@@ -404,20 +404,20 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, reading("path"))
     def file_system_list(path: str = ".", show_hidden: bool = False) -> ToolResult:
-        """List a directory. Sub-directories end with "/".
+        """List a directory ("/" suffix = folder).
 
         Args:
-            path: directory to list (relative to the working directory, or absolute).
-            show_hidden: include entries starting with a dot.
+            path: directory (relative or absolute)
+            show_hidden: include dot entries
         """
         return ToolResult.ok(files.listdir(path, show_hidden))
 
     @guarded(ctx, reading("path"))
     def file_system_cd(path: str) -> ToolResult:
-        """Change the working directory (also switches between drives, WSL and reMarkable).
+        """Change the working directory (also switches drive, WSL, reMarkable).
 
         Args:
-            path: the folder to move into.
+            path: the folder to move into
         """
         files.change_directory(path)
         return ToolResult.ok(f"Changed directory to {files.location}")
@@ -427,18 +427,18 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         """Show the tree of a directory.
 
         Args:
-            path: directory to show.
-            depth: levels to expand (-1 = unlimited).
-            show_hidden: include entries starting with a dot.
+            path: directory
+            depth: levels (-1 = unlimited)
+            show_hidden: include dot entries
         """
         return ToolResult.ok("\n".join(files.tree(path, depth, show_hidden)))
 
     @guarded(ctx, reading("path"))
     def file_system_stat(path: str) -> ToolResult:
-        """Return the readable/writable/executable permissions of a path.
+        """Permissions (r/w/x) of a path.
 
         Args:
-            path: the file or folder to inspect.
+            path: file or folder
         """
         return ToolResult.ok(files.stat(path)._asdict())
 
@@ -446,26 +446,24 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, reading("path"))
     def file_system_find(pattern: str, path: str = ".", depth: int = 2, strict: bool = False) -> ToolResult:
-        """Find files and directories by name (also works on the reMarkable).
+        """Find entries by name (also on the reMarkable).
 
         Args:
-            pattern: case-insensitive regex on the entry name; a trailing "/" restricts
-                the search to directories.
-            path: directory to search in.
-            depth: how many levels to go down (1 = direct children only).
-            strict: the whole name must match the pattern.
+            pattern: case-insensitive regex on the name; trailing "/" = folders only
+            path: directory to search
+            depth: levels (1 = direct children)
+            strict: the whole name must match
         """
         return ToolResult.ok(files.find(pattern, path, depth, strict))
 
     @guarded(ctx, reading("path"))
     def file_system_glob(pattern: str, path: str = ".", max_results: int = 200) -> ToolResult:
-        """Find local files by glob pattern, most recently modified first.
+        """Find local files by glob, newest first.
 
         Args:
-            pattern: e.g. "**/*.py", "src/**/test_*.py" or "*.md" (without "/" it matches
-                names at any depth). A trailing "/" matches directories only.
-            path: directory to search in.
-            max_results: maximum number of paths returned.
+            pattern: e.g. "**/*.py"; without "/" it matches names at any depth; trailing "/" = folders only
+            path: directory to search
+            max_results: maximum number of paths
         """
         root = files.local_path(path, "glob")
         if not os.path.isdir(root):
@@ -494,17 +492,15 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         context: int = 0,
         max_matches: int = 100,
     ) -> ToolResult:
-        """Search the content of local text files with a regular expression.
-
-        Output lines look like "relative/path:LINE:text" (context lines use "-" instead of ":").
+        """Regex search in local text files. Output "path:LINE:text" ("-" for context lines).
 
         Args:
-            pattern: regular expression (Python syntax).
-            path: file or directory to search (directories are searched recursively).
-            include: only files whose path matches this glob, e.g. "*.py" or "src/**/*.ts".
-            ignore_case: case-insensitive search.
-            context: lines of context to show around each match.
-            max_matches: stop after this many matching lines.
+            pattern: regex (Python syntax)
+            path: file or directory (recursive)
+            include: glob filter, e.g. "*.py"
+            ignore_case: case-insensitive
+            context: lines around each match
+            max_matches: stop after this many matching lines
         """
         try:
             regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
@@ -565,20 +561,15 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         max_chars: int = 20000,
         line_numbers: bool = False,
     ) -> ToolResult:
-        """Read a text file. Read a file before editing it. A long file is cut: the answer
-        then says which lines were shown and where to go on with mode "range".
+        """Read a text file; read a file before editing it. A long file is cut and the answer says how to continue with mode "range".
 
         Args:
-            path: file to read.
-            mode: "full" = whole file; "range" = lines start_line..end_line (1-based,
-                inclusive; end_line may be left out); "summary" = outline of a Python
-                file (classes/functions), or the first 50 lines of any other file.
-            start_line: first line for "range".
-            end_line: last line for "range" (default: the end of the file).
-            max_chars: the answer is cut beyond this many characters (there is also a
-                limit set by the context window).
-            line_numbers: put each line's number before it, followed by a tab. The numbers
-                are not part of the file: never copy them into an edit.
+            path: file to read
+            mode: "full", "range" (start_line..end_line, 1-based) or "summary" (Python outline, else the first 50 lines)
+            start_line: first line for "range"
+            end_line: last line for "range" (default: the end)
+            max_chars: the answer is cut beyond this
+            line_numbers: prefix each line with its number (not part of the file: never copy it into an edit)
         """
         read = files.read(path, max_bytes=MAX_READ_BYTES)
         all_lines = read.text.split("\n")
@@ -632,14 +623,12 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, writing("path"), describe=preview_write)
     def file_system_write(path: str, content: str, overwrite: bool = True) -> ToolResult:
-        """Create a text file, or replace an existing one entirely (missing folders are
-        created). To change part of an existing file prefer file_system_edit; an existing
-        file must have been read first.
+        """Create or replace a whole text file (creates folders; an existing file must have been read first). To change part of a file prefer file_system_edit.
 
         Args:
-            path: file to write.
-            content: the complete new content.
-            overwrite: when False, fail instead of replacing an existing file.
+            path: file to write
+            content: the complete new content
+            overwrite: false = fail instead of replacing
         """
         local = files.local_path(path, "write")
         if os.path.isdir(local):
@@ -670,40 +659,34 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, writing("path"), describe=preview_edit)
     def file_system_edit(path: str, old_text: str, new_text: str, replace_all: bool = False) -> ToolResult:
-        """Replace exact text in a file. The file must have been read first. old_text must
-        match the file exactly (including indentation) and be unique, unless replace_all.
-        When it is not found, the error shows the closest passage of the file.
+        """Replace exact text in a file. The file must have been read first. old_text must match exactly (indentation included) and be unique unless replace_all; if it is not found the error shows the closest passage.
 
         Args:
-            path: file to edit.
-            old_text: the exact text to replace; include enough surrounding lines to be unique.
-            new_text: the replacement text.
-            replace_all: replace every occurrence of old_text.
+            path: file to edit
+            old_text: the exact text to replace; add surrounding lines to make it unique
+            new_text: the replacement
+            replace_all: replace every occurrence
         """
         return change_file(path, lambda text: apply_edit(text, old_text, new_text, replace_all))
 
     @guarded(ctx, writing("path"), describe=preview_edits)
     def file_system_multi_edit(path: str, edits: List[Dict[str, Any]]) -> ToolResult:
-        """Make several replacements in one file at once: all of them, or none if one fails.
-        Same rules as file_system_edit for each; they are applied in order, each on the
-        result of the previous one.
+        """Several file_system_edit replacements in one file, applied in order: all or none.
 
         Args:
-            path: file to edit (read it first).
-            edits: the replacements, each {"old_text": "...", "new_text": "...",
-                "replace_all": false}.
+            path: file to edit (read it first)
+            edits: the replacements, each {"old_text", "new_text", "replace_all"}
         """
         return change_file(path, lambda text: apply_edits(text, edits))
 
     @guarded(ctx, writing("src", "dst"))
     def file_system_copy(src: str, dst: str, recursive: bool = False) -> ToolResult:
-        """Copy a file or directory (local, WSL, reMarkable).
+        """Copy a file or folder (local, WSL, reMarkable).
 
         Args:
-            src: source path.
-            dst: destination path; an existing directory receives the copy. From
-                reMarkable, `dst` is the local destination folder.
-            recursive: required to copy a directory.
+            src: source
+            dst: destination; an existing folder receives the copy
+            recursive: required for a folder
         """
         source, destination = files.resolve(src), files.resolve(dst)
         if source.backend is Backend.LOCAL and destination.backend is Backend.LOCAL:
@@ -714,12 +697,11 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, writing("src", "dst", strict=("src",)))
     def file_system_move(src: str, dst: str) -> ToolResult:
-        """Move or rename a local file or directory. An existing directory `dst` receives
-        the source; an existing file is never overwritten.
+        """Move or rename a local file or folder; an existing file is never overwritten.
 
         Args:
-            src: what to move.
-            dst: new path, or the directory to move it into.
+            src: what to move
+            dst: new path, or the folder to move it into
         """
         origin = files.local_path(src, "mv")
         final = files.move(src, dst)
@@ -729,12 +711,11 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     @guarded(ctx, writing("path", strict=("path",)))
     def file_system_remove(path: str, recursive: bool = False) -> ToolResult:
-        """Delete a file or a directory (`recursive` for a non-empty one). Refuses drive
-        roots, the home folder and any folder containing the current directory.
+        """Delete a file or folder. Refuses drive roots, the home folder and any folder containing the current directory.
 
         Args:
-            path: what to delete.
-            recursive: delete a directory with everything in it.
+            path: what to delete
+            recursive: needed for a non-empty folder
         """
         files.check_removable(path)
         target = files.resolve(path)

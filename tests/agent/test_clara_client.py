@@ -14,7 +14,7 @@ import pytest
 from custom_console.agent.clara import ClaraClient, ClaraError, NothingToCompact
 from custom_console.agent.remote import run_remote_turn
 
-CHAT, ADMIN = "chat-token", "admin-token"
+CHAT = "chat-token"
 
 
 class State:
@@ -22,7 +22,6 @@ class State:
         self.bodies = []
         self.results = {}
         self.answered = threading.Event()
-        self.admin_lines = []
         self.deleted = []
         self.closed_early = threading.Event()
         self.reminder_bodies = []
@@ -31,7 +30,6 @@ class State:
         self.stream_paths = []
         self.logins = []  # bodies of POST /v1/auth/login
         self.user_tokens = set()  # tokens the server gave and still accepts
-        self.admin_user = False  # the user who signs in is an administrator
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -56,7 +54,7 @@ class Handler(BaseHTTPRequestHandler):
     def allowed(self, token):
         sent = self.headers.get("Authorization", "")
         signed_in = sent.removeprefix("Bearer ") in self.state.user_tokens
-        if sent == f"Bearer {token}" or (signed_in and (token == CHAT or self.state.admin_user)):
+        if sent == f"Bearer {token}" or (signed_in and token == CHAT):
             return True
         self.reply(401, {"detail": "Missing or invalid token"})
         return False
@@ -69,8 +67,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self.reply(200, {"status": "ok", "provider": "local", "model": "fake"})
-        if self.path == "/v1/admin/commands":
-            return self.reply(200, [{"name": "provider", "choices": ["local", "cloud"]}]) if self.allowed(ADMIN) else None
         if self.path.startswith("/v1/conversations/"):
             if not self.allowed(CHAT):
                 return
@@ -156,12 +152,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.state.notification_bodies.append(self.body)
                 self.reply(201, {"id": 1, "targets": self.body["targets"]})
             return
-        if self.path == "/v1/admin/command":
-            if self.allowed(ADMIN):
-                line = self.body["line"]
-                self.state.admin_lines.append(line)
-                self.reply(200, {"output": f"ran {line}", "quit": False})
-            return
         self.reply(404, {"detail": "no such route"})
 
     def stream(self):
@@ -213,7 +203,7 @@ def server():
 
 
 def client_for(url, token=CHAT, **options):
-    return ClaraClient(url, token, user_id="erwan", user_name="Erwan", admin_token=ADMIN, **options)
+    return ClaraClient(url, token, user_id="erwan", user_name="Erwan", **options)
 
 
 class TestBody:
@@ -372,25 +362,6 @@ class TestOtherCalls:
             client_for(url).compact("empty")
         assert isinstance(caught.value, LookupError) and isinstance(caught.value, ClaraError)
 
-    def test_admin_commands_use_the_admin_token(self, server):
-        url, state = server
-        client = client_for(url)
-        assert client.admin("/provider cloud") == "ran /provider cloud"
-        assert state.admin_lines == ["/provider cloud"]
-        assert client.admin_commands() == [{"name": "provider", "choices": ["local", "cloud"]}]
-
-    def test_the_chat_token_is_not_an_admin_token(self, server):
-        url, _ = server
-        client = ClaraClient(url, CHAT, user_id="u", admin_token=CHAT)
-        with pytest.raises(ClaraError, match="401"):
-            client.admin("/status")
-
-    def test_without_an_admin_token_the_commands_explain(self):
-        client = ClaraClient("http://x", CHAT, user_id="u")
-        with pytest.raises(ClaraError, match="CLARA_ADMIN_TOKEN"):
-            client.admin("/status")
-        assert client.admin_commands() == []
-
 
 class TestReminders:
     def test_a_reminder_is_sent_with_who_set_it(self, server):
@@ -508,14 +479,3 @@ class TestPassword:
         with pytest.raises(ClaraError, match="401"):
             ClaraClient(url, "wrong", user_id="erwan").notify("x")
         assert state.logins == []
-
-    def test_an_administrator_user_needs_no_admin_token(self, server):
-        url, state = server
-        state.admin_user = True
-        client = self.user(url)
-        assert client.admin("/status") == "ran /status"
-        assert [c["name"] for c in client.admin_commands()] == ["provider"]
-
-    def test_a_user_who_is_not_an_administrator_just_has_no_completion(self, server):
-        url, _ = server
-        assert self.user(url).admin_commands() == []

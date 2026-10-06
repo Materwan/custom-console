@@ -56,7 +56,6 @@ class ClaraClient:
         user_id: str,
         user_name: Optional[str] = None,
         surface: str = "console",
-        admin_token: Optional[str] = None,
         password: Optional[str] = None,
         session: Optional[requests.Session] = None,
         timezone: Optional[str] = None,
@@ -66,7 +65,6 @@ class ClaraClient:
         self.url = url.rstrip("/")
         self.token = token
         self.password = password
-        self.admin_token = admin_token
         self.user_id = user_id
         self.user_name = user_name
         self.surface = surface
@@ -333,20 +331,3 @@ class ClaraClient:
         if response.status_code >= 400:
             raise ClaraError(f"Clara server: {_detail(response)} (HTTP {response.status_code})")
         return response.json()
-
-    def admin(self, line: str) -> str:
-        """Run a command of the server's console (/provider, /model...); needs the admin token, or to be signed
-        in as an administrator."""
-        if not self.admin_token and not self.password:
-            raise ClaraError("No admin token: set CLARA_ADMIN_TOKEN in the .env file to use the server's commands.")
-        response = self._request("POST", "/v1/admin/command", token=self.admin_token, json={"line": line})
-        return response.json().get("output", "")
-
-    def admin_commands(self) -> List[Dict[str, Any]]:
-        """The server's console commands, with the values they complete."""
-        if not self.admin_token and not self.password:
-            return []
-        try:
-            return self._request("GET", "/v1/admin/commands", token=self.admin_token).json()
-        except ClaraError:
-            return []  # signed in as a user who is not an administrator

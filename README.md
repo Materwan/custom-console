@@ -43,7 +43,6 @@ project root (see `.env.example`; empty values mean "use the default").
 | `CLARA_URL` | `http://127.0.0.1:8765` | The Clara server the agent talks to |
 | `CLARA_USER`, `CLARA_PASSWORD` | – | Your user name and password on that server (the administrator makes them with `/user add`): `ai agent` signs in by itself, and the server knows it is you |
 | `CLARA_TOKEN` | – | Instead of a user: a chat token (`CLARA_TOKENS` there). Required by `ai agent` when there is no `CLARA_USER` |
-| `CLARA_ADMIN_TOKEN` | – | Optional: lets `/server-model`, `/models` and `/provider` run in the server's console (not needed when `CLARA_USER` is an administrator) |
 | `CLARA_USER_NAME` | – | How Clara should call you |
 | `CLARA_TIMEZONE` | this computer's | Your time zone (IANA name, `Europe/Paris`), sent with each message: the server tells the model the date and time in it |
 | `OLLAMA_HOST` | `http://localhost:11434` | The local Ollama of `ai list` / `ai start` (not used by the agent) |
@@ -131,20 +130,22 @@ this machine, and the permissions, the free zone and `/undo` work exactly as bef
 Which model runs, and where (Ollama on the server's computer, or ollama.com with an API
 key), is the server's business, but you choose among the models an administrator offers:
 `/model` lists them with what a token of each costs in credits and sets the one the console
-is answered by (it is yours, kept by the server, separately from your other clients). The
-server's own commands, `/provider`, `/server-model` and `/models` (which models users may
-choose, their weights), need `CLARA_ADMIN_TOKEN` (the server's remote-admin token). The
-header and `/usage` follow whatever model the server used for each turn.
+is answered by (it is yours, kept by the server, separately from your other clients). Managing
+the server itself (its provider, its own model, which models users may choose) is done on its
+web site or console, not here. The header and `/usage` follow whatever model the server used for each turn.
 
 ### Terminal behaviour
 
-The input is pinned at the bottom of the terminal; it grows with what you type (long
-lines wrap, `Shift+Tab` starts a new line, up to 10 rows).
+The screen is full-screen: the conversation scrolls in its own pane (mouse wheel, `PgUp` /
+`PgDn`; `Shift`+drag selects text), and the header rule and the input are **fixed at the
+bottom of the window**, whatever the scroll position. New output follows the bottom unless
+you scrolled up (the rule then says `↑ scrolled`). The input grows with what you type (long
+lines wrap, `Shift+Tab` starts a new line, up to 10 rows). When you leave, the conversation
+is written back to the normal terminal scrollback.
 
 While the agent answers, what is final (a finished paragraph, a finished tool call) is
-printed **as it comes** into the normal scrollback, rendered as **Markdown**, so you can
-scroll back, select and copy during the answer. Only the part still being written stays
-in a live area above the input, as plain text. A paragraph counts as finished once the
+added to the pane **as it comes**, rendered as **Markdown**. Only the part still being
+written stays in a live area above the input, as plain text. A paragraph counts as finished once the
 next one starts (never in the middle of a code block or a list). The model's reasoning, for
 the models that show it, streams there too (its last lines), then folds into one line
 (`✻ thought for 4.2s`, unfolded by `Ctrl+O`); so does the output of a running command.
@@ -169,7 +170,7 @@ sub-agent's work) is shown under it once you press `Ctrl+O` (or `/details`), fro
 `Ctrl+T` (or `/transcript`) opens the whole conversation in a full-screen viewer where any
 tool line unfolds: `Tab`/`Shift+Tab` select the next/previous tool line, `Enter` or a
 **click** unfolds it, `a` unfolds everything, the arrows, `PgUp`/`PgDn`/`Space` and the
-mouse wheel scroll, `q` or `Esc` goes back (your scrollback is left untouched). The checklist's
+mouse wheel scroll, `q` or `Esc` goes back (the conversation pane is left untouched). The checklist's
 final state is printed at the end of each turn.
 
 | Key | Action |
@@ -194,9 +195,6 @@ Typing `/` lists them above the input, with what they do.
 | Command | What it does |
 |---|---|
 | `/model [N\|NAME\|default]` | the models an administrator offers you, with their cost in credits per token; choose the one the console is answered by (`default`: the server's own) |
-| `/server-model [NAME]` | the server's `/model`: list the models of its provider, or switch its own (needs `CLARA_ADMIN_TOKEN`) |
-| `/models [list\|enable\|disable\|weight\|discord ...]` | the server's `/models`: which models users may choose, what they cost, Discord's model (needs `CLARA_ADMIN_TOKEN`) |
-| `/provider [local\|cloud]` | the server's `/provider`: show where it runs the model, or switch (needs `CLARA_ADMIN_TOKEN`) |
 | `/remind [daily\|weekly\|monthly] [@SURFACES] WHEN TEXT` | a reminder for you, shown on your Clara clients at that time (see below) |
 | `/reminders` `/unremind ID` | your reminders that have not fired yet; cancel one |
 | `/tasks [all\|done]` | your to-do list, kept by Clara: each task with the reminders sent and the next one (see below) |
@@ -499,3 +497,21 @@ pytest
 
 The file system layer and the agent UI are tested without a real tablet, Clara server or
 terminal (`rmapi` is mocked; the UI is driven through prompt_toolkit's pipe input).
+
+## Token budget
+
+Every request carries the tool definitions and the system prompt. Measure them, tool by
+tool, with `python scripts/token_baseline.py` (`--log` adds the calls and result sizes of the
+journal); `/context` and `/usage` give the live and real numbers.
+
+| Change | Static prefix (estimated tokens) |
+|---|---|
+| Baseline: 34 tool definitions + system prompt | 5 223 (tools 4 449, prompt 774) |
+| Tool descriptions cut to "when to use" + non-obvious constraints, one-line parameter docs | tools 3 628 |
+| System prompt rewritten without what the tool descriptions already say | prompt 442 |
+| **Now** | **4 070 (-22 %)** |
+
+Not changed here, because the console already has them: tool results as terse plain text with
+size limits tied to the context window, `/tools` to switch tool groups off (the Moodle group
+alone is ~700 tokens), `/compact`, sub-agents (`task`) for noisy exploration. Per-turn tokens
+before/after and the success rate are not measured: use the console for a while with `/usage`.

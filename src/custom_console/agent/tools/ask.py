@@ -42,16 +42,13 @@ def ask_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         multiple: bool = False,
         allow_other: bool = True,
     ) -> ToolResult:
-        """Ask the user a question and wait for the answer. Use it when you need a decision
-        or a preference that you cannot find out yourself, instead of guessing; do not use
-        it for permission to run a tool (the user is asked anyway).
+        """Ask the user a question and wait: for a decision or preference you cannot find out yourself, never for permission to run a tool.
 
         Args:
-            question: the question, in one or two sentences.
-            options: 2 to 6 possible answers (at most 9), each {"label": "short answer", "description":
-                "what choosing it implies"}. May be empty when allow_other is true.
-            multiple: true when the user may pick several options.
-            allow_other: true to let the user type an answer of their own instead.
+            question: one or two sentences
+            options: 2-6 answers (max 9), each {"label", "description"}; may be empty when allow_other
+            multiple: several options may be picked
+            allow_other: the user may type an answer of their own
         """
         if not question.strip():
             raise ValueError("The question is empty.")

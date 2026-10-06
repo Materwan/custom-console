@@ -47,7 +47,8 @@ class Harness:
 
     @property
     def output(self) -> str:
-        return self.console.file.getvalue()
+        """What the user has seen in the conversation pane (plain text)."""
+        return self.screen.printed_text() if self.screen else ""
 
     def idle(self) -> bool:
         return not self.screen._busy and self.screen._question is None
@@ -412,13 +413,16 @@ class TestSlashCommands:
         h.run(driver)
         assert calls == []
 
-    def test_clear_redraws_the_banner(self):
+    def test_clear_empties_the_pane_and_keeps_the_banner(self):
         h = Harness(simple_runner, banner="BANNER-TEXT")
 
         def driver(h):
-            assert h.output.count("BANNER-TEXT") == 1  # printed at startup
+            assert h.output.count("BANNER-TEXT") == 1  # shown at startup
+            h.send("hello\r")
+            wait_for(lambda: "tokens" in h.output and h.idle())
             h.send("/clear\r")
-            wait_for(lambda: h.output.count("BANNER-TEXT") == 2)
+            wait_for(lambda: "hello" not in h.output)  # the conversation is gone...
+            assert h.output.count("BANNER-TEXT") == 1  # ...the banner is back
 
         h.run(driver)
 

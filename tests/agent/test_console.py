@@ -102,7 +102,11 @@ class Session:
             run_with(self.console_, self.pipe, lambda: driver(self))
         finally:
             self.pipe_ctx.__exit__(None, None, None)
-        return self.out.file.getvalue()
+        return self.text()
+
+    def text(self):
+        """What the user sees in the conversation pane (plain text)."""
+        return self.console_.screen.printed_text()
 
     def send(self, text):
         self.pipe.send_text(text + "\r")
@@ -110,7 +114,7 @@ class Session:
     def wait_output(self, text):
         """Wait for `text` to be printed, then for the screen to be ready for the next input
         (a busy screen keeps typed text instead of acting on it)."""
-        wait_for(lambda: text in self.out.file.getvalue())
+        wait_for(lambda: text in self.text())
         wait_for(self.idle)
 
     def idle(self):
@@ -218,7 +222,7 @@ class TestAgentConsole:
             s.wait_output("Tool details are shown")
             (s.created["work"] / "note.txt").unlink()  # created again: the whole file is the diff
             s.send("write a note")
-            wait_for(lambda: s.out.file.getvalue().count("Done: write a note") == 2)
+            wait_for(lambda: s.text().count("Done: write a note") == 2)
 
         out = session.run(driver)
         assert asked == [None]
@@ -318,7 +322,7 @@ class TestSlashCommands:
             s.send("/cd ..")
             wait_for(s.idle)
             s.send("/pwd")
-            wait_for(lambda: s.out.file.getvalue().count(str(tmp_path).replace("\\", "/")) >= 2)
+            wait_for(lambda: s.text().count(str(tmp_path).replace("\\", "/")) >= 2)
 
         out = session.run(driver)
         assert session.console_.files.location == str(tmp_path).replace("\\", "/")  # shared with the agent's tools
@@ -364,37 +368,20 @@ class TestSlashCommands:
             s.wait_output("Ctrl+C")
 
         out = session.run(driver)
-        for name in ("/model", "/server-model", "/models", "/provider", "/usage", "/context", "/compact", "/undo", "/init", "/ls", "/cd", "/cp", "/rm", "/bye"):
+        for name in ("/model", "/usage", "/context", "/compact", "/undo", "/init", "/ls", "/cd", "/cp", "/rm", "/bye"):
             assert name in out
 
-    def test_server_model_and_provider_are_the_servers_commands(self, tmp_path):
+    def test_the_servers_admin_commands_are_not_offered(self, tmp_path):
         session = Session(tmp_path)
-        session.clara.admin_output["/provider"] = "* local  Local host"
 
         def driver(s):
+            s.send("/help")
+            s.wait_output("Ctrl+C")
             s.send("/provider")
-            s.wait_output("* local  Local host")
-            session.clara.model, session.clara.provider = "gpt-oss:120b", "cloud"  # what the server does
-            s.send("/provider cloud")
-            s.wait_output("ran /provider cloud")
-            s.send("/server-model gpt-oss:120b")
-            s.wait_output("ran /model gpt-oss:120b")  # the server's own /model
+            s.wait_output("Unknown command")
 
-        session.run(driver)
-        assert session.clara.admin_calls == ["/provider", "/provider cloud", "/model gpt-oss:120b"]
-        assert session.console_.model == "gpt-oss:120b" and session.console_.provider_name == "cloud"
-        assert "gpt-oss:120b" in session.console_.screen.title and "(cloud)" in session.console_.screen.title
-
-    def test_models_is_the_servers_catalogue_command(self, tmp_path):
-        session = Session(tmp_path)
-        session.clara.admin_output["/models"] = "Server default: local:fake"
-
-        def driver(s):
-            s.send("/models")
-            s.wait_output("Server default: local:fake")
-
-        session.run(driver)
-        assert session.clara.admin_calls == ["/models"]
+        out = session.run(driver)
+        assert "/server-model" not in out and "/models" not in out and "/provider" not in out.replace("Unknown command: /provider", "")
 
     def test_model_chooses_among_the_models_an_administrator_offers(self, tmp_path):
         session = Session(tmp_path)
@@ -417,7 +404,6 @@ class TestSlashCommands:
 
         session.run(driver)
         assert session.clara.model_choice is None
-        assert session.clara.admin_calls == []  # never the server's console: this is the user's own choice
 
     def test_the_title_follows_the_model_chosen_and_nothing_is_offered_by_default(self, tmp_path):
         session = Session(tmp_path)
@@ -453,26 +439,6 @@ class TestSlashCommands:
         session.run(driver)
         assert session.console_.model == "other-model" and "other-model" in session.console_.screen.title
         assert session.console_.session.usage.session_models["other-model"].turns == 1
-
-    def test_without_an_admin_token_the_server_commands_explain(self, tmp_path):
-        session = Session(tmp_path, clara=FakeClara(admin_token=None))
-
-        def driver(s):
-            s.send("/provider")
-            s.wait_output("CLARA_ADMIN_TOKEN")
-
-        session.run(driver)
-
-    def test_provider_names_are_completed_from_the_server(self, tmp_path):
-        from prompt_toolkit.document import Document
-
-        from custom_console.agent.slash import SlashCompleter
-
-        session = Session(tmp_path)
-        completer = SlashCompleter(session.console_.screen.commands)
-        names = [c.text for c in completer.get_completions(Document("/provider c"), None)]
-        session.pipe_ctx.__exit__(None, None, None)
-        assert names == ["cloud"]
 
     def test_usage_reports_session_and_ledger(self, tmp_path):
         session = Session(tmp_path)
@@ -1013,7 +979,7 @@ class TestReminders:
             s.send("work")
             wait_for(lambda: s.console_.screen._busy)
             session.clara.announced.append(self.announced("During the turn"))
-            wait_for(lambda: "During the turn" in session.out.file.getvalue())
+            wait_for(lambda: "During the turn" in session.text())
             release.set()
             s.wait_output("finished")
 
