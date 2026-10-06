@@ -354,8 +354,12 @@ class AgentCommands:
         table.add_column("Next reminder")
         for task in found:
             nxt = "done" if task["status"] == "done" else local_time(task["next_reminder"]) if task["next_reminder"] else "none"
+            progress = task.get("subtasks") or {}
+            name = ("\u21b3 " if task.get("parent_id") else "") + task["title"]
+            if progress.get("total"):
+                name += f" ({progress['done']}/{progress['total']})"
             table.add_row(
-                str(task["id"]), task["title"], local_time(task["due_at"]) if task.get("due_at") else "",
+                str(task["id"]), name, local_time(task["due_at"]) if task.get("due_at") else "",
                 str(task["reminders_sent"]), nxt,
             )
         return CommandResult(self.renderer.render(table))
@@ -367,14 +371,21 @@ class AgentCommands:
         try:
             if word.isdigit() and not rest:
                 return CommandResult(self.renderer.text(describe_task_detail(client.task(int(word))), "dim"))
-            if word == "add":
+            if word in ("add", "sub"):
+                parent = None
+                if word == "sub":
+                    number, _, rest = rest.partition(" ")
+                    if not number.isdigit():
+                        return self._error(TASK_HELP)
+                    parent, rest = int(number), rest.strip()
                 targets, rest = take_targets(rest)
                 title, description, due, reminders = parse_task(rest, now)
                 task = client.add_task(
                     title, description, due.isoformat(timespec="seconds") if due else None,
-                    [at.isoformat(timespec="seconds") for at in reminders], targets,
+                    [at.isoformat(timespec="seconds") for at in reminders], targets, parent,
                 )
-                return CommandResult(self.renderer.text("Task added.\n" + describe_task_detail(task), "green"))
+                return CommandResult(self.renderer.text(
+                    ("Sub task added.\n" if parent else "Task added.\n") + describe_task_detail(task), "green"))
             if word in ("done", "reopen", "delete") and rest.isdigit():
                 if word == "delete":
                     client.delete_task(int(rest))
@@ -398,7 +409,7 @@ class AgentCommands:
         except (ValueError, ClaraError) as error:
             return self._error(str(error))
         return self._error(
-            f"{TASK_HELP}\n       /task ID | done ID | reopen ID | delete ID | set ID title|description|due|remind VALUE"
+            f"{TASK_HELP}\n       /task ID | sub ID ... | done ID | reopen ID | delete ID | set ID title|description|due|remind VALUE"
         )
 
     def complete_tasks(self, arguments: str) -> Iterator[Completion]:
@@ -411,12 +422,12 @@ class AgentCommands:
     def complete_task(self, arguments: str) -> Iterator[Completion]:
         words = arguments.split(" ")
         if len(words) == 1:
-            options = {"add": "a new task", "done": "mark one as done", "reopen": "open a done one again",
+            options = {"add": "a new task", "sub": "a sub task of a task", "done": "mark one as done", "reopen": "open a done one again",
                        "delete": "delete one for good", "set": "change one"}
             for word, meta in options.items():
                 if word.startswith(words[0].lower()):
                     yield Completion(word, start_position=-len(words[0]), display_meta=meta)
-        if len(words) == 1 or (len(words) == 2 and words[0].lower() in ("done", "reopen", "delete", "set")):
+        if len(words) == 1 or (len(words) == 2 and words[0].lower() in ("sub", "done", "reopen", "delete", "set")):
             try:
                 found = self.app.client.tasks("all")["tasks"]
             except ClaraError:

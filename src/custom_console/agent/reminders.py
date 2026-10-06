@@ -76,7 +76,10 @@ def parse_remind(argument: str, now: datetime) -> Tuple[datetime, str, str]:
     return due, repeat, text
 
 
-TASK_HELP = "Usage: /task add [@SURFACES] [due WHEN] [remind WHEN]... TITLE [| DESCRIPTION]"
+TASK_HELP = (
+    "Usage: /task add [@SURFACES] [due WHEN] [remind WHEN]... TITLE [| DESCRIPTION]\n"
+    "       /task sub ID [@SURFACES] [due WHEN] [remind WHEN]... TITLE [| DESCRIPTION]   (a sub task of task ID)"
+)
 
 
 def parse_task(argument: str, now: datetime) -> Tuple[str, str, Optional[datetime], List[datetime]]:
@@ -123,6 +126,10 @@ def describe_task(task: Dict[str, Any]) -> str:
     parts = [f"[{task['id']}] {task['title']}"]
     if task["status"] == "done":
         parts.append("done")
+    if task.get("parent_id"):
+        parts.append(f"sub task of [{task['parent_id']}]")
+    if task.get("subtasks", {}).get("total"):
+        parts.append(f"{task['subtasks']['done']}/{task['subtasks']['total']} sub tasks done")
     if task.get("due_at"):
         parts.append(f"due {local_time(task['due_at'])}")
     sent = task["reminders_sent"]
@@ -136,6 +143,8 @@ def describe_task_detail(task: Dict[str, Any]) -> str:
     lines = [describe_task(task), f"Description: {task['description'] or '(none)'}"]
     if len(task["reminders"]) > 1:
         lines.append("Reminders to come: " + ", ".join(local_time(at) for at in task["reminders"]))
+    if task.get("due_limit"):
+        lines.append(f"Nothing of it may be later than {local_time(task['due_limit'])} (the deadline of the task it is part of).")
     if task["targets"]:
         lines.append("Shown on: " + ", ".join(task["targets"]))
     return "\n".join(lines)

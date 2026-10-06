@@ -895,7 +895,7 @@ class TestTasks:
             return [c.text for c in completer.get_completions(Document(line), None)]
 
         session.pipe_ctx.__exit__(None, None, None)
-        assert complete("/task ") == ["add", "done", "reopen", "delete", "set", "1", "2"]
+        assert complete("/task ") == ["add", "sub", "done", "reopen", "delete", "set", "1", "2"]
         assert complete("/task de") == ["delete"] and complete("/task done ") == ["1", "2"] and complete("/task set 2") == ["2"]
         assert complete("/task add ") == []
         assert complete("/tasks ") == ["all", "done"]

@@ -291,14 +291,16 @@ class ClaraClient:
 
     def add_task(
         self, title: str, description: str = "", due: Optional[str] = None, reminders: Optional[List[str]] = None,
-        targets: Optional[List[str]] = None,
+        targets: Optional[List[str]] = None, parent_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """A task for this user. `due` and `reminders` are ISO 8601 times with their offset; without any reminder
-        Clara picks them on the server."""
+        """A task for this user (a sub task of `parent_id`, if given). `due` and `reminders` are ISO 8601 times with
+        their offset; without any reminder Clara picks them on the server."""
         body: Dict[str, Any] = {
             **self._identity(), "title": title, "description": description, "due": due,
             "reminders": list(reminders or []), "targets": list(targets or []),
         }
+        if parent_id:
+            body["parent_id"] = parent_id
         if self.user_name:
             body["user_name"] = self.user_name
         return self._request("POST", "/v1/tasks", json=body).json()
