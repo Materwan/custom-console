@@ -342,6 +342,13 @@ class AgentCommands:
                     return CommandResult(self.renderer.text("Task deleted.", "green"))
                 task = client.change_task(int(rest), status="done" if word == "done" else "open")
                 return CommandResult(self.renderer.text(describe_task(task), "green"))
+            if word == "move":
+                number, _, under = rest.partition(" ")
+                under = under.strip().lower()
+                if not number.isdigit() or not (under.isdigit() or under == "none"):
+                    return self._error("Usage: /task move ID PARENT_ID|none   (a sub task of that task, or a main task again)")
+                task = client.change_task(int(number), parent_id=int(under) if under.isdigit() else None)
+                return CommandResult(self.renderer.text(describe_task(task), "green"))
             if word == "set":
                 number, _, rest = rest.partition(" ")
                 field, _, value = rest.strip().partition(" ")
@@ -359,7 +366,7 @@ class AgentCommands:
         except (ValueError, ClaraError) as error:
             return self._error(str(error))
         return self._error(
-            f"{TASK_HELP}\n       /task ID | sub ID ... | done ID | reopen ID | delete ID | set ID title|description|due|remind VALUE"
+            f"{TASK_HELP}\n       /task ID | sub ID ... | done ID | reopen ID | delete ID | move ID PARENT|none | set ID title|description|due|remind VALUE"
         )
 
     def complete_tasks(self, arguments: str) -> Iterator[Completion]:
@@ -373,11 +380,11 @@ class AgentCommands:
         words = arguments.split(" ")
         if len(words) == 1:
             options = {"add": "a new task", "sub": "a sub task of a task", "done": "mark one as done", "reopen": "open a done one again",
-                       "delete": "delete one for good", "set": "change one"}
+                       "delete": "delete one for good", "move": "put one under another", "set": "change one"}
             for word, meta in options.items():
                 if word.startswith(words[0].lower()):
                     yield Completion(word, start_position=-len(words[0]), display_meta=meta)
-        if len(words) == 1 or (len(words) == 2 and words[0].lower() in ("sub", "done", "reopen", "delete", "set")):
+        if len(words) == 1 or (len(words) == 2 and words[0].lower() in ("sub", "done", "reopen", "delete", "move", "set")):
             try:
                 found = self.app.client.tasks("all")["tasks"]
             except ClaraError:

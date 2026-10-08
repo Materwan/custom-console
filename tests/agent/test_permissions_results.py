@@ -122,11 +122,19 @@ class TestDecisions:
         assert parse_decision("do it in src/ instead") == Decision(False, reason="do it in src/ instead")
         assert parse_decision("a", can_remember=False) == Decision(False, reason="a")
 
+    def test_what_runs_anything_or_brings_in_code_is_never_approved_for_good(self):
+        for command in (
+            "python script.py", "python -c \"print(1)\"", "python -m", "node -e 1", "bash run.sh", "powershell -File x.ps1",
+            "pip install requests", "npm install left-pad", "git push origin main", "uv add x", "curl http://x", "npx something",
+        ):
+            assert command_rule(command) is None, command
+
     def test_command_rules_name_the_program_and_its_subcommand(self):
         assert command_rule("git status -s") == "run_command:git status"
         assert command_rule("C:/Python/python.exe -m pytest -q") == "run_command:python -m pytest"
         assert command_rule("pytest tests/a.py") == "run_command:pytest"
-        assert command_rule("git --no-pager log") == "run_command:git"
+        assert command_rule("git --no-pager log") is None  # a flag where the subcommand is: asked every time
+        assert command_rule("npm run test -- --watch") == "run_command:npm run test"
 
     def test_chained_or_redirected_commands_have_no_rule(self):
         for command in ("git status && del x", "dir | findstr a", "echo a > b", "a; b", "echo %PATH%", "x $(y)"):
@@ -257,3 +265,19 @@ class TestGuardedDecorator:
 
         assert list(inspect.signature(tool).parameters) == ["path", "depth"]
         assert tool.__doc__ == "Doc." and tool.__name__ == "tool"
+
+
+class TestSecretsAreAlwaysAsked:
+    """Reading keys, tokens and cookies goes to the model of the server: it is asked, at every level but 2."""
+
+    def test_the_paths_that_hold_secrets(self):
+        from custom_console.agent.zone import is_sensitive
+
+        for path in (
+            "C:/Users/me/.ssh/id_rsa", "/home/me/.aws/credentials", "/work/app/.env", "/work/app/.env.production",
+            "C:/Users/me/AppData/Roaming/Mozilla/Firefox/Profiles/x.default/cookies.sqlite", "/x/server.pem", "/x/.git-credentials",
+            "/work/config/cookies/moodle_state.json", "D:\\keys\\backup.kdbx", "/home/me/.config/gcloud/application_default_credentials.json",
+        ):
+            assert is_sensitive(path), path
+        for path in ("/work/app/main.py", "/work/app/.env.example", "/work/README.md", "/work/app/environment.py", "/work/keyboard.txt"):
+            assert not is_sensitive(path), path

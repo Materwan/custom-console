@@ -11,7 +11,9 @@ A question can be answered:
 A rule is the kind of call an answer covers: a tool (``send_email``), a tool in a folder
 (``file_system_write:C:/work/notes``), or for ``run_command`` the program and its subcommand
 (``run_command:git status``). A command with shell operators (``&&``, ``|``, ``>``...) gets no rule:
-it is always asked, since a harmless start could hide anything after it.
+it is always asked, since a harmless start could hide anything after it. So do the programs that run whatever they
+are given (``python x.py``, ``node -e``, ``bash``), a flag where the subcommand should be (``git -c ...``), and what
+installs or publishes (``pip install``, ``git push``): approving one "for good" would approve what follows.
 """
 
 from __future__ import annotations
@@ -116,6 +118,15 @@ def describe_call(name: str, arguments: Mapping[str, Any], value_limit: int = 16
 
 _SHELL_OPERATORS = re.compile(r"[&|;<>`\n\r]|\$\(|%[A-Za-z_]+%")
 _TWO_WORDS = {"git", "npm", "pnpm", "yarn", "pip", "pip3", "uv", "cargo", "docker", "dotnet", "go", "poetry", "conda"}
+# Programs that run whatever they are given (`python x.py`, `node -e ...`, `bash script`): approving one of those "for
+# good" would approve everything that follows, so each is asked, except `python -m <module>`
+_INTERPRETERS = {
+    "python", "python3", "py", "node", "deno", "bun", "bash", "sh", "zsh", "pwsh", "powershell", "cmd", "ruby", "perl",
+    "php", "lua", "wscript", "cscript", "mshta", "rundll32", "regsvr32", "msiexec", "wsl", "ssh", "scp", "curl", "wget",
+    "iex", "invoke-expression", "start", "start-process", "npx", "bunx", "pipx",
+}
+# Subcommands that bring in or run somebody else's code, or publish: asked every time
+_ALWAYS_ASKED = {"install", "i", "add", "remove", "uninstall", "update", "upgrade", "publish", "exec", "dlx", "x", "run-script", "push", "login"}
 
 
 def command_rule(command: str) -> Optional[str]:
@@ -133,8 +144,17 @@ def command_rule(command: str) -> Optional[str]:
     prefix = [program]
     if program in ("python", "python3", "py") and len(words) > 2 and words[1] == "-m":
         prefix += ["-m", words[2].lower()]
-    elif program in _TWO_WORDS and len(words) > 1 and not words[1].startswith("-"):
-        prefix.append(words[1].lower())
+    elif program in _INTERPRETERS:
+        return None
+    elif program in _TWO_WORDS:
+        if len(words) < 2 or words[1].startswith("-"):
+            return None  # `git -c core.pager=... log`: the subcommand is not where it is expected: asked
+        sub = words[1].lower()
+        if sub in _ALWAYS_ASKED:
+            return None
+        prefix.append(sub)
+        if sub == "run" and program in ("npm", "pnpm", "yarn") and len(words) > 2:
+            prefix.append(words[2].lower())  # which script: `npm run test` is not `npm run anything`
     return COMMAND_RULE + " ".join(prefix)
 
 

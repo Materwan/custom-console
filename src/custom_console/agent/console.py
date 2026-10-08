@@ -18,7 +18,7 @@ from ..fs import FileManager
 from ..settings import Settings
 from .cache import JsonCache
 from .checkpoints import Checkpoints
-from .clara import ClaraClient, ClaraError
+from .clara import ClaraClient, ClaraError, plain_http_warning
 from .commands import AgentCommands
 from .context import ContextManager
 from .journal import JsonlLogger
@@ -79,6 +79,9 @@ class AgentConsole:
         )
         self.renderer = Renderer(self.console)
         settings.agent_dir.mkdir(parents=True, exist_ok=True)
+        warning = plain_http_warning(settings.clara_url)
+        if warning:
+            self.console.print(f"[yellow]Warning: {warning}[/yellow]")
 
         health = self.client.health()
         self.model = str(health.get("model") or "?")

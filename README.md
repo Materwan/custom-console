@@ -306,8 +306,17 @@ empty `Enter` answers nothing):
 
 "The same kind" is the tool in that folder (`file_system_write in C:/notes`), the program and
 its subcommand for `run_command` (`git status …` commands), the kind of file for `open_path`,
-the recipient for `send_email`. A command that chains or redirects (`&&`, `|`, `>`...) is
-always asked. `/permissions` lists what you allowed; `/permissions forget` drops it.
+the site for opening a URL, the recipient for `send_email`. A command that chains or redirects (`&&`, `|`,
+`>`...) is always asked, and so is what runs whatever it is given (`python x.py`, `node -e`, `bash`; only
+`python -m <module>` can be remembered), a flag where the subcommand should be (`git -c ...`) and what installs or
+publishes (`pip install`, `npm install`, `git push`). `/permissions` lists what you allowed; `/permissions forget`
+drops it.
+
+**Secrets.** What the agent reads goes to the Clara server and the model service behind it. A read of a file that
+holds secrets (SSH and cloud keys, `.env` files, `*.pem`, `.git-credentials`, cookie jars, browser profiles,
+`moodle_state.json`...) **outside the free zone** is therefore asked even at level 1, and a search through a folder
+skips such files. `get_location` is asked too (it tells ipinfo.io this computer's address). A server address in plain
+`http://` that is not this machine, a private network or Tailscale is warned about at start.
 
 | Level | Auto-accepted outside the zone | Examples |
 |---|---|---|

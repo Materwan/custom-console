@@ -58,7 +58,11 @@ def compact_weather(payload: Dict[str, Any], resolution: str) -> Dict[str, Any]:
 
 
 def web_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
-    @guarded(ctx, PermissionLevel.READ)
+    @guarded(
+        ctx,
+        PermissionLevel.WRITE,  # asked at the default level: it tells a third party this computer's address, and the model where you are
+        describe=lambda: "Agent wants to look up where this computer is (ipinfo.io sees its IP address, the model gets the city)",
+    )
     def get_location() -> ToolResult:
         """Approximate location of this device (city, region, country, "loc" = lat,lon).
         """

@@ -25,7 +25,7 @@ from ..permissions import (
 )
 from ..results import ToolResult
 from ..schema import coerce_arguments
-from ..zone import FreeZone
+from ..zone import FreeZone, is_sensitive
 from .state import ReadTracker, TodoList
 
 # A tool's level is fixed, or computed from its arguments (e.g. free inside the zone).
@@ -78,6 +78,14 @@ class ToolContext:
             return False
         return target.backend is Backend.LOCAL and self.zone.contains(target.path, strict=strict, write=write)
 
+    def is_sensitive(self, raw: str) -> bool:
+        """Does this path hold secrets (keys, tokens, cookies, browser profiles)? Such a read is always asked."""
+        try:
+            target = self.files.resolve(raw)
+        except Exception:
+            return False
+        return target.backend is Backend.LOCAL and is_sensitive(target.path)
+
     def max_chars(self, share: float = 0.25) -> int:
         """Characters a tool may give back: `share` of the context window (about 3.5 characters a token)."""
         try:
@@ -101,6 +109,10 @@ def zone_level(
     WRITE level the protected paths of the zone are outside it."""
 
     def rule(**arguments: Any) -> PermissionLevel:
+        for name in params:
+            value = arguments.get(name)
+            if value is not None and ctx.is_sensitive(value) and not ctx.in_zone(value):
+                return PermissionLevel.WRITE  # keys, tokens, cookies elsewhere on the disk: asked, even for a read
         for name in params:
             value = arguments.get(name)
             if value is None:

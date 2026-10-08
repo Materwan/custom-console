@@ -6,16 +6,37 @@ Server-Sent Events. This module only speaks the protocol; `remote.py` runs a tur
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import socket
 import threading
 from typing import Any, Dict, Iterator, List, Optional
+from urllib.parse import urlsplit
 
 import requests
 import urllib3
 
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 90  # the server sends a keepalive every 15 s, so silence this long means trouble
+
+
+def plain_http_warning(url: str) -> str:
+    """A word of warning when the password or the token would cross a network unencrypted ("" when it is fine):
+    plain http to a machine that is not this one, on a private network or on Tailscale (which encrypts it)."""
+    parts = urlsplit(url.strip())
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "http" or not host or host == "localhost" or host.endswith((".local", ".localdomain", ".internal")):
+        return ""
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:  # a name: only a Tailscale one is encrypted on its way (and it is better served over https)
+        return (
+            f"{url} is plain http: your password and token cross the network unencrypted. Use an https:// address."
+            if not host.endswith(".ts.net") else f"{url} is a Tailscale address served over https: use https://."
+        )
+    if not address.is_global:  # this machine, a private network, Tailscale (100.64.0.0/10): not the open internet
+        return ""
+    return f"{url} is plain http: your password and token cross the network unencrypted. Use an https:// address."
 
 
 class ClaraError(Exception):
@@ -305,7 +326,7 @@ class ClaraClient:
 
     def change_task(self, task_id: int, **fields: Any) -> Dict[str, Any]:
         """Change a task: `title`, `description`, `due` (None: no deadline), `reminders` (ISO times; [] stops them),
-        `status` ("done" or "open")."""
+        `status` ("done" or "open"), `parent_id` (the task it becomes a sub task of; None: a main task)."""
         return self._request("PATCH", f"/v1/tasks/{int(task_id)}", json={**self._identity(), **fields}).json()
 
     def delete_task(self, task_id: int) -> None:

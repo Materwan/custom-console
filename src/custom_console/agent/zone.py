@@ -13,11 +13,41 @@ files, the project instructions file). Reading them stays free.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Iterable, Optional
 
 # Folders, anywhere below the zone, whose content is protected
 PROTECTED_FOLDERS = frozenset({".git", ".hg", ".svn", ".vscode", ".idea", ".venv", "venv", ".github"})
+
+
+# Folders and files that hold what opens other things: keys, tokens, passwords, cookies, browser profiles. What
+# the agent reads goes to the model of the server (and its provider), so reading these outside the free zone (the
+# folder the person started the agent in, which they trust) is asked at every permission level but 2.
+SENSITIVE_FOLDERS = frozenset({
+    ".ssh", ".gnupg", ".aws", ".azure", ".kube", ".password-store", ".terraform.d", ".docker", "gcloud",
+    "credentials", "cookies", "profiles", "user data", "brave-browser", "keychains", "protect",
+})
+SENSITIVE_NAMES = re.compile(
+    r"^(\.env(\..*)?|\.netrc|_netrc|\.git-credentials|\.npmrc|\.pypirc|\.pgpass|\.my\.cnf|id_(rsa|dsa|ecdsa|ed25519)(\..*)?"
+    r"|.*\.(pem|key|pfx|p12|jks|keystore|kdbx|ppk|asc|gpg)|credentials(\..*)?|secrets?(\..*)?|.*_secrets?(\..*)?"
+    r"|moodle_state\.json|cookies(\..*)?|login data|local state|key[34]\.db|logins\.json|web data|shadow)$",
+    re.IGNORECASE,
+)
+
+
+def is_sensitive(path: "str | os.PathLike[str]") -> bool:
+    """Is this a path that holds secrets (a key, a token, a password file, a cookie jar, a browser profile)?"""
+    text = os.path.normcase(os.fspath(path)).replace("\\", "/")
+    parts = [part for part in text.split("/") if part]
+    if not parts:
+        return False
+    if any(part.lower() in SENSITIVE_FOLDERS for part in parts[:-1]) or parts[-1].lower() in SENSITIVE_FOLDERS:
+        return True
+    if SENSITIVE_NAMES.match(parts[-1]) and not parts[-1].lower().endswith((".example", ".sample", ".template", ".dist")):
+        return True
+    joined = "/".join(part.lower() for part in parts)
+    return "/mozilla/firefox/" in joined or "/google/chrome/" in joined or "/microsoft/edge/" in joined
 
 
 def _key(path: "str | os.PathLike[str]") -> str:

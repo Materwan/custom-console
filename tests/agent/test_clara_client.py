@@ -479,3 +479,15 @@ class TestPassword:
         with pytest.raises(ClaraError, match="401"):
             ClaraClient(url, "wrong", user_id="erwan").notify("x")
         assert state.logins == []
+
+
+class TestPlainHttpWarning:
+    def test_only_a_network_that_does_not_encrypt_is_warned_about(self):
+        from custom_console.agent.clara import plain_http_warning
+
+        for url in ("https://clara.example", "http://127.0.0.1:8765", "http://localhost:8765", "http://192.168.1.4:8765",
+                    "http://10.0.0.2", "http://100.96.116.71:8765", "http://nas.local:8765"):
+            assert plain_http_warning(url) == "", url
+        for url in ("http://8.8.8.8:8765", "http://clara.example.com"):
+            assert "unencrypted" in plain_http_warning(url), url
+        assert "https" in plain_http_warning("http://clara.tail1234.ts.net")

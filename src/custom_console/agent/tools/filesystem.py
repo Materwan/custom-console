@@ -23,6 +23,7 @@ from ...fs import Backend, BinaryFileError
 from ..diffs import clip_diff, count_changes, make_diff, new_file_diff
 from ..permissions import PermissionLevel
 from ..results import ToolResult
+from ..zone import is_sensitive
 from .base import ToolContext, clip, guarded, truncation_notice, zone_level
 
 MAX_READ_BYTES = 1_000_000
@@ -520,6 +521,8 @@ def filesystem_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
         for relative, absolute, is_dir in candidates:
             if is_dir or (include_regex and not include_regex.match(relative)):
                 continue
+            if absolute != root and is_sensitive(absolute):
+                continue  # a search through a folder does not read its keys, tokens and cookies
             try:
                 if os.path.getsize(absolute) > MAX_SEARCH_FILE_BYTES:
                     continue

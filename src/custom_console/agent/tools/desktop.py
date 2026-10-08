@@ -8,6 +8,7 @@ everything is auto-accepted (it often holds a password), and so does replacing w
 import os
 import subprocess
 import sys
+from urllib.parse import urlsplit
 from typing import Callable, List, Optional
 
 from ...apps.finder import SavedApps, clean_name, find_application
@@ -56,7 +57,9 @@ def desktop_tools(ctx: ToolContext) -> List[Callable[..., ToolResult]]:
 
     def open_rule(target: str) -> Optional[str]:
         if target.strip().lower().startswith(URL_SCHEMES):
-            return "open_path:URLs"
+            host = urlsplit(target.strip()).hostname or ""
+            # per site: "always" for one address must not open any address later (a query string can carry data out)
+            return f"open_path:{host.lower()}" if host and target.strip().lower().startswith("http") else None
         extension = os.path.splitext(target.strip())[1].lower()
         if not extension or extension in EXECUTABLE:
             return None  # a program, a script, a folder or something unknown: asked every time

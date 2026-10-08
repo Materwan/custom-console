@@ -628,3 +628,30 @@ class TestProtectedPaths:
         zone = FreeZone(files_dir, protected_files=["AGENT.md"])
         assert not zone.contains(files_dir / "AGENT.md", write=True)
         assert zone.contains(files_dir / "AGENT.md") and zone.contains(files_dir / "sub" / "AGENT.md", write=True)
+
+
+class TestSecretsAreAsked:
+    def test_a_read_of_a_secret_outside_the_free_zone_asks_at_level_1(self, make_ctx):
+        ctx, log = make_ctx(zone=True, auto_level=1, answer=False)
+        elsewhere = ctx.zone.root.parent / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / ".env").write_text("TOKEN=abc\n")
+        (elsewhere / "notes.txt").write_text("hello\n")
+        read = by_name(filesystem_tools(ctx))["file_system_read"]
+        assert read(path=str(elsewhere / "notes.txt")).success and log.asked == []  # an ordinary read is free at level 1
+        refused = read(path=str(elsewhere / ".env"))
+        assert not refused.success and len(log.asked) == 1 and "abc" not in str(refused)
+
+    def test_the_same_secret_inside_the_free_zone_stays_free(self, make_ctx):
+        ctx, log = make_ctx(zone=True, auto_level=0, answer=False)
+        (ctx.zone.root / ".env").write_text("A=1")
+        assert by_name(filesystem_tools(ctx))["file_system_read"](path=str(ctx.zone.root / ".env")).success
+        assert log.asked == []
+
+    def test_a_search_through_a_folder_does_not_read_its_secrets(self, make_ctx):
+        ctx, log = make_ctx(zone=True, auto_level=1)
+        folder = ctx.zone.root
+        (folder / ".env").write_text("TOKEN=needle\n")
+        (folder / "a.txt").write_text("needle\n")
+        found = by_name(filesystem_tools(ctx))["file_system_grep"](pattern="needle", path=str(folder))
+        assert "a.txt" in str(found.data) and ".env" not in str(found.data)
