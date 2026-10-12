@@ -71,7 +71,7 @@ class FakeClara(ClaraClient):
         self.reminder_list: List[Dict[str, Any]] = []  # what /remind created
         self.announced: List[Dict[str, Any]] = []  # reminders the next connection of the stream delivers
         self.notify_after_value: Optional[int] = None  # what /notify-after set (None: the server's default)
-        self.offered_models: List[Dict[str, Any]] = []  # what an administrator lets this user choose
+        self.offered_models: List[Dict[str, Any]] = []  # what the owner lets this user choose
         self.model_choice: Optional[str] = None  # what /model chose (None: the server's own)
         self.task_list: Dict[int, Dict[str, Any]] = {}  # the user's to-do list, as the server describes each task
 

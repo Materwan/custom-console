@@ -1,6 +1,6 @@
 """The agent's slash commands: /model /remind /reminders /unremind /notify-after /usage /context /compact
 /clear /undo /init /todo /permissions, plus the file commands of the shell (/ls /cd /cat ...). They are the user's own:
-what the server's administrators manage (provider, server model, which models users may choose) is not here."""
+what the server's owner manages (provider, server model, which models users may choose) is not here."""
 
 from __future__ import annotations
 
@@ -97,6 +97,11 @@ def bar(fraction: float, width: int = BAR_WIDTH) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def _context_text(tokens: int) -> str:
+    """A number of tokens in words: 262K, 1M."""
+    return f"{round(tokens / 1_000_000, 1):g}M" if tokens >= 1_000_000 else f"{round(tokens / 1000)}K"
+
+
 class AgentCommands:
     def __init__(self, app: "AgentConsole") -> None:
         self.app = app
@@ -114,7 +119,7 @@ class AgentCommands:
 
     def register(self, registry: SlashRegistry) -> None:
         add = registry.add
-        add(SlashCommand("model", "show or choose the model Clara answers you with (among those an administrator offers)", self.model, "[N|NAME|default]", self.complete_model))
+        add(SlashCommand("model", "show or choose the model Clara answers you with (among those the owner offers)", self.model, "[N|NAME|default]", self.complete_model))
         add(SlashCommand("remind", "a notification for you at a time, on your Clara clients", self.remind, "[daily|weekly|monthly] [@SURFACES] WHEN TEXT", self.complete_remind))
         add(SlashCommand("reminders", "your reminders that have not fired yet", self.reminders))
         add(SlashCommand("unremind", "cancel one of your reminders", self.unremind, "ID", self.complete_unremind))
@@ -179,6 +184,17 @@ class AgentCommands:
         weight = f"{model['weight']:.3f}".rstrip("0").rstrip(".")
         return f"{weight} {'credit' if model['weight'] == 1 else 'credits'} per token"
 
+    def _model_abilities(self, model: dict) -> str:
+        """What the model can do, as the server says it: " · thinking, tools, image input, 262K context"."""
+        caps = model.get("capabilities") or {}
+        words = [word for key, word in (("thinking", "thinking"), ("tools", "tools"), ("vision", "image input"))
+                 if caps.get(key) is True]
+        if caps.get("context"):
+            words.append(f"{_context_text(caps['context'])} context")
+        if all(caps.get(key) is False for key in ("thinking", "tools", "vision")):
+            words.insert(0, "text only")
+        return f" · {', '.join(words)}" if words else " · capabilities not reported"
+
     def model(self, arguments: str) -> CommandResult:
         """Show the models on offer, or choose one by its number, its name or `provider:name` (`default`: the
         server's own)."""
@@ -194,16 +210,19 @@ class AgentCommands:
             return self._error(str(error))
         current = info["current"]
         self.app.model_changed(str(current["name"]), str(current["provider"]))
-        lines = [f"Clara answers you here with {current['name']} ({current['provider_label']}), {self._model_cost(current)}."]
+        lines = [f"Clara answers you here with {current['name']} ({current['provider_label']}), "
+                 f"{self._model_cost(current)}{self._model_abilities(current)}."]
         if info["models"]:
             default = info["default"]
-            lines.append(f"  0. default: {default['name']} ({default['provider_label']}), {self._model_cost(default)}")
+            lines.append(f"  0. default: {default['name']} ({default['provider_label']}), "
+                         f"{self._model_cost(default)}{self._model_abilities(default)}")
             for number, model in enumerate(info["models"], 1):
                 mark = "*" if model["ref"] == current["ref"] else " "
-                lines.append(f"{mark} {number}. {model['name']} ({model['provider_label']}), {self._model_cost(model)}")
+                lines.append(f"{mark} {number}. {model['name']} ({model['provider_label']}), "
+                             f"{self._model_cost(model)}{self._model_abilities(model)}")
             lines.append("Choose one with /model N or /model NAME; /model default goes back to the server's own.")
         else:
-            lines.append("An administrator has not offered other models.")
+            lines.append("The owner has not offered other models.")
         return CommandResult(self.renderer.text("\n".join(lines), "green" if word else None))
 
     def complete_model(self, arguments: str) -> Iterator[Completion]:

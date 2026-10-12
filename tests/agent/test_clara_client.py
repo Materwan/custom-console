@@ -470,7 +470,7 @@ class TestPassword:
         url, state = server
         client = self.user(url)
         client.notify("one")
-        state.user_tokens.clear()  # an administrator signed this device out
+        state.user_tokens.clear()  # the owner signed this device out
         client.notify("two")
         assert len(state.logins) == 2 and len(state.notification_bodies) == 2
 

@@ -65,7 +65,7 @@ def run_remote_turn(
     """Run one turn and return its final `done` event (None if `cancel` was set meanwhile).
 
     `on_usage(prompt_tokens, completion_tokens)` is told after each model round, `on_note(text)`
-    of what the server did on its own (compaction...), `on_thinking(text)` of the model's reasoning
+    of what the server did on its own (compaction, a fallback model asked...), `on_thinking(text)` of the model's reasoning
     and `on_server_tool(name, arguments, result)` of a tool the server ran itself (remember,
     web_search...). Raises :class:`ClaraError`.
 
@@ -119,7 +119,7 @@ def run_remote_turn(
             elif kind == "compacted":
                 if on_note:
                     on_note(f"Conversation compacted ({event['before']:.0f}% → {event['after']:.0f}% of the context).")
-            elif kind == "warning":
+            elif kind in ("warning", "retrying"):  # retrying: the model failed, the server asks its next one
                 if on_note:
                     on_note(str(event.get("message", "")))
             elif kind == "error":

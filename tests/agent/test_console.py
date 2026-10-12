@@ -282,6 +282,18 @@ class TestAgentConsole:
 
         session.run(driver)
 
+    def test_a_fallback_model_asked_by_the_server_is_noted(self, tmp_path):
+        def respond(body):
+            return [{"type": "retrying", "message": "The model is busy, trying gpt-oss…"}, *say("done", model="gpt-oss")]
+
+        session = Session(tmp_path, clara=FakeClara(respond))
+
+        def driver(s):
+            s.send("hello")
+            s.wait_output("The model is busy, trying gpt-oss…")
+
+        session.run(driver)
+
     def test_tool_context_is_closed_when_the_console_exits(self, tmp_path):
         session = Session(tmp_path)
         closed = []
@@ -405,6 +417,25 @@ class TestSlashCommands:
         session.run(driver)
         assert session.clara.model_choice is None
 
+    def test_model_says_what_each_model_can_do(self, tmp_path):
+        session = Session(tmp_path)
+        session.clara.offered_models = [
+            {"ref": "cloud:big", "name": "big", "provider": "cloud", "provider_label": "Ollama API key", "weight": 8.75,
+             "capabilities": {"thinking": True, "tools": True, "vision": False, "context": 262144}},
+            {"ref": "local:small", "name": "small", "provider": "local", "provider_label": "Local host", "weight": 0.125,
+             "capabilities": {"thinking": False, "tools": False, "vision": False, "context": 8192}},
+            {"ref": "local:old", "name": "old", "provider": "local", "provider_label": "Local host", "weight": 1,
+             "capabilities": {"thinking": None, "tools": None, "vision": None, "context": None}},
+        ]
+
+        def driver(s):
+            s.send("/model")
+            s.wait_output("1. big (Ollama API key), 8.75 credits per token · thinking, tools, 262K context")
+            s.wait_output("2. small (Local host), 0.125 credits per token · text only, 8K context")
+            s.wait_output("3. old (Local host), 1 credit per token · capabilities not reported")
+
+        session.run(driver)
+
     def test_the_title_follows_the_model_chosen_and_nothing_is_offered_by_default(self, tmp_path):
         session = Session(tmp_path)
         session.clara.offered_models = [
@@ -422,7 +453,7 @@ class TestSlashCommands:
 
         def ask(s):
             s.send("/model")
-            s.wait_output("An administrator has not offered other models")
+            s.wait_output("The owner has not offered other models")
 
         quiet.run(ask)
 

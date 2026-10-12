@@ -41,7 +41,7 @@ project root (see `.env.example`; empty values mean "use the default").
 | `DATA_DIR` | `<project>/data` | Logs, saved sessions, usage ledger, checkpoints, caches |
 | `WSL_DISTRO` | `Ubuntu` | Distribution exposed as `/wsl-<name>/` |
 | `CLARA_URL` | `http://127.0.0.1:8765` | The Clara server the agent talks to |
-| `CLARA_USER`, `CLARA_PASSWORD` | – | Your user name and password on that server (the administrator makes them with `/user add`): `ai agent` signs in by itself, and the server knows it is you |
+| `CLARA_USER`, `CLARA_PASSWORD` | – | Your user name and password on that server (the owner makes them with `/user add`): `ai agent` signs in by itself, and the server knows it is you |
 | `CLARA_TOKEN` | – | Instead of a user: a chat token (`CLARA_TOKENS` there). Required by `ai agent` when there is no `CLARA_USER` |
 | `CLARA_USER_NAME` | – | How Clara should call you |
 | `CLARA_TIMEZONE` | this computer's | Your time zone (IANA name, `Europe/Paris`), sent with each message: the server tells the model the date and time in it |
@@ -128,7 +128,7 @@ and the answer goes back on the same stream. So files, shell, PDF, Moodle and ma
 this machine, and the permissions, the free zone and `/undo` work exactly as before.
 
 Which model runs, and where (Ollama on the server's computer, or ollama.com with an API
-key), is the server's business, but you choose among the models an administrator offers:
+key), is the server's business, but you choose among the models the owner offers:
 `/model` lists them with what a token of each costs in credits and sets the one the console
 is answered by (it is yours, kept by the server, separately from your other clients). Managing
 the server itself (its provider, its own model, which models users may choose) is done on its
@@ -194,7 +194,7 @@ Typing `/` lists them above the input, with what they do.
 
 | Command | What it does |
 |---|---|
-| `/model [N\|NAME\|default]` | the models an administrator offers you, with their cost in credits per token; choose the one the console is answered by (`default`: the server's own) |
+| `/model [N\|NAME\|default]` | the models the owner offers you, with their cost in credits per token; choose the one the console is answered by (`default`: the server's own) |
 | `/remind [daily\|weekly\|monthly] [@SURFACES] WHEN TEXT` | a reminder for you, shown on your Clara clients at that time (see below) |
 | `/reminders` `/unremind ID` | your reminders that have not fired yet; cancel one |
 | `/tasks [all\|done]` | your to-do list, kept by Clara: each task with the reminders sent and the next one (see below) |
