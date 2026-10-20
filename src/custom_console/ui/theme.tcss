@@ -1,0 +1,197 @@
+Screen {
+    layout: vertical;
+}
+
+#transcript {
+    height: 1fr;
+    padding: 0 1;
+    scrollbar-size-vertical: 1;
+}
+
+#bottom {
+    height: auto;
+    max-height: 60%;
+}
+
+#status {
+    height: 1;
+    padding: 0 1;
+    background: $boost;
+    color: $text-muted;
+}
+
+#chips {
+    height: auto;
+    padding: 0 1;
+    color: $accent;
+}
+
+#chips.empty {
+    display: none;
+}
+
+#popup {
+    display: none;
+    height: auto;
+    max-height: 9;
+    margin: 0 1;
+    border: round $primary-darken-1;
+    background: $surface;
+}
+
+#popup.open {
+    display: block;
+}
+
+#prompt {
+    height: 3;
+    min-height: 3;
+    max-height: 12;
+    margin: 0 1;
+    border: round $primary;
+}
+
+#prompt:focus {
+    border: round $accent;
+}
+
+UserBlock {
+    height: auto;
+    margin: 1 0 0 0;
+}
+
+AnswerBlock {
+    height: auto;
+    margin: 1 0 0 0;
+    padding: 0 1;
+}
+
+AnswerBlock Static {
+    height: auto;
+}
+
+AnswerBlock Markdown {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+}
+
+Collapsible {
+    height: auto;
+    margin: 0;
+    padding: 0;
+    border: none;
+    background: transparent;
+}
+
+Collapsible > Contents {
+    padding: 0 0 0 2;
+}
+
+Collapsible > CollapsibleTitle {
+    padding: 0 1;
+    color: $text-muted;
+}
+
+ThinkingBlock Static {
+    color: $text-muted;
+    text-style: italic;
+}
+
+NoteBlock {
+    height: auto;
+}
+
+OutputBlock {
+    height: auto;
+    margin: 0 0 0 2;
+}
+
+ApprovalBlock {
+    height: auto;
+    margin: 1 0 0 0;
+    padding: 0 1;
+    border: round $warning;
+}
+
+ApprovalBlock:focus {
+    border: heavy $warning;
+}
+
+ApprovalBlock.done {
+    border: none;
+    color: $text-muted;
+    padding: 0 1;
+    margin: 0;
+}
+
+QuestionBlock {
+    height: auto;
+    margin: 1 0 0 0;
+    padding: 0 1;
+    border: round $accent;
+}
+
+QuestionBlock.done {
+    border: none;
+    color: $text-muted;
+    margin: 0;
+}
+
+PickerScreen {
+    align: center middle;
+}
+
+PickerScreen > * {
+    width: 80%;
+    max-width: 90;
+}
+
+PickerScreen #picker-title {
+    padding: 0 1;
+    background: $boost;
+    text-style: bold;
+}
+
+PickerScreen #picker-list {
+    height: auto;
+    max-height: 70%;
+    border: round $accent;
+    background: $surface;
+}
+
+PickerScreen #picker-help {
+    padding: 0 1;
+    color: $text-muted;
+    background: $surface;
+}
+
+ViewerScreen {
+    background: $surface;
+}
+
+ViewerScreen #viewer-title {
+    height: 1;
+    padding: 0 1;
+    background: $boost;
+    text-style: bold;
+}
+
+ViewerScreen TextArea {
+    height: 1fr;
+}
+
+ViewerScreen #viewer-search {
+    display: none;
+    height: 3;
+}
+
+ViewerScreen #viewer-search.open {
+    display: block;
+}
+
+ViewerScreen #viewer-help {
+    height: 1;
+    padding: 0 1;
+    color: $text-muted;
+}

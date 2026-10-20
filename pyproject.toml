@@ -1,41 +1,141 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
 
 [project]
 name = "custom-console"
-version = "0.6.0"
-description = "A custom terminal with custom commands and tools, including a personal AI agent."
+version = "1.0.0.dev0"
+description = "A terminal shell and a full-screen agent console for Clara."
 readme = "README.md"
+license = { text = "All rights reserved" }
 requires-python = ">=3.11"
 classifiers = [
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "ollama>=0.4",
-    "prompt_toolkit>=3.0.40",
-    "python-dotenv>=1.0",
-    "requests>=2.31",
-    "rich>=13.7",
-    "tzlocal>=5",
+    "textual>=1.0",          # the full-screen agent console
+    "prompt_toolkit>=3.0.47",  # the shell prompt only: Textual has no inline mode on Windows (docs/SPIKES.md)
+    "httpx>=0.28",
+    "tzlocal>=5",             # the computer's IANA time zone, told to Clara in the chat body
 ]
 
 [project.optional-dependencies]
-# Moodle tools (Playwright browser automation + HTML parsing).
-moodle = ["playwright>=1.40", "beautifulsoup4>=4.12"]
-# PDF -> Markdown agent tool.
+# `local_pdf_to_markdown`
 pdf = ["pymupdf4llm>=0.0.17"]
-# reMarkable .rmdoc -> PDF with the handwriting drawn on the pages.
+# `rmdoc2pdf`: the handwriting of a reMarkable file drawn on PDF pages
 rmdoc = ["pymupdf>=1.24", "rmscene>=0.7"]
-dev = ["pytest>=8"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "hypothesis>=6.100",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "import-linter>=2.1",
+    "starlette>=0.40",
+    "uvicorn>=0.32",
+]
 
 [project.scripts]
 custom_console = "custom_console.__main__:main"
+custom-console = "custom_console.__main__:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/custom_console"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+asyncio_mode = "auto"
+markers = ["live: needs a running Clara and a token; run by hand, never in CI"]
+addopts = "-m 'not live'"
+
+[tool.ruff]
+line-length = 110
+src = ["src", "tests"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501", "SIM105", "RUF012", "B008"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+mypy_path = "src"
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["rmscene.*", "pymupdf.*", "pymupdf4llm.*"]
+ignore_missing_imports = true
+
+# pymupdf and rmscene ship no type information, so calls into them are untyped by nature.
+[[tool.mypy.overrides]]
+module = ["custom_console.core.vfs.rmdoc", "custom_console.core.tools.pdf"]
+disallow_untyped_calls = false
+disallow_any_expr = false
+warn_return_any = false
+
+[tool.importlinter]
+root_package = "custom_console"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Layers point down only"
+type = "layers"
+layers = [
+    "custom_console.ui",
+    "custom_console.commands",
+    "custom_console.core",
+    "custom_console.clara | custom_console.platform",
+]
+# `clara` and `platform` are siblings at the bottom (see the contracts below).
+exhaustive = false
+
+[[tool.importlinter.contracts]]
+name = "clara knows nothing of the rest of the package"
+type = "forbidden"
+source_modules = ["custom_console.clara"]
+forbidden_modules = [
+    "custom_console.core", "custom_console.commands", "custom_console.ui",
+    "custom_console.platform", "custom_console.settings", "custom_console.paths",
+]
+
+[[tool.importlinter.contracts]]
+name = "platform knows nothing of the rest of the package"
+type = "forbidden"
+source_modules = ["custom_console.platform"]
+forbidden_modules = [
+    "custom_console.core", "custom_console.commands", "custom_console.ui",
+    "custom_console.clara", "custom_console.settings", "custom_console.paths",
+]
+
+[[tool.importlinter.contracts]]
+name = "Only ui draws: no Textual or prompt_toolkit below it"
+type = "forbidden"
+source_modules = [
+    "custom_console.core", "custom_console.commands", "custom_console.clara", "custom_console.platform",
+    "custom_console.settings", "custom_console.paths",
+]
+forbidden_modules = ["textual", "prompt_toolkit"]
+
+[[tool.importlinter.contracts]]
+name = "settings and paths sit below every layer but platform and clara"
+type = "forbidden"
+source_modules = ["custom_console.settings", "custom_console.paths"]
+forbidden_modules = ["custom_console.core", "custom_console.commands", "custom_console.ui", "custom_console.clara"]
+
+[tool.coverage.run]
+source = ["custom_console"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "^\\s*\\.\\.\\.$"]

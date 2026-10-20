@@ -1,22 +1,12 @@
-# Secrets / local configuration
-.env
-
-# Runtime data (logs, agent memory, workspaces, downloaded files, cookies)
-data/
-config/cookies/
-
-# Python
+.venv/
 __pycache__/
-*.py[cod]
 *.egg-info/
 .pytest_cache/
-.venv/
-venv/
-build/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 dist/
-
-# Editors / scratch
-.vscode/
-*.rmdoc
-*.ico
-*.ini
+.env
+.hypothesis/
+.import_linter_cache/

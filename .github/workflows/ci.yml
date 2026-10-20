@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install
+        run: uv sync --frozen --all-extras --python ${{ matrix.python }}
+      - name: Lint
+        run: uv run ruff check .
+      - name: Types
+        run: uv run mypy
+      - name: Import rules
+        run: uv run lint-imports
+      - name: Tests
+        run: uv run pytest --cov=custom_console --cov-report=term-missing
+      - name: Every branch of the permission modules and the path resolver
+        if: runner.os == 'Linux'  # their tests use POSIX fixtures, so the other systems run fewer of them
+        run: uv run coverage report --include="src/custom_console/core/permissions/*,src/custom_console/core/vfs/resolver.py" --fail-under=100
+      - name: Prompt check
+        run: uv run python scripts/check_prompt.py

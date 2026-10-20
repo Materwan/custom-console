@@ -1,236 +1,257 @@
-"""Application settings.
+"""Settings: four sources in a fixed order, validated all at once.
 
-Everything is resolved by :func:`load_settings` (no module-level side effects):
-environment variables (optionally loaded from a ``.env`` file) override the
-defaults, and empty values are treated as "not set".
+    1. command-line options   2. environment variables   3. `.env` in the config folder   4. built-in defaults
+
+The `.env` file is parsed, never loaded into `os.environ` (so no child process inherits it), and it holds no secrets:
+a key that looks like one stops the start with a pointer to the token file. If anything is wrong, every problem is
+reported in one list and nothing starts half-configured.
 """
 
 from __future__ import annotations
 
+import difflib
+import ipaddress
 import os
-from dataclasses import dataclass
-from functools import lru_cache
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional
+from urllib.parse import urlsplit
 
-# <root>/src/custom_console/settings.py -> <root>
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+from .paths import DataLayout, Locations, locations, system_name
 
-DEFAULT_INSTRUCTIONS = (
-    "You are a personal assistant. Use the available tools to carry out the "
-    "requested tasks and answer concisely."
-)
-
-
-def _get(env: Mapping[str, str], name: str) -> Optional[str]:
-    value = env.get(name)
-    if value is None:
-        return None
-    value = value.strip()
-    return value or None
+DEFAULT_URL = "http://127.0.0.1:8765"
+LOG_LEVELS = ("debug", "info", "warning", "error")
+SECRET_KEY = re.compile(r"(TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|BEARER|API_?KEY|PRIVATE_?KEY|_KEY$)", re.I)
+TOKEN_VALUE = re.compile(r"clara_[A-Za-z0-9]+_[A-Za-z0-9_\-]{8,}")
+TOKEN_HINT = "The Clara token lives in its own file: run `custom_console --save-token`."
 
 
-def _text(env: Mapping[str, str], name: str, default: str) -> str:
-    return _get(env, name) or default
+class SettingsError(Exception):
+    """One or more problems with the settings, all of them."""
+
+    def __init__(self, problems: list[str]):
+        super().__init__("\n".join(problems))
+        self.problems = problems
 
 
-def _flag(env: Mapping[str, str], name: str, default: bool) -> bool:
-    value = _get(env, name)
-    if value is None:
-        return default
-    return value.lower() in ("1", "true", "yes", "on", "y", "oui")
-
-
-def _int(env: Mapping[str, str], name: str, default: int) -> int:
-    value = _get(env, name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        raise ValueError(f"{name} must be an integer, got {value!r}") from None
-
-
-def _path(env: Mapping[str, str], name: str, default: Path) -> Path:
-    value = _get(env, name)
-    return Path(value).expanduser().resolve() if value else default.resolve()
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Settings:
-    project_root: Path
-    data_dir: Path
-
-    # reMarkable / virtual file system
-    rmapi_path: Optional[Path]
-    remarkable_sync_dir: Path
-    wsl_distro: str
-
-    # Local Ollama (the `ai list` / `ai start` commands; the agent itself talks to Clara)
-    ollama_host: str
-    default_model: str
-
-    # The Clara server: it runs the model, the memory and the conversations
     clara_url: str
-    clara_token: Optional[str]  # chat token (CLARA_TOKENS on the server)
-    clara_user: Optional[str]  # your user name on the server: with clara_password, instead of a shared token
-    clara_password: Optional[str]
-    clara_user_name: Optional[str]  # how Clara should call you
-    clara_timezone: Optional[str]  # IANA name of this computer's clock, told to the server (None: unknown)
-
-    # Agent
-    agent_instructions_path: Path
-    agent_permission_level: int
-    agent_user_id: str
-    agent_session_id: str
-    agent_keep_sessions: int  # saved sessions kept per working directory (/restore)
-    agent_project_file: str  # instructions file looked up in the agent's free zone
-
-    # Moodle
-    moodle_enabled: bool
-    moodle_base_url: str
-    moodle_state_path: Path
-
-    # Email (tool registered only when smtp_host is set)
-    smtp_host: Optional[str]
-    smtp_port: int
-    smtp_user: Optional[str]
-    smtp_password: Optional[str]
-    smtp_from: Optional[str]
-
-    # -- derived locations -------------------------------------------------- #
+    token_file: Path
+    data_dir: Path
+    config_dir: Path
+    tool_timeout: float = 120.0
+    result_limit: int = 30_000
+    rmapi: str | None = None
+    log_level: str = "info"
+    debug: bool = False
+    warnings: tuple[str, ...] = field(default=(), compare=False)
 
     @property
-    def agent_dir(self) -> Path:
-        return self.data_dir / "agent"
+    def data(self) -> DataLayout:
+        return DataLayout(self.data_dir)
 
-    @property
-    def agent_cache_path(self) -> Path:
-        return self.agent_dir / "cache.json"
 
-    @property
-    def agent_history_path(self) -> Path:
-        return self.agent_dir / "history.txt"
+@dataclass(frozen=True, slots=True)
+class Raw:
+    value: str
+    source: str  # "the command line", "the environment", ".env line 3"
 
-    @property
-    def agent_log_path(self) -> Path:
-        return self.data_dir / "logs" / "agent.jsonl"
 
-    @property
-    def agent_usage_path(self) -> Path:
-        return self.agent_dir / "usage.jsonl"
-
-    @property
-    def agent_sessions_dir(self) -> Path:
-        return self.agent_dir / "sessions"
-
-    @property
-    def agent_tools_path(self) -> Path:
-        return self.agent_dir / "tools.json"
-
-    @property
-    def agent_checkpoints_dir(self) -> Path:
-        return self.agent_dir / "checkpoints"
-
-    @property
-    def agent_permissions_dir(self) -> Path:
-        """The "always in this project" answers, one file per working directory."""
-        return self.agent_dir / "permissions"
-
-    @property
-    def saved_apps_path(self) -> Path:
-        return self.data_dir / "saved_apps.json"
-
-    # -- helpers ------------------------------------------------------------ #
-
-    @property
-    def rmapi_available(self) -> bool:
-        return self.rmapi_path is not None and self.rmapi_path.is_file()
-
-    def load_instructions(self) -> str:
+def _number(low: float, high: float) -> Callable[[str], float]:
+    def parse(text: str) -> float:
         try:
-            text = self.agent_instructions_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            return DEFAULT_INSTRUCTIONS
-        return text or DEFAULT_INSTRUCTIONS
+            value = float(text)
+        except ValueError:
+            raise ValueError(f"must be a number from {low:g} to {high:g}, not {text!r}") from None
+        if not low <= value <= high:
+            raise ValueError(f"must be from {low:g} to {high:g}, not {text}")
+        return value
+    return parse
 
 
-def local_timezone() -> Optional[str]:
-    """The IANA name of this computer's time zone ("Europe/Paris"), or None when it cannot be told."""
+def _integer(low: int, high: int) -> Callable[[str], int]:
+    def parse(text: str) -> int:
+        try:
+            value = int(text)
+        except ValueError:
+            raise ValueError(f"must be a whole number from {low:,} to {high:,}, not {text!r}") from None
+        if not low <= value <= high:
+            raise ValueError(f"must be from {low:,} to {high:,}, not {text}")
+        return value
+    return parse
+
+
+def _level(text: str) -> str:
+    if text.lower() not in LOG_LEVELS:
+        raise ValueError(f"must be one of {', '.join(LOG_LEVELS)}, not {text!r}")
+    return text.lower()
+
+
+def _path(text: str) -> Path:
+    return Path(text).expanduser().absolute()
+
+
+def _url(text: str) -> str:
+    parts = urlsplit(text.strip())
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError(f"must be an address such as {DEFAULT_URL}, not {text!r}")
+    if parts.query or parts.fragment or parts.username or parts.password:
+        raise ValueError("must be a plain address: no user, query or fragment")
+    return text.strip().rstrip("/")
+
+
+def is_loopback(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
     try:
-        from tzlocal import get_localzone_name
-
-        return get_localzone_name() or None
-    except Exception:
-        return None
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
-def load_settings(
-    env: Optional[Mapping[str, str]] = None,
-    *,
-    root: Optional[Path] = None,
-    use_dotenv: bool = True,
-) -> Settings:
-    """Build a :class:`Settings` from ``env`` (default: ``os.environ``).
+# name -> (parser, what it is)
+FIELDS: dict[str, tuple[Callable[[str], object], str]] = {
+    "CLARA_URL": (_url, "Clara's address"),
+    "CLARA_TOKEN_FILE": (_path, "where the token is read"),
+    "CONSOLE_DATA_DIR": (_path, "where sessions, undo records, the journal and rules live"),
+    "CONSOLE_TOOL_TIMEOUT": (_number(1, 600), "seconds before a foreground command is stopped"),
+    "CONSOLE_RESULT_LIMIT": (_integer(1_000, 1_000_000), "characters kept of one tool result"),
+    "CONSOLE_RMAPI": (_path, "path to rmapi"),
+    "CONSOLE_LOG_LEVEL": (_level, "log detail"),
+}
 
-    When ``env`` is omitted, a ``.env`` file found in ``root`` is loaded first
-    (without overriding variables that are already set).
+# command-line option -> setting name (`--save-token` and `--debug` are handled by the entry point)
+OPTION_NAMES = {
+    "--url": "CLARA_URL", "--token-file": "CLARA_TOKEN_FILE", "--data-dir": "CONSOLE_DATA_DIR",
+    "--tool-timeout": "CONSOLE_TOOL_TIMEOUT", "--result-limit": "CONSOLE_RESULT_LIMIT", "--rmapi": "CONSOLE_RMAPI",
+    "--log-level": "CONSOLE_LOG_LEVEL",
+}
+
+
+def parse_env_file(text: str) -> tuple[dict[str, Raw], list[str]]:
+    """`NAME=value` lines (comments, `export`, quotes, an inline ` # comment`). Returns the pairs and the bad lines."""
+    pairs: dict[str, Raw] = {}
+    problems: list[str] = []
+    for number, line in enumerate(text.lstrip("﻿").splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        stripped = stripped.removeprefix("export ").lstrip()
+        name, equals, rest = stripped.partition("=")
+        name = name.strip()
+        if not equals or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            problems.append(f".env line {number}: expected NAME=value.")
+            continue
+        rest = rest.strip()
+        if rest[:1] in ("'", '"'):
+            quote = rest[0]
+            end = rest.find(quote, 1)
+            while quote == '"' and end > 0 and rest[end - 1] == "\\":
+                end = rest.find(quote, end + 1)
+            if end < 0:
+                problems.append(f".env line {number}: the quote opened for {name} is never closed.")
+                continue
+            value = rest[1:end]
+            if quote == '"':
+                value = value.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\")
+            tail = rest[end + 1:].strip()
+            if tail and not tail.startswith("#"):
+                problems.append(f".env line {number}: unexpected text after the closing quote of {name}.")
+                continue
+        else:
+            value = re.split(r"\s+#", rest, maxsplit=1)[0].strip()
+        pairs[name] = Raw(value, f".env line {number}")
+    return pairs, problems
+
+
+def _suggest(name: str) -> str:
+    close = difflib.get_close_matches(name.upper(), FIELDS, n=1, cutoff=0.6)
+    return f" Did you mean {close[0]}?" if close else ""
+
+
+def _warnings(clara_url: str) -> tuple[str, ...]:
+    parts = urlsplit(clara_url)
+    if parts.scheme == "http" and parts.hostname and not is_loopback(parts.hostname):
+        return (f"CLARA_URL is plain http:// to {parts.hostname}, which is not this computer: your token and messages "
+                "cross the network unencrypted. Use https://.",)
+    return ()
+
+
+def load(options: Mapping[str, str] | None = None, *, env: Mapping[str, str] | None = None, system: str | None = None,
+         home: Path | None = None, config_dir: Path | None = None, debug: bool = False,
+         token_check: Callable[[Path], str | None] | None = None) -> Settings:
+    """The settings, or a SettingsError listing every problem.
+
+    `options` maps setting names to values given on the command line. `token_check`, when given, is asked about the
+    token file once its path is known and returns a problem or None.
     """
-    root = (
-        root or Path(os.environ.get("CUSTOM_CONSOLE_HOME") or PROJECT_ROOT)
-    ).resolve()
+    env = os.environ if env is None else env
+    home = Path.home() if home is None else home
+    where: Locations = locations(system or system_name(), env, home)
+    folder = config_dir if config_dir is not None else where.config
+    problems: list[str] = []
+    raw: dict[str, Raw] = {}
 
-    if env is None:
-        if use_dotenv:
-            from dotenv import load_dotenv
+    env_file = folder / ".env"
+    try:
+        text = env_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    except (OSError, UnicodeDecodeError) as error:
+        text = ""
+        problems.append(f"Cannot read {env_file}: {getattr(error, 'strerror', None) or error}")
+    pairs, bad = parse_env_file(text)
+    problems += [f"{env_file}: {line}" if i == 0 else line for i, line in enumerate(bad)]
+    for name, item in pairs.items():
+        if name in FIELDS:
+            raw[name] = item
+        elif SECRET_KEY.search(name):
+            problems.append(f"{env_file} ({item.source}): {name} looks like a secret, and secrets do not go in .env. "
+                            f"{TOKEN_HINT}")
+        else:
+            problems.append(f"{env_file} ({item.source}): unknown setting {name}.{_suggest(name)}")
+        if TOKEN_VALUE.search(item.value):
+            problems.append(f"{env_file} ({item.source}): the value of {name} looks like a Clara token. {TOKEN_HINT}")
 
-            load_dotenv(root / ".env")
-        env = os.environ
+    for name, value in env.items():
+        if name in FIELDS:
+            raw[name] = Raw(value, "the environment")
+        elif name.startswith("CONSOLE_"):
+            problems.append(f"The environment sets {name}, which is not a setting.{_suggest(name)}")
+    for name, value in (options or {}).items():
+        if name not in FIELDS:
+            problems.append(f"Unknown setting {name}.{_suggest(name)}")
+        else:
+            raw[name] = Raw(value, "the command line")
 
-    data_dir = _path(env, "DATA_DIR", root / "data")
-    rmapi = _get(env, "RMAPI_PATH")
+    values: dict[str, object] = {}
+    for name, (parse, _doc) in FIELDS.items():
+        chosen = raw.get(name)
+        if chosen is None or chosen.value == "":
+            continue  # an empty value means "not set"
+        try:
+            values[name] = parse(chosen.value)
+        except ValueError as error:
+            problems.append(f"{name} ({chosen.source}): {error}.")
 
+    token_file = values.get("CLARA_TOKEN_FILE", where.token_file)
+    assert isinstance(token_file, Path)
+    if token_check is not None and not any(p.startswith("CLARA_TOKEN_FILE") for p in problems):
+        found = token_check(token_file)
+        if found:
+            problems.append(found)
+    if problems:
+        raise SettingsError(problems)
+
+    url = str(values.get("CLARA_URL", DEFAULT_URL))
+    data_dir = values.get("CONSOLE_DATA_DIR", where.data)
+    rmapi = values.get("CONSOLE_RMAPI")
+    timeout = values.get("CONSOLE_TOOL_TIMEOUT", 120.0)
+    limit = values.get("CONSOLE_RESULT_LIMIT", 30_000)
+    assert isinstance(data_dir, Path) and isinstance(timeout, float) and isinstance(limit, int)
     return Settings(
-        project_root=root,
-        data_dir=data_dir,
-        rmapi_path=Path(rmapi).expanduser() if rmapi else None,
-        remarkable_sync_dir=_path(
-            env, "REMARKABLE_SYNC_PATH", data_dir / "reMarkable_sync"
-        ),
-        wsl_distro=_text(env, "WSL_DISTRO", "Ubuntu"),
-        ollama_host=_text(env, "OLLAMA_HOST", "http://localhost:11434").rstrip("/"),
-        default_model=_text(env, "AGENT_DEFAULT_MODEL", "gemma4"),
-        clara_url=_text(env, "CLARA_URL", "http://127.0.0.1:8765").rstrip("/"),
-        clara_token=_get(env, "CLARA_TOKEN"),
-        clara_user=(_get(env, "CLARA_USER") or "").lower() or None,
-        clara_password=_get(env, "CLARA_PASSWORD"),
-        clara_user_name=_get(env, "CLARA_USER_NAME"),
-        clara_timezone=_get(env, "CLARA_TIMEZONE") or local_timezone(),
-        agent_instructions_path=_path(
-            env, "AGENT_INSTRUCTIONS_PATH", root / "config" / "agent_instructions.txt"
-        ),
-        agent_permission_level=_int(env, "AGENT_PERMISSION_LEVEL", 1),
-        # a user who signs in speaks as themselves: the server takes nothing else
-        agent_user_id=(_get(env, "CLARA_USER") or "").lower() or _text(env, "AGENT_USER_ID", "default_user"),
-        agent_session_id=_text(env, "AGENT_SESSION_ID", "console_session"),
-        agent_keep_sessions=max(1, _int(env, "AGENT_KEEP_SESSIONS", 5)),
-        agent_project_file=_text(env, "AGENT_PROJECT_FILE", "AGENT.md"),
-        moodle_enabled=_flag(env, "MOODLE_ENABLED", True),
-        moodle_base_url=_text(env, "MOODLE_BASE_URL", "https://moodle.epita.fr").rstrip(
-            "/"
-        ),
-        moodle_state_path=_path(
-            env, "MOODLE_STATE_PATH", root / "config" / "cookies" / "moodle_state.json"
-        ),
-        smtp_host=_get(env, "SMTP_HOST"),
-        smtp_port=_int(env, "SMTP_PORT", 587),
-        smtp_user=_get(env, "SMTP_USER"),
-        smtp_password=_get(env, "SMTP_PASSWORD"),
-        smtp_from=_get(env, "SMTP_FROM"),
-    )
-
-
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    """Process-wide settings, loaded on first use."""
-    return load_settings()
+        clara_url=url, token_file=token_file, data_dir=data_dir, config_dir=folder, tool_timeout=timeout,
+        result_limit=limit, rmapi=str(rmapi) if isinstance(rmapi, Path) else None,
+        log_level=str(values.get("CONSOLE_LOG_LEVEL", "info")), debug=debug, warnings=_warnings(url))

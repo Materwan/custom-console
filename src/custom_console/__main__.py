@@ -1,15 +1,12 @@
-"""Entry point: ``python -m custom_console`` or the ``custom_console`` script."""
+"""`python -m custom_console` and the `custom_console` command."""
 
-from __future__ import annotations
+import sys
 
-from .settings import get_settings
-from .shell import Shell
+from .cli import main as _main
 
 
 def main() -> None:
-    shell = Shell(get_settings())
-    shell.run()
-    shell.printer.console.clear()
+    sys.exit(_main())
 
 
 if __name__ == "__main__":
