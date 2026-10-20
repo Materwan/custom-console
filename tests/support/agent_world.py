@@ -31,12 +31,18 @@ class AgentFakeUI(FakeUI):
         super().__init__(answers)
         self.sub: list[tuple[str, Any]] = []
 
-    def sub_started(self, label: str) -> int:
+    def sub_started(self, label: str, prompt: str, round_limit: int) -> int:
         self.sub.append(("start", label))
         return len([s for s in self.sub if s[0] == "start"])
 
-    def sub_line(self, number: int, text: str) -> None:
-        self.sub.append(("line", text))
+    def sub_event(self, number: int, event: Any) -> None:
+        self.sub.append(("event", event))
+
+    def sub_tool(self, number: int, call: Any, ok: bool, result: str, seconds: float, preview: str) -> None:
+        self.sub.append(("tool", call.name))
+
+    def sub_waiting(self, number: int, waiting: bool) -> None:
+        self.sub.append(("waiting", waiting))
 
     def sub_finished(self, number: int, ok: bool, summary: str) -> None:
         self.sub.append(("end", (ok, summary)))

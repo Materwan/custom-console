@@ -18,7 +18,7 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from ..clara import ClaraClient
-from ..clara.events import Event, Token, ToolCall, ToolRequests
+from ..clara.events import Event, ToolCall, ToolRequests
 from ..platform import CancelToken
 from .journal import Journal
 from .ledger import Ledger
@@ -38,17 +38,21 @@ RESULT_LIMIT = 8_000  # characters given back
 
 
 class SubagentView(Protocol):
-    """What the interface shows of a sub-agent: a block that grows one line per tool call."""
+    """What the interface shows of a sub-agent: a tab of its own that prints what it does, and a status line in the main one."""
 
-    def sub_started(self, label: str) -> int: ...
+    def sub_started(self, label: str, prompt: str, round_limit: int) -> int: ...
 
-    def sub_line(self, number: int, text: str) -> None: ...
+    def sub_event(self, number: int, event: Event) -> None: ...
+
+    def sub_tool(self, number: int, call: ToolCall, ok: bool, result: str, seconds: float, preview: str) -> None: ...
+
+    def sub_waiting(self, number: int, waiting: bool) -> None: ...
 
     def sub_finished(self, number: int, ok: bool, summary: str) -> None: ...
 
 
 class _SubUI:
-    """The `TurnUI` of the sub-agent's turn: counts rounds, forwards prompts to the person, draws one line per tool."""
+    """The `TurnUI` of the sub-agent's turn: counts rounds, forwards prompts to the person, shows what it does in its tab."""
 
     def __init__(self, parent: TurnUI, view: SubagentView, number: int, on_round: Callable[[], None]):
         self.parent, self.view, self.number, self.on_round = parent, view, number, on_round
@@ -56,11 +60,14 @@ class _SubUI:
     def show(self, event: Event) -> None:
         if isinstance(event, ToolRequests):
             self.on_round()
-        elif isinstance(event, Token):
-            pass  # the answer is returned as text, not streamed into the transcript
+        self.view.sub_event(self.number, event)
 
     async def confirm(self, prompt: Prompt) -> str:
-        return await self.parent.confirm(dataclasses.replace(prompt, summary=f"[sub-agent] {prompt.summary}"))
+        self.view.sub_waiting(self.number, True)
+        try:
+            return await self.parent.confirm(dataclasses.replace(prompt, summary=f"[sub-agent] {prompt.summary}"))
+        finally:
+            self.view.sub_waiting(self.number, False)
 
     async def ask_user(self, question: Question) -> str:
         return ""  # a sub-agent cannot ask the person
@@ -69,18 +76,10 @@ class _SubUI:
         self.parent.approval_closed(approval_id, note)
 
     def tool_finished(self, call: ToolCall, ok: bool, result: str, seconds: float, preview: str) -> None:
-        first = (result.strip().splitlines() or [""])[0][:100]
-        self.view.sub_line(self.number, f"{'✓' if ok else '✗'} {call.name} {_brief(call.arguments)} — {first}")
+        self.view.sub_tool(self.number, call, ok, result, seconds, preview)
 
     def note(self, text: str) -> None:
         self.parent.note(text)
-
-
-def _brief(arguments: dict[str, Any]) -> str:
-    for key in ("path", "pattern", "glob", "command"):
-        if arguments.get(key):
-            return str(arguments[key])[:60]
-    return ""
 
 
 class SubagentRunner:
@@ -92,19 +91,21 @@ class SubagentRunner:
         self.ui, self.view, self.journal, self.ledger = ui, view, journal, ledger
         self.parent_runner = parent_runner
         self.round_limit, self.time_limit = round_limit, time_limit
+        self._stops: dict[int, Callable[[], None]] = {}  # the sub-agents at work, by number
 
     def instructions(self) -> str:
         return f"{SUBAGENT_PROMPT.strip()}\n\n## This session\n- Working folder: {self.ctx.folder.virtual}"
 
     async def __call__(self, prompt: str, parent_cancel: CancelToken) -> str:
         label = " ".join(prompt.split())[:70]
-        number = self.view.sub_started(label)
+        number = self.view.sub_started(label, prompt, self.round_limit)
         cancel = CancelToken()
         ctx = dataclasses.replace(self.ctx, cancel=cancel, vfs=self.ctx.vfs.fork(cancel), subagent=None, ask=None,
                                   todos=TodoStore(), extras={}, round_deadline=None,
                                   guard=OverwriteGuard(self.ctx.floor.case_insensitive))  # what it read unlocks nothing for the main agent
         session = Session(folder=self.parent.folder, incognito=True, local_only=self.parent.local_only,
-                          model=self.parent.model, disabled_tools=set(self.parent.disabled_tools))
+                          model=self.parent.model, disabled_tools=set(self.parent.disabled_tools),
+                          parent=self.parent.conversation)
         rounds = 0
         stopped_by = ""
 
@@ -118,6 +119,13 @@ class SubagentRunner:
         runner = TurnRunner(client=self.client, session=session, registry=self.registry, engine=self.engine, ctx=ctx,
                             ui=_SubUI(self.ui, self.view, number, on_round), journal=self.journal, ledger=self.ledger,
                             instructions=self.instructions, store=None, agent="sub", subagent=True)
+
+        def stop() -> None:
+            nonlocal stopped_by
+            stopped_by = stopped_by or "the person's request"
+            runner.cancel()
+
+        self._stops[number] = stop
         task = asyncio.create_task(runner.run(prompt))
         try:
             await asyncio.wait({task}, timeout=self.time_limit)
@@ -128,12 +136,21 @@ class SubagentRunner:
                 await task
             self.view.sub_finished(number, False, "stopped")
             raise
+        finally:
+            self._stops.pop(number, None)
         if not task.done():
             stopped_by = stopped_by or f"the time limit ({self.time_limit:.0f} s)"
             runner.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self._carry_taint(runner)
         return self._answer(number, task, runner, stopped_by)
+
+    def stop(self, number: int) -> bool:
+        """Stop one sub-agent (the person pressed Esc in its tab). False when it is not at work."""
+        stop = self._stops.get(number)
+        if stop is not None:
+            stop()
+        return stop is not None
 
     def _carry_taint(self, runner: TurnRunner) -> None:
         main = self.parent_runner()

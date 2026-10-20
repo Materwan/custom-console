@@ -34,16 +34,24 @@ def requests(turn_id, *calls):
 
 class View:
     def __init__(self):
-        self.lines: list[tuple[int, str]] = []
+        self.tools: list[tuple[int, str, dict]] = []
+        self.events: list[tuple[int, object]] = []
+        self.waiting: list[bool] = []
         self.started: list[str] = []
         self.finished: list[tuple[int, bool, str]] = []
 
-    def sub_started(self, label):
+    def sub_started(self, label, prompt, round_limit):
         self.started.append(label)
         return len(self.started)
 
-    def sub_line(self, number, text):
-        self.lines.append((number, text))
+    def sub_event(self, number, event):
+        self.events.append((number, event))
+
+    def sub_tool(self, number, call, ok, result, seconds, preview):
+        self.tools.append((number, call.name, call.arguments))
+
+    def sub_waiting(self, number, waiting):
+        self.waiting.append(waiting)
 
     def sub_finished(self, number, ok, summary):
         self.finished.append((number, ok, summary))
@@ -78,6 +86,7 @@ async def test_a_subagent_is_a_separate_incognito_conversation_that_only_reads(w
     assert result.outcome == "ok"
     main_body, sub_body = (r["body"] for r in fake_clara.requests_to("/v1/chat/stream"))
     assert sub_body["message"] == "find the answer" and sub_body["incognito"] is True and "conversation" not in sub_body
+    assert sub_body["parent"] == MAIN and "parent" not in main_body  # Clara shows it inside the main conversation
     offered = {t["function"]["name"] for t in sub_body["tools"]}
     readers = {"local_list", "local_read", "local_search", "local_git", "local_pdf_to_markdown"}
     assert {"local_list", "local_read", "local_search"} <= offered <= readers  # the PDF reader and git exist when installed
@@ -86,7 +95,8 @@ async def test_a_subagent_is_a_separate_incognito_conversation_that_only_reads(w
     assert "local_task" in {t["function"]["name"] for t in main_body["tools"]}
     assert fake_clara.results["t1"]["call_0_0"] == "It says alpha."
     assert view.started == ["find the answer"] and view.finished == [(1, True, "1 tool calls")]
-    assert "local_read" in view.lines[0][1] and "a.txt" in view.lines[0][1]
+    assert view.tools == [(1, "local_read", {"path": "a.txt"})]
+    assert {type(e).__name__ for _, e in view.events} >= {"TurnStarted", "ToolRequests", "Done"}  # what it does is shown
     assert w.session.conversation == MAIN and w.store.list()[0].conversation == MAIN  # the sub-agent never became the session
 
 
@@ -119,9 +129,10 @@ async def test_a_prompt_of_the_subagent_goes_to_the_person_marked_as_its_own(w, 
     outside.write_text("x")
     main_turn(fake_clara, turn("s1", SUB), requests("s1", ("local_read", {"path": str(outside)})), WaitResults(), done("ok", SUB))
     w.ui.answers = ["refuse_once"]
-    runner, _ = attach(w, client)
+    runner, view = attach(w, client)
     await runner.run("go")
     assert [p.summary.startswith("[sub-agent]") for p in w.ui.prompts] == [True]
+    assert view.waiting == [True, False]  # the main tab shows that it waited for the person
     assert "refused" in fake_clara.results["s1"]["call_0_0"].lower()
 
 
@@ -133,6 +144,23 @@ async def test_the_round_limit_stops_the_subagent(w, client, fake_clara):
     await runner.run("go")
     assert "round limit (1)" in fake_clara.results["t1"]["call_0_0"]
     assert view.finished[0][1] is False
+
+
+async def test_the_person_stops_one_subagent_and_the_main_agent_goes_on(w, client, fake_clara):
+    main_turn(fake_clara, turn("s1", SUB), Hang())
+    runner, view = attach(w, client)
+    task = asyncio.create_task(runner.run("go"))
+    for _ in range(100):
+        await asyncio.sleep(0.05)
+        if view.started:
+            break
+    await asyncio.sleep(0.2)
+    assert w.ctx.subagent.stop(1) is True
+    result = await task
+    assert w.ctx.subagent.stop(1) is False  # nothing left to stop
+    assert result.outcome == "ok"  # the main turn was not cancelled
+    assert "stopped at the person's request" in fake_clara.results["t1"]["call_0_0"]
+    assert view.finished[0][:2] == (1, False) and "person's request" in view.finished[0][2]
 
 
 async def test_the_time_limit_stops_the_subagent(w, client, fake_clara):

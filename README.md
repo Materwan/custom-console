@@ -62,12 +62,14 @@ Every start-up problem (bad setting, unreadable token file, ...) is printed in o
 | --- | --- |
 | Enter | send |
 | Shift+Enter, Ctrl+J, or `\` before Enter | add a line |
-| Esc | stop the answer or the command running |
+| Esc | stop the answer or the command running (in a sub-agent's tab: only that sub-agent) |
 | Up / Down | walk the history of what you sent |
 | Tab | complete a `/command`, a path, an `@file` |
 | Ctrl+V | paste text, or an image from the clipboard (it becomes an attachment) |
 | Ctrl+X | remove the last attachment |
 | Ctrl+D | leave (empty box) |
+| Alt+Left, Alt+Right, Alt+1..9 | switch between the main tab and the sub-agents' tabs |
+| Alt+W | close the sub-agent tab on screen, once it has finished |
 
 In a message: `@path` sends a file or a folder (small text files go in the message as a fenced block; PDF, Word, spreadsheet, slide and image files are attached and Clara reads them; a file over 30 MB is refused); `!command` runs a command now, as you, and its output goes with your next message; `//` and `!!` start a message with a real `/` or `!`.
 
@@ -75,7 +77,7 @@ Commands: `/model` `/tools` `/clear` `/project` `/retry` `/version` `/restore` `
 
 - **Sessions.** A session is one Clara conversation. The console saves a small metadata file per session and keeps the newest 5 of each folder; `/restore` lists and brings them back. Clara keeps the messages.
 - **Undo.** Before each `local_write` and `local_edit` the original is copied away; `/undo` goes back through the last turn. A file someone else changed since is left alone with a warning. What `local_run` does cannot be undone.
-- **Sub-agents.** `local_task` hands a reading job to a separate incognito conversation that can only read.
+- **Sub-agents.** `local_task` hands a reading job to a separate incognito conversation that can only read. Each one gets a tab of its own that prints what it does (thinking, tools, answer), and the main tab keeps one status line for it (round, time, current tool, "waiting for your answer"). A permission prompt, from either side, is drawn in every tab; the first answer closes the others. Esc in a sub-agent's tab stops only that sub-agent and the main agent goes on.
 - **`AGENT.md`** in a trusted folder is sent as project instructions; `/init` asks the agent to write one.
 - **Journal.** `/journal` shows what happened in this session: turns, tool calls with the permission decision and the reason, approval answers, errors. Secrets are redacted before anything is written.
 

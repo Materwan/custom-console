@@ -71,7 +71,7 @@ A session file holds no permission, rule or trust. `/restore` therefore cannot b
 
 - `@file` is a read like any other: inside the trusted folder it does not ask; a sensitive file, or one outside the folder, asks first. Attached files make the turn tainted.
 - `!command` runs as you, with your environment, without a prompt (you typed it). Its output goes with your next message, and that turn is tainted.
-- A **sub-agent** (`local_task`) has the read tools only, its own overwrite guard (what it read unlocks nothing for the main agent), a round limit (12), a time limit (300 s) and an 8,000-character result. A prompt it raises reaches you marked `[sub-agent]`.
+- A **sub-agent** (`local_task`) has the read tools only, its own overwrite guard (what it read unlocks nothing for the main agent), a round limit (12), a time limit (300 s) and an 8,000-character result. A prompt it raises reaches you marked `[sub-agent]`, and is drawn in every tab (the main one and each sub-agent's): the first answer wins and the other copies close with a note. Esc in a sub-agent's tab stops only that sub-agent.
 
 ## Time
 

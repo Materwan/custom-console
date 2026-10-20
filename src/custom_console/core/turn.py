@@ -159,7 +159,7 @@ class TurnRunner:
             project=session.project if new else None, model=session.model, fork_of=fork_of, timezone=timezone_name(),
             tools=tuple(s.schema() for s in specs) if fork_of is None else (),  # Clara refuses tools with fork_of
             instructions=self.instructions(), incognito=session.incognito if new else None,
-            local_only=session.local_only if new else None)
+            local_only=session.local_only if new else None, parent=session.parent if new else None)
 
     async def run(self, text: str, *, attachments: Sequence[Attachment] = (), fork_of: int | None = None,
                   tainted: bool = False) -> TurnResult:

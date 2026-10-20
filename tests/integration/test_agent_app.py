@@ -17,6 +17,7 @@ from custom_console.ui.widgets.blocks import (
     NoteBlock,
     PendingTool,
     QuestionBlock,
+    SubagentBlock,
     UserBlock,
 )
 from custom_console.ui.widgets.picker import PickerScreen
@@ -514,18 +515,104 @@ async def test_saying_no_to_trust_leaves_the_agent_read_only(tmp_path, fake_clar
         assert not app.agent.trusted
 
 
-async def test_a_subagent_is_a_collapsed_block_that_ends_with_a_mark(tmp_path, fake_clara):
-    sub = "c0fedcba987654321"
+SUB = "c0fedcba987654321"
+
+
+def pane_text(app, pane_id):
+    return "\n".join(text_of(w) for w in app.query(f"#{pane_id} *") if text_of(w))
+
+
+def sub_title(app):
+    return app.query_one(SubagentBlock).line(0, True).plain
+
+
+async def test_a_subagent_gets_a_tab_that_prints_what_it_did_and_a_status_line_in_the_main_one(tmp_path, fake_clara):
     fake_clara.queue_turn(turn(), requests("t1", ("local_task", {"prompt": "find the thing"})), WaitResults(), token("back"),
                           done("back"))
-    fake_clara.queue_turn(turn("s1", sub, incognito=True), token("found"), done("found", sub))
+    fake_clara.queue_turn(turn("s1", SUB, incognito=True), {"type": "thinking", "text": "let me look"},
+                          requests("s1", ("local_list", {})), WaitResults(), token("found"), done("found", SUB))
+    app, _ = make_app(tmp_path, fake_clara)
+    async with app.run_test(size=SIZE) as pilot:
+        assert not app.query_one("#tabs").has_class("open")  # no tab bar before there is a sub-agent
+        await type_and_send(app, pilot, "delegate")
+        await settle(app, pilot)
+        assert app.query_one("#tabs").has_class("open") and app._active == "main"  # it did not take the screen
+        assert sub_title(app).startswith("ok Sub-agent 1: find the thing") and "1 tool calls" in sub_title(app)
+        shown = pane_text(app, "pane-sub-1")
+        assert "find the thing" in shown and "list" in shown and "found" in shown  # its task, its tool, its answer
+        assert any(str(c.title) == "Thought (3 words)" for c in app.query("#pane-sub-1 Collapsible"))
+        assert "Finished: 1 tool calls" in shown
+        assert [t.label_text for t in app.query("Tab")] == ["Main", "ok sub-1"]
+    assert fake_clara.results["t1"]["call_0_0"] == "found"
+
+
+async def test_the_main_status_line_follows_the_subagent_while_it_works(tmp_path, fake_clara):
+    fake_clara.queue_turn(turn(), requests("t1", ("local_task", {"prompt": "wait there"})), WaitResults(), token("back"),
+                          done("back"))
+    fake_clara.queue_turn(turn("s1", SUB, incognito=True), requests("s1", ("local_read", {"path": "a.txt"})), Hang())
+    app, sh = make_app(tmp_path, fake_clara)
+    (sh.work / "a.txt").write_text("alpha\n")
+    async with app.run_test(size=SIZE) as pilot:
+        await type_and_send(app, pilot, "delegate")
+        await settle(app, pilot, until=lambda: bool(app.query(SubagentBlock)) and "round 1/12" in sub_title(app))
+        assert "working" in sub_title(app) and "wait there" in sub_title(app)
+        await settle(app, pilot, until=lambda: "list" not in sub_title(app) and "local_read" not in pane_text(app, "pane-sub-1"))
+        await pilot.press("alt+2")
+        assert app._active == "sub-1" and app.query_one("#panes").current == "pane-sub-1"
+        await pilot.press("escape")  # stops only the sub-agent
+        await settle(app, pilot)
+        assert sub_title(app).startswith("!! Sub-agent 1") and "person's request" in sub_title(app)
+        assert not app.busy
+    assert "stopped at the person's request" in fake_clara.results["t1"]["call_0_0"]
+    assert app.agent.session.conversation == CID  # the main conversation went on
+
+
+@pytest.mark.parametrize("answer_in", ["main", "sub-1"])
+async def test_a_prompt_of_the_subagent_is_in_every_tab_and_the_first_answer_closes_the_others(tmp_path, fake_clara, answer_in):
+    fake_clara.queue_turn(turn(), requests("t1", ("local_task", {"prompt": "read it"})), WaitResults(), token("back"),
+                          done("back"))
+    app, sh = make_app(tmp_path, fake_clara)
+    outside = sh.home / "elsewhere.txt"
+    outside.write_text("secret\n")
+    fake_clara.queue_turn(turn("s1", SUB, incognito=True), requests("s1", ("local_read", {"path": str(outside)})), WaitResults(),
+                          token("read"), done("read", SUB))
+    async with app.run_test(size=SIZE) as pilot:
+        await type_and_send(app, pilot, "delegate")
+        await settle(app, pilot, until=lambda: len(app.query(ApprovalBlock)) == 2)
+        assert {b.parent.id for b in app.query(ApprovalBlock)} == {"transcript", "pane-sub-1"}
+        assert all(text_of(b.query(Static).first()).startswith("Allow this?  [sub-agent]") for b in app.query(ApprovalBlock))
+        assert "waiting for your answer" in sub_title(app)
+        assert [t.label_text for t in app.query("Tab")] == ["Main", "! sub-1"]
+        if answer_in != "main":
+            await pilot.press("alt+right")
+            assert app._active == "sub-1"
+            assert [t.label_text for t in app.query("Tab")] == ["Main !", "! sub-1"]  # the other tab says a prompt is there
+        assert app.focused.parent.id == ("transcript" if answer_in == "main" else "pane-sub-1")
+        await pilot.press("o")
+        await settle(app, pilot)
+        other = "pane-sub-1" if answer_in == "main" else "transcript"
+        assert "allowed once" in pane_text(app, "transcript" if answer_in == "main" else "pane-sub-1")
+        assert f"answered in {'the main tab' if answer_in == 'main' else 'tab sub-1'}" in pane_text(app, other)
+        assert app.focused is app.prompt_box
+    assert fake_clara.results["t1"]["call_0_0"] == "read"
+
+
+async def test_tabs_switch_with_the_keys_and_a_finished_one_closes(tmp_path, fake_clara):
+    fake_clara.queue_turn(turn(), requests("t1", ("local_task", {"prompt": "one"})), WaitResults(), token("back"), done("back"))
+    fake_clara.queue_turn(turn("s1", SUB, incognito=True), token("done one"), done("done one", SUB))
     app, _ = make_app(tmp_path, fake_clara)
     async with app.run_test(size=SIZE) as pilot:
         await type_and_send(app, pilot, "delegate")
         await settle(app, pilot)
-        titles = [str(c.title) for c in app.query(Collapsible)]
-        assert any(t.startswith("ok Sub-agent: find the thing") for t in titles)
-    assert fake_clara.results["t1"]["call_0_0"] == "found"
+        await pilot.press("alt+right")
+        assert app._active == "sub-1"
+        await pilot.press("alt+right")
+        assert app._active == "main"  # it goes round
+        await pilot.press("alt+2")
+        await pilot.press("alt+w")
+        await settle(app, pilot, until=lambda: not app.query("#pane-sub-1") and app._active == "main")
+        assert not app.query_one("#tabs").has_class("open") and [t.label_text for t in app.query("Tab")] == ["Main"]
+        assert sub_title(app).endswith("(tab closed)")
 
 
 async def test_the_journal_opens_in_a_viewer_with_search(tmp_path, fake_clara):

@@ -18,31 +18,22 @@ from typing import Any
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Vertical
+from textual.content import Content
 from textual.css.query import NoMatches
-from textual.widgets import OptionList, Static
+from textual.widgets import ContentSwitcher, OptionList, Static, Tab, Tabs
 from textual.widgets.option_list import Option
 
 from ..clara import ClaraError
 from ..clara.events import (
     ApprovalRequested,
-    Compacted,
-    Discarded,
     Done,
     ErrorEvent,
     Event,
-    FileNote,
-    Quiz,
-    Retrying,
-    Thinking,
-    Token,
     ToolCall,
-    ToolDone,
     ToolRequests,
-    ToolStart,
     TurnStarted,
     Usage,
-    Warning,
 )
 from ..clara.types import Attachment, Message
 from ..commands.base import Line, Shell
@@ -65,17 +56,17 @@ from .widgets.blocks import (
     HistoryBlock,
     NoteBlock,
     OutputBlock,
-    PendingTool,
     QuestionBlock,
     SubagentBlock,
-    ThinkingBlock,
     UserBlock,
+    brief,
     plain,
     tool_block,
 )
+from .widgets.pane import Pane
 from .widgets.picker import PickerScreen
 from .widgets.prompt import PromptBox
-from .widgets.status import StatusFacts, StatusLine
+from .widgets.status import SPINNER_ASCII, SPINNER_UNICODE, StatusFacts, StatusLine
 from .widgets.viewer import ViewerScreen
 
 log = logging.getLogger("custom_console.agent_app")
@@ -121,11 +112,17 @@ class AppUI:
     def note(self, text: str) -> None:
         self.app.say(text, "dim")
 
-    def sub_started(self, label: str) -> int:
-        return self.app.sub_started(label)
+    def sub_started(self, label: str, prompt: str, round_limit: int) -> int:
+        return self.app.sub_started(label, prompt, round_limit)
 
-    def sub_line(self, number: int, text: str) -> None:
-        self.app.sub_line(number, text)
+    def sub_event(self, number: int, event: Event) -> None:
+        self.app.sub_event(number, event)
+
+    def sub_tool(self, number: int, call: ToolCall, ok: bool, result: str, seconds: float, preview: str) -> None:
+        self.app.sub_tool(number, call, ok, result, seconds, preview)
+
+    def sub_waiting(self, number: int, waiting: bool) -> None:
+        self.app.sub_waiting(number, waiting)
 
     def sub_finished(self, number: int, ok: bool, summary: str) -> None:
         self.app.sub_finished(number, ok, summary)
@@ -138,6 +135,10 @@ class AgentApp(App[None]):
         Binding("ctrl+c", "interrupt", "Stop", show=False, priority=True),
         Binding("ctrl+d", "leave", "Leave", show=False, priority=True),
         Binding("escape", "stop", "Stop", show=False),
+        Binding("alt+left", "tab_step(-1)", "Previous tab", show=False, priority=True),
+        Binding("alt+right", "tab_step(1)", "Next tab", show=False, priority=True),
+        Binding("alt+w", "tab_close", "Close tab", show=False, priority=True),
+        *(Binding(f"alt+{n}", f"tab_goto({n})", f"Tab {n}", show=False, priority=True) for n in range(1, 10)),
     ]
 
     def __init__(self, runtime: Runtime, shell: Shell, options: AgentOptions):
@@ -154,26 +155,28 @@ class AgentApp(App[None]):
         self.command_running = False
         self.turn_started = 0.0
         self.turn_model = ""
-        self._answer: AnswerBlock | None = None
-        self._thinking: ThinkingBlock | None = None
-        self._pending_tools: list[PendingTool] = []
-        self._approvals: dict[int, ApprovalBlock] = {}
+        self._approvals: dict[int, list[ApprovalBlock]] = {}  # a prompt is drawn in every tab; the first answer wins
+        self._prompt_open = False
         self._question: QuestionBlock | None = None
         self._permission_lock = asyncio.Lock()
         self._subagents: dict[int, SubagentBlock] = {}
+        self._sub_count = 0
+        self._tabs: list[str] = ["main"]  # the tabs, left to right: "main", then "sub-1", "sub-2" ...
+        self._active = "main"
         self._flow: asyncio.Future[Any] | None = None
         self._background: list[asyncio.Future[Any]] = []
         self._cands: list[Any] = []
         self._cand_start = 0
         self._complete_cancel: CancelToken | None = None
         self._frame = 0
-        self._streaming = False
         self._popup_text = ""
         self._trim_retry_at = 0.0
 
     # ------------------------------------------------------------------ layout
     def compose(self) -> ComposeResult:
-        yield VerticalScroll(id="transcript")
+        yield Tabs(Tab("Main", id="main"), id="tabs")  # shown once there is a sub-agent
+        with ContentSwitcher(id="panes", initial="transcript"):
+            yield Pane(id="transcript")
         with Vertical(id="bottom"):
             yield OptionList(id="popup")
             yield Static("", id="chips", classes="empty")
@@ -181,8 +184,9 @@ class AgentApp(App[None]):
             yield PromptBox()
 
     @property
-    def transcript(self) -> VerticalScroll:
-        return self.query_one("#transcript", VerticalScroll)
+    def transcript(self) -> Pane:
+        """The main agent's pane."""
+        return self.query_one("#transcript", Pane)
 
     @property
     def prompt_box(self) -> PromptBox:
@@ -274,6 +278,7 @@ class AgentApp(App[None]):
             working_seconds=working, frame=self._frame, unicode=self.shell.unicode)
         with contextlib.suppress(Exception):  # the screen may be closing
             self.query_one(StatusLine).show(facts)
+        self.refresh_tabs()
 
     def update_chips(self) -> None:
         chips = self.query_one("#chips", Static)
@@ -292,108 +297,59 @@ class AgentApp(App[None]):
 
     # ------------------------------------------------------------------ streaming
     def flush_streams(self) -> None:
-        for block in (self._thinking, self._answer):
-            if block is not None:
-                block.flush()
         with contextlib.suppress(NoMatches):  # the screen may be closing
+            for pane in self.query(Pane):
+                pane.flush()
             if len(self.transcript.children) > MAX_BLOCKS:
                 self.trim_transcript()
 
-    def answer(self) -> AnswerBlock:
-        if self._answer is None:
-            self._answer = AnswerBlock()
-            self.add(self._answer)
-        return self._answer
-
-    def thinking(self) -> ThinkingBlock:
-        if self._thinking is None:
-            self._thinking = ThinkingBlock()
-            self.add(self._thinking)
-        return self._thinking
-
     def close_blocks(self) -> None:
-        """The text and the thinking written so far are complete: draw them for good."""
-        if self._thinking is not None:
-            self._thinking.finish()
-            self._thinking = None
-        if self._answer is not None:
-            self._answer.flush()
-            self._answer.finish()
-            self._answer = None
+        self.transcript.close_blocks()
 
     def handle_event(self, event: Event) -> None:
         if isinstance(event, TurnStarted):
             self.turn_model = event.model
             self.refresh_status()
-        elif isinstance(event, Thinking):
-            self.thinking().feed(event.text)
-        elif isinstance(event, Token):
-            if self._thinking is not None:
-                self._thinking.finish()
-                self._thinking = None
-            self.answer().feed(event.text)
-            self._streaming = True
-        elif isinstance(event, Retrying):
-            self.say(event.message or f"Trying again with {event.model}.", "warn")
-        elif isinstance(event, ToolStart):
-            self.close_blocks()
-            pending = PendingTool(event.name, event.arguments)
-            self._pending_tools.append(pending)
-            self.add(pending)
-        elif isinstance(event, ToolDone):
-            self._server_tool_done(event)
-        elif isinstance(event, ToolRequests):
-            self.close_blocks()
         elif isinstance(event, Usage):
             self.refresh_status()
-        elif isinstance(event, Compacted):
-            self.say(f"Compacted: {event.before:.0f}% to {event.after:.0f}% of the context.", "ok")
-        elif isinstance(event, Discarded):
-            self.say("Dropped unanswered tool calls of an earlier turn: " + ", ".join(event.tools), "dim")
-        elif isinstance(event, Warning):
-            self.say(event.message, "warn")
-        elif isinstance(event, Quiz):
-            self.say(f"Clara showed a quiz ({event.title or 'untitled'}); the console cannot display it.", "warn")
-        elif isinstance(event, FileNote):
-            self.say(f"Clara {event.action or 'wrote'} {event.path}", "dim")
-        elif isinstance(event, Done):
-            if self._answer is None and event.reply.strip() and not self._streaming:
-                self.answer().feed(event.reply)
-            self.close_blocks()
-            self._streaming = False
-            self.refresh_status()
-        elif isinstance(event, (ApprovalRequested, ErrorEvent)):
-            pass  # a prompt opens through `confirm`; an error is told once the turn ends
-
-    def _server_tool_done(self, event: ToolDone) -> None:
-        for pending in self._pending_tools:
-            if pending.tool == event.name:
-                self._pending_tools.remove(pending)
-                pending.remove()
-                break
-        self.add(tool_block(event.name, event.arguments, True, event.result, 0.0, server=True))
+        elif not isinstance(event, (ApprovalRequested, ErrorEvent)):  # a prompt opens through `confirm`; an error is told once the turn ends
+            self.transcript.handle_event(event)
+            if isinstance(event, Done):
+                self.refresh_status()
 
     # ------------------------------------------------------------------ prompts to the person
     async def ask_permission(self, prompt: Prompt) -> str:
+        """The prompt is drawn in every tab, so it is answered from wherever the person is; the first answer closes the others."""
         async with self._permission_lock:
-            block = ApprovalBlock(prompt)
+            blocks = {key: ApprovalBlock(prompt) for key in self._tabs}
             if prompt.approval_id is not None:
-                self._approvals[prompt.approval_id] = block
-            await self.transcript.mount(block)
-            self.transcript.anchor()
+                self._approvals[prompt.approval_id] = list(blocks.values())
+            self._prompt_open = True
+            self.refresh_tabs()
             try:
-                return await block.future
+                for key, block in blocks.items():
+                    await self._pane(key).mount(block)
+                self.focus_active()
+                done, _ = await asyncio.wait([b.future for b in blocks.values()], return_when=asyncio.FIRST_COMPLETED)
+                first = next(iter(done))
+                answer = first.result()  # a prompt closed from elsewhere (answered on another device) raises, as with one block
+                where = next(key for key, b in blocks.items() if b.future is first)
+                for block in blocks.values():
+                    block.close_with_note(f"answered in {self._tab_name(where)}")
+                return answer
             except asyncio.CancelledError:
-                block.close_with_note("Stopped")
+                for block in blocks.values():
+                    block.close_with_note("Stopped")
                 raise
             finally:
                 if prompt.approval_id is not None:
                     self._approvals.pop(prompt.approval_id, None)
-                self.prompt_box.focus()
+                self._prompt_open = False
+                self.refresh_tabs()
+                self.focus_active()
 
     def close_approval(self, approval_id: int, note: str) -> None:
-        block = self._approvals.get(approval_id)
-        if block is not None:
+        for block in self._approvals.get(approval_id, ()):
             block.close_with_note(note)
 
     async def ask_question(self, question: Question) -> str:
@@ -407,21 +363,133 @@ class AgentApp(App[None]):
         finally:
             self._question = None
 
-    # ------------------------------------------------------------------ sub-agents
-    def sub_started(self, label: str) -> int:
-        block = SubagentBlock(label)
-        number = len(self._subagents) + 1
+    # ------------------------------------------------------------------ sub-agents and tabs
+    def _block(self, key: str) -> SubagentBlock:
+        return self._subagents[int(key.removeprefix("sub-"))]
+
+    def _pane(self, key: str) -> Pane:
+        return self.transcript if key == "main" else self._block(key).pane
+
+    def _tab_name(self, key: str) -> str:
+        return "the main tab" if key == "main" else f"tab {key}"
+
+    def sub_started(self, label: str, prompt: str, round_limit: int) -> int:
+        self._sub_count += 1
+        number = self._sub_count
+        pane = Pane(id=f"pane-sub-{number}", local_pending=True)
+        block = SubagentBlock(number, label, round_limit, pane)
         self._subagents[number] = block
+        self._tabs.append(block.key)
+        tabs = self.query_one("#tabs", Tabs)
+        self.query_one("#panes", ContentSwitcher).add_content(pane)
+        tabs.add_class("open")
+        tabs.add_tab(Tab(block.key, id=block.key))
+        pane.add(UserBlock(prompt))
+        pane.say(f"Sub-agent {number}, started by the main agent. Esc stops it; Alt+Left goes back to the main tab.")
         self.add(block)
+        self.refresh_tabs()
         return number
 
-    def sub_line(self, number: int, text: str) -> None:
+    def sub_event(self, number: int, event: Event) -> None:
+        if (block := self._subagents.get(number)) is None:
+            return
+        if isinstance(event, ToolRequests):
+            block.rounds += 1
+            block.action = ""
+            if event.calls:
+                first = event.calls[0]
+                block.action = f"{first.name.removeprefix('local_')} {brief(first.arguments)}".strip()
+                block.action += f" +{len(event.calls) - 1}" if len(event.calls) > 1 else ""
+        block.pane.handle_event(event)
+        self.refresh_tabs()
+
+    def sub_tool(self, number: int, call: ToolCall, ok: bool, result: str, seconds: float, preview: str) -> None:
         if (block := self._subagents.get(number)) is not None:
-            block.add_line(text)
+            block.action = ""
+            block.pane.tool_finished(call, ok, result, seconds, preview)
+            self.refresh_tabs()
+
+    def sub_waiting(self, number: int, waiting: bool) -> None:
+        if (block := self._subagents.get(number)) is not None:
+            block.waiting = waiting
+            self.refresh_tabs()
 
     def sub_finished(self, number: int, ok: bool, summary: str) -> None:
         if (block := self._subagents.get(number)) is not None:
+            block.pane.close_blocks()
+            block.pane.drop_pending()
+            block.pane.say(f"{'Finished' if ok else 'Stopped'}: {summary}. Alt+W closes this tab.", "ok" if ok else "warn")
             block.finish(ok, summary)
+            self.refresh_tabs()
+
+    def tab_label(self, key: str) -> str:
+        """`sub-1` with its state: a spinner at work, `!` when it waits for the person (or a prompt waits in another tab), ok/!! when done."""
+        if key == "main":
+            return "Main !" if self._prompt_open and self._active != "main" else "Main"
+        block = self._block(key)
+        if block.done:
+            mark = "ok" if block.ok else "!!"
+        elif block.waiting or (self._prompt_open and self._active != key):
+            mark = "!"
+        else:
+            frames = SPINNER_UNICODE if self.shell.unicode else SPINNER_ASCII
+            mark = frames[self._frame % len(frames)]
+        return f"{mark} {key}"
+
+    def refresh_tabs(self) -> None:
+        with contextlib.suppress(Exception):  # the screen may be closing
+            tabs = self.query_one("#tabs", Tabs)
+            for key in self._tabs:
+                tab = tabs.query_one(f"#{key}", Tab)
+                label = self.tab_label(key)
+                if tab.label_text != label:
+                    tab.label = Content(label)
+            for block in self._subagents.values():
+                block.show(self._frame, self.shell.unicode)
+
+    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        key = event.tab.id or "main"
+        self._active = key
+        self.query_one("#panes", ContentSwitcher).current = "transcript" if key == "main" else self._pane(key).id
+        self.refresh_tabs()
+        self.focus_active()
+
+    def focus_active(self) -> None:
+        """The answer keys go to an open prompt in the tab on screen; otherwise the person types."""
+        for block in self._pane(self._active).query(ApprovalBlock):
+            if not block.future.done():
+                block.focus()
+                return
+        self.prompt_box.focus()
+
+    def action_tab_step(self, step: int) -> None:
+        self.query_one("#tabs", Tabs).active = self._tabs[(self._tabs.index(self._active) + step) % len(self._tabs)]
+
+    def action_tab_goto(self, number: int) -> None:
+        if number <= len(self._tabs):
+            self.query_one("#tabs", Tabs).active = self._tabs[number - 1]
+
+    def action_tab_close(self) -> None:
+        if self._active == "main":
+            return
+        block = self._block(self._active)
+        if not block.done:
+            self._pane(self._active).say("That sub-agent is still at work. Esc stops it.", "warn")
+            return
+        block.closed = True
+        self._remove_tab(block.key)
+        block.show(self._frame, self.shell.unicode)
+
+    def _remove_tab(self, key: str) -> None:
+        tabs = self.query_one("#tabs", Tabs)
+        pane = self._pane(key)
+        if self._active == key:
+            tabs.active = "main"
+        self._tabs.remove(key)
+        tabs.remove_tab(key)
+        pane.remove()
+        if len(self._tabs) == 1:
+            tabs.remove_class("open")
 
     # ------------------------------------------------------------------ keys
     def action_interrupt(self) -> None:
@@ -440,6 +508,9 @@ class AgentApp(App[None]):
         if self.prompt_box.popup_open:
             self.close_popup()
             return
+        if self._active != "main":
+            self.agent.stop_subagent(self._block(self._active).number)
+            return
         if not self.busy:
             return
         self.agent.cancel()
@@ -452,9 +523,10 @@ class AgentApp(App[None]):
 
     # ------------------------------------------------------------------ SlashScreen
     def clear_transcript(self) -> None:
-        self._answer = self._thinking = None
-        self._pending_tools.clear()
+        for key in self._tabs[1:]:
+            self._remove_tab(key)
         self._subagents.clear()
+        self.transcript.reset()
         self.transcript.remove_children()
 
     def show_answer(self, text: str) -> None:
@@ -623,9 +695,7 @@ class AgentApp(App[None]):
             self.say(f"Unexpected error: {type(error).__name__}: {error}. See the log.", "error")
         finally:
             self.close_blocks()
-            for stale in self._pending_tools:  # a Clara tool whose end never came (the turn was stopped)
-                stale.remove()
-            self._pending_tools.clear()
+            self.transcript.drop_pending()  # a Clara tool whose end never came (the turn was stopped)
             self.turn_running = False
             self.refresh_status()
             self.prompt_box.focus()

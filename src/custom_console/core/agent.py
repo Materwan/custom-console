@@ -184,6 +184,11 @@ class Agent:
         if self._owns_client:
             await self.client.aclose()
 
+    def stop_subagent(self, number: int) -> bool:
+        """Stop one sub-agent and let the main agent go on. False when that one is not at work."""
+        runner = self.ctx.subagent
+        return isinstance(runner, SubagentRunner) and runner.stop(number)
+
     @property
     def trusted(self) -> bool:
         return self.ctx.trusted

@@ -61,6 +61,7 @@ class ChatBody:
     instructions: str | None = None
     incognito: bool | None = None
     local_only: bool | None = None
+    parent: str | None = None  # a new conversation shown inside this one (a sub-agent's)
 
     def to_json(self) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -75,6 +76,7 @@ class ChatBody:
             "instructions": self.instructions,
             "incognito": self.incognito,
             "local_only": self.local_only,
+            "parent": self.parent,
         }
         return {key: value for key, value in body.items() if value is not None}
 

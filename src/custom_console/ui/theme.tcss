@@ -2,10 +2,26 @@ Screen {
     layout: vertical;
 }
 
-#transcript {
+#tabs {
+    display: none;
+}
+
+#tabs.open {
+    display: block;
+}
+
+#panes {
+    height: 1fr;
+}
+
+Pane {
     height: 1fr;
     padding: 0 1;
     scrollbar-size-vertical: 1;
+}
+
+SubagentBlock {
+    height: auto;
 }
 
 #bottom {

@@ -15,9 +15,11 @@ ANSWER_WORDS = {
     "refuse": "refuse_once", "no": "refuse_once", "r": "refuse_once", "never": "refuse_always", "n": "refuse_always",
 }
 KEYS = (
-    ("Enter", "send the message"), ("Shift+Enter or Ctrl+J", "add a line"), ("Esc", "stop the answer or the command running"),
+    ("Enter", "send the message"), ("Shift+Enter or Ctrl+J", "add a line"), ("Esc", "stop the answer or the command running (in a sub-agent's tab: only that sub-agent)"),
     ("Up / Down", "walk the history of what you sent"), ("Tab", "complete a command, a path or an @file"),
     ("Ctrl+V", "paste text, or an image from the clipboard"), ("Ctrl+D", "leave (when the box is empty)"),
+    ("Alt+Left / Alt+Right / Alt+1..9", "switch between the main tab and the sub-agents' tabs"),
+    ("Alt+W", "close the sub-agent tab on screen once it has finished"),
 )
 
 

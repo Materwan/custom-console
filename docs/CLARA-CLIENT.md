@@ -22,7 +22,9 @@ Not used: `/v1/documents/extract` (the server prepares attachments itself), `/v1
 
 ## The chat body
 
-`message` (up to 2,000,000 characters), `conversation`, `attachments` (`name`, base64 `data`; at most 30 MB each), `project`, `model`, `fork_of`, `timezone`, `tools` (up to 64 schemas; 16 are sent), `instructions` (up to 20,000 characters), `incognito`, `local_only`. A body is built from typed fields: a field is left out only when it is `None`, never because it is `0` or `False` (BUG-10). A body Clara would refuse (empty message, bad conversation id, too many tools, instructions too long) is refused before sending.
+`message` (up to 2,000,000 characters), `conversation`, `attachments` (`name`, base64 `data`; at most 30 MB each), `project`, `model`, `fork_of`, `timezone`, `tools` (up to 64 schemas; 16 are sent), `instructions` (up to 20,000 characters), `incognito`, `local_only`, `parent`. A body is built from typed fields: a field is left out only when it is `None`, never because it is `0` or `False` (BUG-10). A body Clara would refuse (empty message, bad conversation id, too many tools, instructions too long) is refused before sending.
+
+**Sub-agents.** A sub-agent (`local_task`) works in a conversation of its own, incognito, and its first chat body carries `parent`: the main agent's conversation id. Clara then leaves it out of every list and shows it inside the main conversation, as a block that opens under the `local_task` call; it is kept as long as the main conversation and deleted with it. A Clara that does not know `parent` ignores it.
 
 **Tool packs** cannot be put in the chat body. When you change them before the first message, the console creates the conversation first (`POST /v1/conversations` with `packs`) and chats in it.
 

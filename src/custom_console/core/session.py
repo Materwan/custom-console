@@ -59,6 +59,7 @@ class Session:
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)
     # not saved:
+    parent: str | None = None  # the conversation of the main agent, for a sub-agent's session
     plan_mode: bool = False
     pending_notes: list[str] = field(default_factory=list)  # `!command` output waiting to go with the next message
     context_percent: float = 0.0

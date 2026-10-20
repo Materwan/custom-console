@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rich.console import Group, RenderableType
 from rich.markdown import Markdown as RichMarkdown
@@ -18,6 +19,10 @@ from textual.widgets import Collapsible, Static
 
 from ...core.tools.base import Question
 from ...core.turn import Prompt
+from .status import SPINNER_ASCII, SPINNER_UNICODE
+
+if TYPE_CHECKING:
+    from .pane import Pane
 
 TOOL_BODY_LINES = 30
 
@@ -193,24 +198,48 @@ class PendingTool(Static):
         self.tool = name
 
 
-class SubagentBlock(Collapsible):
-    def __init__(self, label: str):
-        self._log = Static("")
-        super().__init__(self._log, title=f"Sub-agent: {label} ...", collapsed=True)
-        self.label = label
-        self.done = False
-        self.lines: list[str] = []
+class SubagentBlock(Static):
+    """The sub-agent in the main transcript: one line that says where it is. Its work is in its own tab (`pane`)."""
 
-    def add_line(self, text: str) -> None:
-        self.lines.append(text)
-        self._log.update(plain("\n".join(self.lines[-60:])))
+    def __init__(self, number: int, label: str, round_limit: int, pane: Pane):
+        self.number, self.label, self.round_limit, self.pane = number, label, round_limit, pane
+        self.started = time.monotonic()
+        self.rounds = 0
+        self.action = ""  # what the tool being run is, while it runs
+        self.waiting = False  # for the person's answer
+        self.done = False
+        self.ok = False
+        self.summary = ""
+        self.closed = False  # its tab was closed
+        super().__init__(self.line(0, True))
+
+    @property
+    def key(self) -> str:
+        return f"sub-{self.number}"
+
+    def line(self, frame: int, unicode: bool) -> Text:
+        name = f"Sub-agent {self.number}: {self.label}"
+        if self.done:
+            text = f"{'ok' if self.ok else '!!'} {name} - {self.summary}" + (" (tab closed)" if self.closed else "")
+            return Text(text, style="" if self.ok else "red")
+        if self.waiting:
+            mark, state = "!", "waiting for your answer"
+        else:
+            frames = SPINNER_UNICODE if unicode else SPINNER_ASCII
+            mark, state = frames[frame % len(frames)], "working"
+        detail = f"round {min(self.rounds, self.round_limit)}/{self.round_limit}, {time.monotonic() - self.started:.0f}s"
+        text = f"{mark} {name} - {state} ({detail})" + (f": {self.action}" if self.action else "")
+        return Text(text, style="bold yellow" if self.waiting else "")
+
+    def show(self, frame: int, unicode: bool) -> None:
+        self.update(self.line(frame, unicode))
 
     def finish(self, ok: bool, summary: str) -> None:
-        self.title = f"{'ok' if ok else '!!'} Sub-agent: {self.label} - {summary}"
-        self.done = True
+        self.done, self.ok, self.summary, self.waiting, self.action = True, ok, summary, False, ""
+        self.show(0, True)
 
     def snapshot(self) -> RenderableType | None:
-        return Text("  " + str(self.title), style="dim") if self.done else None
+        return Text("  " + self.line(0, True).plain, style="dim") if self.done else None
 
 
 class ApprovalBlock(Vertical, can_focus=True):
