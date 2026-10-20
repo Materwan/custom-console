@@ -120,6 +120,28 @@ async def test_always_is_remembered_for_exactly_that_call(w, client, fake_clara)
     assert (w.work / "x.txt").read_text() == "v2"
 
 
+async def test_a_pattern_answer_is_kept_for_the_folder_and_nothing_asks_next_time(w, client, fake_clara):
+    w.ui.answers = ["allow_pattern"]
+    fake_clara.queue_turn(turn(), requests("t1", ("local_run", {"command": "ruff --version"})), WaitResults(), done())
+    await w.runner(client).run("1")
+    assert w.ui.prompts[0].proposal is not None and w.ui.prompts[0].proposal.patterns == (("ruff",),)
+    assert any("Remembered in this folder: ruff:*" in n for n in w.ui.notes)
+    fake_clara.queue_turn(turn("t2"), requests("t2", ("local_run", {"command": "ruff check . 2>&1 | tail -3"})),
+                          WaitResults(), done())
+    await w.runner(client).run("2")
+    assert len(w.ui.prompts) == 1, "the second command is covered by the pattern"
+    tools = [e for e in w.journal.read() if e["kind"] == "tool"]
+    assert (tools[0]["answer"], tools[1]["step"]) == ("allow_pattern", "stored")
+
+
+async def test_a_command_the_floor_or_a_tainted_turn_escalated_carries_no_proposal(w, client, fake_clara):
+    w.ui.answers = ["allow_once"]
+    fake_clara.queue_turn(turn(), {"type": "tool_start", "name": "web_fetch", "arguments": {}},
+                          requests("t1", ("local_run", {"command": "ruff --version"})), WaitResults(), done())
+    await w.runner(client).run("1")
+    assert w.ui.prompts[0].tainted and w.ui.prompts[0].proposal is None
+
+
 async def test_a_turn_that_read_outside_content_makes_everything_ask(w, client, fake_clara):
     w.ui.answers = ["allow_always", "allow_once"]
     call = ("local_write", {"path": "x.txt", "content": "v"})

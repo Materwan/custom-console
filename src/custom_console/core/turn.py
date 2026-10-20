@@ -42,6 +42,7 @@ from ..platform import Cancelled, CancelToken
 from .journal import Journal
 from .ledger import Ledger
 from .permissions.engine import ASK, REFUSE, CallInfo, Decision, PermissionEngine, Situation
+from .permissions.propose import Asker, Proposal, plan
 from .permissions.redact import hide_clara_tokens
 from .session import Session, SessionStore, timezone_name
 from .tools.base import Question, ToolContext, ToolError, call_handler, cut_middle, validate_args
@@ -83,6 +84,7 @@ class Prompt:
     level: str = ""
     floor: tuple[str, ...] = ()
     tainted: bool = False
+    proposal: Proposal | None = None  # the patterns "always" could keep for a command (a key press asks the model)
 
 
 class TurnUI(Protocol):
@@ -116,11 +118,12 @@ class TurnRunner:
     def __init__(self, *, client: ClaraClient, session: Session, registry: ToolRegistry, engine: PermissionEngine,
                  ctx: ToolContext, ui: TurnUI, journal: Journal, ledger: Ledger, instructions: Callable[[], str],
                  store: SessionStore | None = None, agent: str = "main", subagent: bool = False,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, proposer: Asker | None = None):
         self.client, self.session, self.registry, self.engine = client, session, registry, engine
         self.ctx, self.ui, self.journal, self.ledger = ctx, ui, journal, ledger
         self.instructions, self.store, self.agent, self.subagent = instructions, store, agent, subagent
         self._clock = clock
+        self.proposer = proposer
         self.tainted = False
         self.turn_id = ""
         self.model = ""
@@ -315,7 +318,7 @@ class TurnRunner:
                 answer = await asyncio.wait_for(self.ui.confirm(prompt), timeout=max(left - 5.0, 1.0))
             except TimeoutError:
                 return self._finish(call, False, NO_ANSWER_TEXT, started, decision, "timeout", preview)
-            line = self.engine.record(decision, answer)
+            line = self.engine.record(decision, answer, prompt.proposal.patterns if prompt.proposal else ())
             if line:
                 self.ui.note(line)
             if answer.startswith("refuse"):
@@ -356,7 +359,8 @@ class TurnRunner:
             return ""
 
     def _prompt(self, info: CallInfo, decision: Decision, preview: str, left: float) -> Prompt:
+        proposal = plan(decision.parts, self.engine.windows, self.proposer) if decision.parts else None
         return Prompt("local", info.tool, info.summary, decision.reason, decision.command, decision.paths, preview,
                       decision.can_remember, decision.why_not_remembered, left, undoable=info.undoable, floor=decision.floor,
-                      tainted=decision.tainted)
+                      tainted=decision.tainted, proposal=proposal)
 

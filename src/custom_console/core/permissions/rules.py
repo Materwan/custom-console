@@ -3,17 +3,30 @@
 A rule stores the tool, the exact command and *all* of its paths together, and matches only that same call (SEC-3). It is
 never applied to a call the floor or a tainted turn escalated (N1). A refusal rule is the only kind that always applies:
 saying no is always safe.
+
+A *pattern* rule (`local_run`, `uv run pytest:*`) is the other kind of "always": the words that say what runs, then any
+arguments, for one folder only (the hash of its real path, as in `trust.json`). It is checked again each time it is used
+(`pattern_covers`), so a hand-edited `uv:*` never matches anything.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from ..vfs.text import fold_path
+from .allowlist import Simple, pattern_covers
+
+
+def folder_id(real_folder: str, case_insensitive: bool) -> str:
+    """The folder a pattern rule belongs to: a hash of its real path, so the file shows nothing about where you work."""
+    return hashlib.sha256(fold_path(real_folder, case_insensitive).rstrip("/").encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,9 +63,22 @@ class Rule:
     hits: int = 0
     note: str = ""
     id: int = field(default=0)
+    pattern: tuple[str, ...] = ()  # non-empty: a pattern rule, the key holds only its tool
+    folder: str = ""  # a pattern rule applies in this folder only
 
     def to_json(self) -> dict[str, object]:
-        return {"effect": self.effect, **self.key.to_json(), "created": self.created, "hits": self.hits, "note": self.note}
+        data: dict[str, object] = {"effect": self.effect, **self.key.to_json(), "created": self.created, "hits": self.hits,
+                                   "note": self.note}
+        if self.pattern:
+            data |= {"pattern": list(self.pattern), "folder": self.folder}
+        return data
+
+    def describe(self, here: str = "") -> str:
+        """The rule in a line; a pattern rule says whether it is for the folder the person is in."""
+        if not self.pattern:
+            return self.key.describe()
+        where = "in this folder" if self.folder == here else f"in another folder ({self.folder[:8]})"
+        return f"{self.key.tool} '{' '.join(self.pattern)}:*' {where}"
 
 
 class RuleStore:
@@ -69,8 +95,11 @@ class RuleStore:
         rules: list[Rule] = []
         for item in items if isinstance(items, list) else []:
             if isinstance(item, dict) and item.get("effect") in ("allow", "refuse") and item.get("tool"):
+                words = item.get("pattern")
+                pattern = tuple(str(w) for w in words) if isinstance(words, list) else ()
                 rules.append(Rule(str(item["effect"]), RuleKey.from_json(item), float(item.get("created", 0) or 0),
-                                  int(item.get("hits", 0) or 0), str(item.get("note", ""))))
+                                  int(item.get("hits", 0) or 0), str(item.get("note", "")), pattern=pattern,
+                                  folder=str(item.get("folder", "")) if pattern else ""))
         for number, rule in enumerate(rules, 1):
             rule.id = number
         return rules
@@ -90,9 +119,9 @@ class RuleStore:
             raise ValueError("effect must be allow or refuse")
         rules = self._load()
         for rule in rules:
-            if rule.key == key and rule.effect == effect:
+            if not rule.pattern and rule.key == key and rule.effect == effect:
                 return rule
-        rules = [r for r in rules if r.key != key]  # a new answer replaces the opposite one
+        rules = [r for r in rules if r.pattern or r.key != key]  # a new answer replaces the opposite one
         rule = Rule(effect, key, self._clock(), 0, note, len(rules) + 1)
         rules.append(rule)
         self._save(rules)
@@ -110,8 +139,36 @@ class RuleStore:
         """The rule of this effect for exactly this key, counting the hit."""
         rules = self._load()
         for rule in rules:
-            if rule.effect == effect and rule.key == key:
+            if rule.effect == effect and not rule.pattern and rule.key == key:
                 rule.hits += 1
                 self._save(rules)
                 return rule
         return None
+
+    # ------------------------------------------------------------------ pattern rules
+    def add_pattern(self, tool: str, pattern: tuple[str, ...], folder: str, note: str = "") -> Rule:
+        rules = self._load()
+        for rule in rules:
+            if rule.pattern == pattern and rule.folder == folder and rule.key.tool == tool and rule.effect == "allow":
+                return rule
+        rule = Rule("allow", RuleKey(tool, " ".join(pattern) + ":*"), self._clock(), 0, note, len(rules) + 1,
+                    tuple(pattern), folder)
+        rules.append(rule)
+        self._save(rules)
+        return rule
+
+    def find_pattern(self, tool: str, simple: Simple, folder: str, windows: bool) -> Rule | None:
+        """The stored pattern of this folder that covers the command (it is checked again now), without counting a hit."""
+        for rule in self._load():
+            if (rule.pattern and rule.effect == "allow" and rule.key.tool == tool and rule.folder == folder
+                    and pattern_covers(rule.pattern, simple, windows)):
+                return rule
+        return None
+
+    def hit(self, rules_used: Iterable[Rule]) -> None:
+        used = {r.id for r in rules_used}
+        rules = self._load()
+        for rule in rules:
+            if rule.id in used:
+                rule.hits += 1
+        self._save(rules)

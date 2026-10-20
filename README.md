@@ -83,7 +83,7 @@ Commands: `/model` `/tools` `/clear` `/project` `/retry` `/version` `/restore` `
 
 Nothing happens on your computer without a decision, and the decision is one engine's, in this order: **resolve** the paths (typed and real), the **floor** (sensitive files, `.git`, anything outside the trusted folder, network paths: always asks, never an "always"), a **tainted turn** (after Clara read outside content, every change and command asks), the short **read-only allowlist** inside the trusted folder, **stored answers**, and otherwise it **asks**.
 
-Answer a prompt with `o` (once), `a` (always, for exactly that call), `r` (refuse) or `n` (never). A new folder asks once to be trusted; an untrusted folder gets read tools only and its `AGENT.md` is not read. The full description is in [docs/PERMISSIONS.md](docs/PERMISSIONS.md).
+Answer a prompt with `o` (once), `a` (always), `r` (refuse) or `n` (never). For a command, `a` offers a **pattern** such as `uv run pytest:*` (that tool, any arguments, in this folder only) and asks you to confirm it with `y`; `e` keeps only the exact command instead. Shells, installers, network tools and deleting commands are never remembered. A new folder asks once to be trusted; an untrusted folder gets read tools only and its `AGENT.md` is not read. The full description is in [docs/PERMISSIONS.md](docs/PERMISSIONS.md).
 
 ## What goes to Clara, and what stays here
 
@@ -106,6 +106,7 @@ Four sources, in this order: the command line, the environment, a `.env` file in
 | `CONSOLE_RESULT_LIMIT` | `--result-limit` | 30000 | characters kept of one tool result |
 | `CONSOLE_RMAPI` | `--rmapi` | search the path | path to `rmapi` |
 | `CONSOLE_LOG_LEVEL` | `--log-level` | `info` | log detail |
+| `CONSOLE_RULE_MODEL` | none | the session's model | model that proposes a permission pattern for a command the built-in table does not know |
 
 `--debug` logs the method, path and status of each request, never a body or a header. The log redacts secrets.
 

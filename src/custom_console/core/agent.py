@@ -26,10 +26,11 @@ from . import attachments as att
 from .journal import Journal, prune_journals
 from .ledger import Ledger, Totals
 from .options import AgentOptions
+from .permissions.allowlist import pattern_problem, simple_words
 from .permissions.engine import ASK, READ, REFUSE, CallInfo, Decision, PathUse, PermissionEngine, Situation
 from .permissions.floor import FloorConfig
 from .permissions.redact import hide_clara_tokens, scrub_environment
-from .permissions.rules import Rule, RuleStore
+from .permissions.rules import Rule, RuleStore, folder_id
 from .permissions.trust import TrustStore
 from .prompt import (
     SessionFacts,
@@ -39,6 +40,7 @@ from .prompt import (
     project_file_warning,
     read_project_file,
 )
+from .proposer import RuleProposer
 from .runtime import Runtime
 from .session import Session, SessionStore
 from .subagent import SubagentRunner, SubagentView
@@ -107,6 +109,7 @@ class VersionInfo:
 @dataclass(slots=True)
 class RuleReport:
     local: list[Rule] = field(default_factory=list)
+    here: str = ""  # the id pattern rules of this folder carry
     clara: Rules | None = None
     clara_error: str = ""
 
@@ -135,6 +138,8 @@ class Agent:
         self.registry = ToolRegistry()
         self.undo = UndoLog(self.layout.undo)
         self.ledger = Ledger(self.layout.usage)
+        self.proposer = RuleProposer(self.client, lambda: self.session, self.ledger, self.settings.rule_model,
+                                     self.platform.is_windows)
         self.store = SessionStore(self.layout.sessions, self.real_folder, case_insensitive=ci)
         self.jobs = JobTable()
         self.ctx = ToolContext(
@@ -155,7 +160,7 @@ class Agent:
         self.journal = Journal(self.layout.journal, session.id)
         self.runner = TurnRunner(client=self.client, session=session, registry=self.registry, engine=self.engine, ctx=self.ctx,
                                  ui=self.ui, journal=self.journal, ledger=self.ledger, instructions=self.instructions,
-                                 store=self.store)
+                                 store=self.store, proposer=self.proposer)
         self.ctx.todos = session.todos
         self.ctx.ask = self.ui.ask_user
         self.ctx.subagent = SubagentRunner(client=self.client, parent=session, registry=self.registry, engine=self.engine,
@@ -472,12 +477,31 @@ class Agent:
         return approval
 
     async def rule_report(self) -> RuleReport:
-        report = RuleReport(local=self.rules.list())
+        report = RuleReport(local=self.rules.list(), here=self.folder_key)
         try:
             report.clara = await self.client.rules()
         except ClaraError as error:
             report.clara_error = str(error)
         return report
+
+    @property
+    def folder_key(self) -> str:
+        """What a pattern rule of this folder is filed under."""
+        return folder_id(self.real_folder, self.platform.paths.case_insensitive)
+
+    def add_pattern_rule(self, text: str) -> Rule:
+        """`/rules add 'uv run pytest:*'`: a pattern rule for this folder, held to the same limits as one the console proposes."""
+        if not self.trusted:
+            raise AgentError("This folder is not trusted: commands do not run here, so there is nothing to allow.")
+        windows = self.platform.is_windows
+        simple = simple_words(text.strip().removesuffix(":*"), windows=windows)
+        if not simple.ok:
+            raise AgentError(f"{text!r} uses {simple.problem}: give the start of a command, such as `uv run pytest:*`.")
+        pattern = (simple.program, *simple.words[1:])
+        problem = pattern_problem(pattern, simple, windows)
+        if problem:
+            raise AgentError(f"Not added: {problem}.")
+        return self.rules.add_pattern("local_run", pattern, self.folder_key, note="added by hand")
 
     def decide_local(self, tool: str, arguments: dict[str, Any], *, tainted: bool = False) -> Decision:
         """What the permission engine would do with this call, without running it."""

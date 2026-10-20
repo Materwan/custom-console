@@ -45,6 +45,7 @@ class Settings:
     result_limit: int = 30_000
     rmapi: str | None = None
     log_level: str = "info"
+    rule_model: str = ""  # the model that proposes a permission pattern for a command the built-in table does not know
     debug: bool = False
     warnings: tuple[str, ...] = field(default=(), compare=False)
 
@@ -120,6 +121,7 @@ FIELDS: dict[str, tuple[Callable[[str], object], str]] = {
     "CONSOLE_RESULT_LIMIT": (_integer(1_000, 1_000_000), "characters kept of one tool result"),
     "CONSOLE_RMAPI": (_path, "path to rmapi"),
     "CONSOLE_LOG_LEVEL": (_level, "log detail"),
+    "CONSOLE_RULE_MODEL": (str.strip, "model that proposes a permission pattern (default: the session's model)"),
 }
 
 # command-line option -> setting name (`--save-token` and `--debug` are handled by the entry point)
@@ -254,4 +256,5 @@ def load(options: Mapping[str, str] | None = None, *, env: Mapping[str, str] | N
     return Settings(
         clara_url=url, token_file=token_file, data_dir=data_dir, config_dir=folder, tool_timeout=timeout,
         result_limit=limit, rmapi=str(rmapi) if isinstance(rmapi, Path) else None,
-        log_level=str(values.get("CONSOLE_LOG_LEVEL", "info")), debug=debug, warnings=_warnings(url))
+        log_level=str(values.get("CONSOLE_LOG_LEVEL", "info")), rule_model=str(values.get("CONSOLE_RULE_MODEL", "")),
+        debug=debug, warnings=_warnings(url))

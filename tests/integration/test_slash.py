@@ -223,6 +223,25 @@ async def test_rules_show_both_sides_test_calls_and_remove(w):
     assert "Removed" in await w.command("/rules remove 1") and "No local rule 1" in await w.command("/rules remove 1")
 
 
+async def test_rules_add_keeps_a_pattern_for_this_folder_under_the_same_limits_as_a_proposed_one(w):
+    assert "usage: /rules add" in await w.command("/rules add")
+    added = await w.command("/rules add 'uv run pytest:*'")
+    assert "Rule 1: local_run 'uv run pytest:*' in this folder" in added
+    assert "runs code" in await w.command("/rules add uv:*") and "name of a tool" in await w.command("/rules add uv run")
+    assert "runs code" in await w.command("/rules add sh:*") and "shell syntax" in await w.command("/rules add ls > x")
+    listing = await w.command("/rules")
+    assert "local_run 'uv run pytest:*' in this folder" in listing and "used 0x" in listing
+    assert (await w.command("/rules test local_run command='uv run pytest -q'")).startswith("ALLOW")
+    assert "step: stored" in await w.command("/rules test local_run command='uv run pytest -q'")
+    assert [r.pattern for r in w.agent.rules.list()] == [("uv", "run", "pytest")]
+
+
+async def test_rules_add_needs_a_trusted_folder(w):
+    w.agent.ctx.trusted = False
+    assert "not trusted" in await w.command("/rules add 'uv run pytest:*'")
+    assert w.agent.rules.list() == []
+
+
 async def test_journal_and_transcript_open_a_viewer(w, fake_clara):
     assert "empty so far" in await w.command("/journal")
     conversation(fake_clara, MESSAGES)

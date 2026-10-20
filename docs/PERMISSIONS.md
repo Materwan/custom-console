@@ -24,8 +24,8 @@ Write, run and git tools are not even offered to the model in a folder that is n
    - a command that names a network path.
    Each path is checked in both forms, so a link to a key is caught by its real path (SEC-4), and a remembered file that later becomes a link asks again.
 3. **Tainted turn.** After a Clara tool read outside content (the web, GitHub, Drive, project files, conversation files), or after you attached a file or ran a `!command`, every change and every command asks, whatever the rules say. The list of Clara tools known to read nothing from outside is short (`SAFE_SERVER_TOOLS` in `core/turn.py`); a tool the console does not know counts as outside content. A sub-agent's taint is passed on to the main turn.
-4. **Allowlist.** Reads inside the trusted folder; and for `local_run` a short fixed list of simple commands inside the trusted folder: `pwd ls dir cat type head tail wc grep which`, and `git status|diff|log` without the flags that run programs. "Simple" means no pipe, redirection, chaining, substitution, glob or variable.
-5. **Stored answers.** An "always" answer is the tool, the exact command and *all* its paths together. It is never applied to a call that the floor or a tainted turn escalated.
+4. **Allowlist.** Reads inside the trusted folder; and for `local_run` a short fixed list of commands inside the trusted folder: `pwd ls dir cat type head tail wc grep which`, and `git status|diff|log` without the flags that run programs. A command line may chain such commands with `&&`, `||`, `;` and `|`, and carry `2>&1` or a redirection to the null device: each part is judged alone, and a part after a pipe may also be a filter that only reads (`head tail wc grep cat sort uniq`, without the forms that write a file). Substitution, globs, variables, any other redirection and a single `&` make the whole line ask.
+5. **Stored answers.** An "always" answer is the tool, the exact command and *all* its paths together, or, for `local_run`, a *pattern* (below). Neither is ever applied to a call that the floor or a tainted turn escalated. A line is covered when every part is read-only, a filter after a pipe, or covered by a pattern.
 6. **Ask.** The prompt shows the tool, the exact command or a diff (cut after 40 rows with "... N more lines"), every path with its real path when a link redirects it, and the answer keys, always last.
 
 ## Answers
@@ -33,11 +33,31 @@ Write, run and git tools are not even offered to the model in a folder that is n
 | Key | Answer | Stored |
 | --- | --- | --- |
 | `o` | allow once | nothing |
-| `a` | allow always | the exact call, if it can be remembered |
+| `a` | allow always | the exact call, if it can be remembered; for a command, a pattern you confirm (below) |
 | `r` or Esc | refuse | nothing |
 | `n` | refuse, never | the exact call |
 
-Interpreters, installers, shells, network tools, `rm`, `mv`, `cp` and other programs whose effect depends on files that can change (`NEVER_REMEMBERED` in `allowlist.py`) can never be remembered; the prompt says why. `/rules` shows every stored rule and `/rules remove N` deletes a local one; `/rules test local_write path=a.txt` shows what a call would do without running it.
+Shells, installers, network tools, `rm`, `mv`, `cp`, `cd` and other programs whose effect depends on files that can change (`NEVER_REMEMBERED` in `allowlist.py`) can never be remembered, not even exactly; the prompt says why. A few of them have one safe, everyday use that a pattern may name (below). `/rules` shows every stored rule and `/rules remove N` deletes a local one; `/rules test local_write path=a.txt` shows what a call would do without running it.
+
+## Patterns for commands
+
+Pressing `a` on a `local_run` prompt does not store the exact command. It offers a **pattern**: the words that say what runs, then any arguments, kept for **this folder only** (a hash of its real path, as in `trust.json`). `uv run pytest:*` covers `uv run pytest -q tests` and `uv run pytest 2>&1 | tail -20`, not `uv run ruff` and not `pytest`. The prompt shows the pattern and asks: `y` keeps it, `e` keeps only the exact command, `n` allows this once and keeps nothing, Esc goes back. A command line with several parts offers one pattern per part that is not read-only; if any part can never be remembered, none is offered.
+
+Which words a pattern must name (`classify` in `allowlist.py`):
+
+| Command | Pattern names at least |
+| --- | --- |
+| `uv run TOOL`, `poetry run TOOL` | the tool: `uv run pytest`. Not a flag first (`--with`), not a script (`x.py`), and the tool itself must not be a shell, interpreter or other program that is never remembered |
+| `python -m MODULE` | the module, from a short list (`pytest mypy ruff black unittest coverage ...`); never `python x.py` or `-c` |
+| `npm\|pnpm\|yarn\|bun run SCRIPT`, `... test` | the script, or `test` |
+| `cargo test\|check\|clippy\|fmt\|build`, `go test\|vet\|build`, `dotnet test\|build` | the subcommand |
+| `pytest ruff mypy black isort flake8 pylint pyright lint-imports tsc eslint prettier jest vitest` | the program |
+| `git status\|diff\|log` | already read-only; remembered exactly, never as a pattern |
+| any other program not on the never list | nothing in the table: the exact command, or a pattern a model proposes |
+
+For a program the table does not know, a short incognito Clara conversation with no tools (model: `CONSOLE_RULE_MODEL`, default the session's) is asked for the start of the command that names what runs, when you press `a`. It sees only the command. Its answer is checked by the same function as every other pattern (`pattern_problem`): it must be the start of the command and no broader than the table allows, or it is dropped and `a` keeps the exact command as before. A model can narrow a rule, never widen it.
+
+A stored pattern is checked again each time it is used, so a hand-edited `uv:*` or `sh:*` in `rules.json` matches nothing. It applies only when the working folder is the trusted folder; arguments are not confined to it (the floor still asks about sensitive files and network paths). `/rules add 'uv run pytest:*'` stores one by hand under the same limits.
 
 ## Trusted folders
 

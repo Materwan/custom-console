@@ -218,6 +218,8 @@ class ApprovalBlock(Vertical, can_focus=True):
 
     KEYS = {"o": "allow_once", "a": "allow_always", "r": "refuse_once", "n": "refuse_always", "escape": "refuse_once"}
     NOT_FOR_TRUST = ("allow_always", "refuse_always")  # trusting a folder is a one-time question: `a` and `n` do nothing there
+    # After `a` on a command a pattern could cover: keep the pattern, keep only this exact command, or allow once.
+    CONFIRM_KEYS = {"y": "allow_pattern", "e": "allow_always", "n": "allow_once"}
 
     def __init__(self, prompt: Prompt):
         super().__init__()
@@ -225,6 +227,8 @@ class ApprovalBlock(Vertical, can_focus=True):
         self.future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
         self.trust = prompt.tool == "trust"
         self.outcome = ""
+        self.stage = "ask"  # "ask"; "waiting" while the model proposes a pattern; "confirm" while the person decides on it
+        self._keys: Static | None = None
 
     def compose(self) -> ComposeResult:
         p = self.prompt
@@ -247,15 +251,33 @@ class ApprovalBlock(Vertical, can_focus=True):
                          plain(p.preview))
         if not p.undoable and p.tool in ("local_run",):
             yield Static(plain("What a command changes cannot be undone with /undo.", "yellow"))
-        yield Static(self._keys_line())
+        self._keys = Static(self._keys_line())
+        yield self._keys
+
+    def _proposable(self) -> bool:
+        p = self.prompt
+        return not self.trust and p.kind == "local" and p.proposal is not None and p.proposal.possible
+
+    def _refresh(self) -> None:
+        if self._keys is not None:
+            self._keys.update(self._keys_line())
 
     def _keys_line(self) -> Text:
         if self.trust:
             return Text.assemble(("[o]", "bold green"), " trust this folder   ", ("[r]", "bold red"), " read only")
         p = self.prompt
+        if self.stage == "waiting":
+            return Text("Looking for a pattern to keep ...", style="dim")
+        if self.stage == "confirm":
+            shown = ", ".join(" ".join(pattern) + ":*" for pattern in (p.proposal.patterns if p.proposal else ()))
+            line = Text.assemble(("Always allow in this folder:  ", "bold"), (shown, "cyan"), "\n",
+                                 ("[y]", "bold green"), " yes   ")
+            if p.can_remember:
+                line.append_text(Text.assemble(("[e]", "bold green"), " only this exact command   "))
+            return line.append_text(Text.assemble(("[n]", "bold green"), " just this once   ", ("[esc]", "bold"), " back"))
         line = Text.assemble(("[o]", "bold green"), " allow once   ", ("[a]", "bold green"), " allow always   ",
                              ("[r]", "bold red"), " refuse once   ", ("[n]", "bold red"), " refuse always")
-        if p.kind == "local" and not p.can_remember:
+        if p.kind == "local" and not p.can_remember and not self._proposable():
             line.append(f"   ('allow always' and 'refuse always' are not kept: {p.why_not_remembered or 'asked every time'})",
                         style="dim")
         if p.seconds_left:
@@ -267,19 +289,55 @@ class ApprovalBlock(Vertical, can_focus=True):
         self.scroll_visible()
 
     def on_key(self, event: events.Key) -> None:
+        if self.stage != "ask":
+            event.stop()
+            event.prevent_default()
+            if self.stage == "confirm":
+                self._on_confirm_key(event.key)
+            elif event.key == "escape":  # tired of waiting for the model: back to the first question
+                self.stage = "ask"
+                self._refresh()
+            return
         answer = self.KEYS.get(event.key)
         if answer is None or (self.trust and answer in self.NOT_FOR_TRUST):
             return
         event.stop()
         event.prevent_default()
+        if answer == "allow_always" and self._proposable():
+            self.stage = "waiting"
+            self._refresh()
+            self.run_worker(self._propose(), exclusive=True)
+            return
         self.resolve(answer)
+
+    def _on_confirm_key(self, key: str) -> None:
+        if key == "escape":
+            self.stage = "ask"
+            self._refresh()
+            return
+        answer = self.CONFIRM_KEYS.get(key)
+        if answer is not None and (answer != "allow_always" or self.prompt.can_remember):
+            self.resolve(answer)
+
+    async def _propose(self) -> None:
+        """Ask for the patterns (the model, for a command the table does not know), then let the person confirm them."""
+        proposal = self.prompt.proposal
+        patterns = await proposal.resolve() if proposal is not None else ()
+        if self.future.done() or self.stage != "waiting":
+            return
+        if patterns:
+            self.stage = "confirm"
+            self._refresh()
+        else:  # nothing to propose: "always" means the exact command, as it did before patterns
+            self.stage = "ask"
+            self.resolve("allow_always")
 
     def resolve(self, answer: str, note: str = "") -> None:
         if self.future.done():
             return
         self.future.set_result(answer)
-        words = {"allow_once": "allowed once", "allow_always": "allowed, always", "refuse_once": "refused",
-                 "refuse_always": "refused, never again"}
+        words = {"allow_once": "allowed once", "allow_always": "allowed, always", "allow_pattern": "allowed, always (pattern)",
+                 "refuse_once": "refused", "refuse_always": "refused, never again"}
         self.add_class("done")
         self.can_focus = False
         self.call_later(self._collapse, note or words.get(answer, answer))

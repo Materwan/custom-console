@@ -121,6 +121,76 @@ async def test_every_answer_key(tmp_path, fake_clara, key, file_made, rules):
     assert (sh.work / "x.txt").exists() is file_made and len(app.agent.rules.list()) == rules
 
 
+@pytest.mark.parametrize(("key", "pattern", "exact", "tail"), [
+    ("y", ("ruff",), False, "(pattern)"), ("e", (), True, "always:"), ("n", (), False, "once:"),
+])
+async def test_always_on_a_command_offers_a_pattern_to_confirm(tmp_path, fake_clara, key, pattern, exact, tail):
+    fake_clara.queue_turn(turn(), requests("t1", ("local_run", {"command": "ruff --version"})), WaitResults(), done("end"))
+    app, _ = make_app(tmp_path, fake_clara)
+    async with app.run_test(size=SIZE) as pilot:
+        await type_and_send(app, pilot, "run it")
+        await settle(app, pilot, until=lambda: bool(app.query(ApprovalBlock)))
+        block = app.query_one(ApprovalBlock)
+        await pilot.press("a")
+        await settle(app, pilot, until=lambda: block.stage == "confirm")
+        shown = "\n".join(text_of(w) for w in block.query(Static))
+        assert "Always allow in this folder:" in shown and "ruff:*" in shown and "[y]" in shown and "[e]" in shown
+        assert not block.future.done()
+        await pilot.press(key)
+        await settle(app, pilot)
+        assert tail in transcript_text(app)
+    rules = app.agent.rules.list()
+    assert [r.pattern for r in rules if r.pattern] == ([pattern] if pattern else [])
+    assert any(not r.pattern and r.key.command == "ruff --version" for r in rules) is exact
+
+
+async def test_escape_in_the_pattern_question_goes_back_to_the_first_question(tmp_path, fake_clara):
+    fake_clara.queue_turn(turn(), requests("t1", ("local_run", {"command": "ruff --version"})), WaitResults(), done("end"))
+    app, _ = make_app(tmp_path, fake_clara)
+    async with app.run_test(size=SIZE) as pilot:
+        await type_and_send(app, pilot, "run it")
+        await settle(app, pilot, until=lambda: bool(app.query(ApprovalBlock)))
+        block = app.query_one(ApprovalBlock)
+        await pilot.press("a")
+        await settle(app, pilot, until=lambda: block.stage == "confirm")
+        await pilot.press("escape")
+        await settle(app, pilot, until=lambda: block.stage == "ask")
+        assert not block.future.done() and "[o]" in "\n".join(text_of(w) for w in block.query(Static))
+        await pilot.press("r")
+        await settle(app, pilot)
+    assert app.agent.rules.list() == []
+
+
+async def test_a_model_proposes_the_pattern_for_a_command_the_table_does_not_know(tmp_path, fake_clara):
+    fake_clara.queue_turn(turn(), requests("t1", ("local_run", {"command": "mytool build --fast"})), WaitResults(), done("end"))
+    fake_clara.queue_turn(turn("t9", conversation=None), token('["mytool build"]'), done('["mytool build"]', conversation=None))
+    app, _ = make_app(tmp_path, fake_clara)
+    async with app.run_test(size=SIZE) as pilot:
+        await type_and_send(app, pilot, "run it")
+        await settle(app, pilot, until=lambda: bool(app.query(ApprovalBlock)))
+        block = app.query_one(ApprovalBlock)
+        await pilot.press("a")
+        await settle(app, pilot, until=lambda: block.stage == "confirm")
+        assert "mytool build:*" in "\n".join(text_of(w) for w in block.query(Static))
+        await pilot.press("y")
+        await settle(app, pilot)
+    asked = fake_clara.requests_to("/v1/chat/stream")[1]["body"]
+    assert asked["incognito"] is True and "tools" not in asked and asked["message"] == '["mytool build --fast"]'
+    assert [r.pattern for r in app.agent.rules.list()] == [("mytool", "build")]
+
+
+async def test_without_a_usable_proposal_always_means_the_exact_command(tmp_path, fake_clara):
+    fake_clara.queue_turn(turn(), requests("t1", ("local_run", {"command": "mytool build"})), WaitResults(), done("end"))
+    fake_clara.queue_turn(turn("t9", conversation=None), token("no idea"), done("no idea", conversation=None))
+    app, _ = make_app(tmp_path, fake_clara)
+    async with app.run_test(size=SIZE) as pilot:
+        await type_and_send(app, pilot, "run it")
+        await settle(app, pilot, until=lambda: bool(app.query(ApprovalBlock)))
+        await pilot.press("a")
+        await settle(app, pilot)
+    assert [(r.pattern, r.key.command) for r in app.agent.rules.list()] == [((), "mytool build")]
+
+
 async def test_prompts_queue_up_and_are_answered_one_after_the_other(tmp_path, fake_clara):
     calls = [("local_write", {"path": "a.txt", "content": "a"}), ("local_write", {"path": "b.txt", "content": "b"})]
     fake_clara.queue_turn(turn(), requests("t1", *calls), WaitResults(), done("end"))

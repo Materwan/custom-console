@@ -115,13 +115,21 @@ async def _rules(ctx: SlashContext, args: str) -> None:
     if words and words[0] == "test":
         await _test_rule(ctx, words[1:])
         return
+    if words and words[0] == "add":
+        pattern = " ".join(words[1:])  # quoted (`'uv run pytest:*'`) or not
+        if not pattern:
+            ctx.fail("usage: /rules add 'uv run pytest:*'")
+            return
+        rule = agent.add_pattern_rule(pattern)  # an AgentError is printed by the router
+        ctx.say(f"Rule {rule.id}: {rule.describe(agent.folder_key)}", "green")
+        return
     if words:
-        ctx.fail("usage: /rules [test TOOL key=value ... [--tainted]] [remove N]")
+        ctx.fail("usage: /rules [add PATTERN] [test TOOL key=value ... [--tainted]] [remove N]")
         return
     report = await agent.rule_report()
     ctx.say("Local rules (what you answered \"always\" or \"never\" to here):")
     if report.local:
-        ctx.table([(str(r.id), r.effect, r.key.describe(), f"used {r.hits}x") for r in report.local],
+        ctx.table([(str(r.id), r.effect, r.describe(report.here), f"used {r.hits}x") for r in report.local],
                   ("yellow", "green", "", "dim"))
     else:
         ctx.say("  none", "dim")
@@ -133,7 +141,8 @@ async def _rules(ctx: SlashContext, args: str) -> None:
                   ("yellow", "green", "", "dim"))
     else:
         ctx.say("  none", "dim")
-    ctx.say("`/rules test local_write path=a.txt` shows what a call would do. `/rules remove N` deletes a local rule.", "dim")
+    ctx.say("`/rules test local_write path=a.txt` shows what a call would do. `/rules remove N` deletes a local rule. "
+            "`/rules add 'uv run pytest:*'` keeps a pattern for this folder.", "dim")
 
 
 async def _test_rule(ctx: SlashContext, words: list[str]) -> None:

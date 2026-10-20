@@ -272,6 +272,9 @@ def test_launching_an_app_can_be_remembered_for_that_app_only(w):
     "pwd", "ls", "ls -la", "ls notes.txt", "dir", "cat notes.txt", "type notes.txt", "head -n 5 notes.txt", "tail notes.txt",
     "wc -l notes.txt", "grep -n todo notes.txt", "grep -rn todo .", "which python", "git status", "git diff", "git log --oneline",
     "git diff --stat", "ls 'notes.txt'",
+    # lines of read-only parts, and filters after a pipe
+    "ls | wc -l", "cat notes.txt | grep todo | head -3", "ls 2>&1 | head", "git status && git diff", "ls; pwd",
+    "cat notes.txt | sort | uniq", "ls > /dev/null", "grep todo notes.txt 2>/dev/null",
 ])
 def test_the_short_read_only_list_runs_without_a_question(w, command):
     d = w.decide(run(command))
@@ -281,9 +284,12 @@ def test_the_short_read_only_list_runs_without_a_question(w, command):
 # Each row is a reproduction from the old review (SEC-3, SEC-1, N1, N2, SEC-10): it must ask, and `remember` says
 # whether an "always" answer may ever cover it.
 ASK_ROWS = [
-    # chaining, pipes, redirection, substitution: not a simple command
-    ("ls | wc -l", False), ("cat notes.txt > copy.txt", False), ("cat notes.txt; rm notes.txt", False),
+    # chaining, pipes, redirection, substitution: every part must be allowed on its own
+    ("cat notes.txt > copy.txt", False), ("cat notes.txt; rm notes.txt", False), ("ls | sh", False), ("ls | xargs rm", False),
     ("cat notes.txt && echo done", False), ("cat $(echo notes.txt)", False), ("cat `echo notes.txt`", False),
+    ("cat notes.txt | python", False), ("ls |& cat", False), ("ls && && pwd", False), ("ls ;", False),
+    ("sort -o out.txt notes.txt", True), ("cat notes.txt | sort -o out.txt", True), ("cat notes.txt | uniq in out", True),
+    ("ls | cat > out.txt", False), ("cd .. && ls", False), ("ls 2>&1 >out.txt", False),
     ("cat notes.txt &", False), ("cat < notes.txt", False), ("echo $HOME", False), ("cat *", False), ("cat ~/notes", False),
     ("cat notes.txt\nrm notes.txt", False),
     # outside the folder or sensitive
@@ -291,9 +297,11 @@ ASK_ROWS = [
     ("cat --file=/etc/passwd", True), ("cat ../../data/rules.json", True),
     # SEC-3: interpreters, installers, runners
     ("python -m pip install requests", False), ("python3.12 evil.py", False), ("python3.12 -c 'import os'", False),
-    ("uv run python -c 1", False), ("uv pip install x", False), ("poetry run x", False), ("pip install x", False),
+    ("uv run python -c 1", False), ("uv pip install x", False), ("uv run bash", False), ("uv run script.py", False),
+    ("uv run --with x pytest", False), ("uv run", False), ("uvx ruff", False), ("npx cowsay", False), ("pip install x", False),
     ("docker run -v /:/host alpine sh", False), ("cargo run", False), ("go run .", False), ("dotnet run", False),
-    ("make", False), ("pytest", False), ("npm install", False), ("npm run test", False), ("./build.sh", False),
+    ("make", False), ("npm install", False), ("npm run", False), ("npm --prefix x test", False), ("./build.sh", False),
+    ("python -m http.server", False), ("python -m pip install x", False), ("python -m pytest -c x.ini; python", False),
     ("bash -c 'ls'", False), ("sh script.sh", False), ("node -e 1", False), ("powershell -Command x", False),
     # N2: the shell keywords and tools the old denylist missed
     ("if exist x echo ok", False), ("call x.bat", False), ("certutil -urlcache -f http://x/y z", False),
@@ -381,3 +389,87 @@ def test_rules_file_survives_garbage_and_can_be_edited(tmp_path):
     store.add("refuse", RuleKey("local_write", "", ("/a",)))  # the opposite answer replaces it
     assert [r.effect for r in store.list()] == ["refuse"]
     assert store.remove(1) and not store.remove(1) and store.list() == [] and rule.id == 1
+
+
+# ---------------------------------------------------------------------- patterns: "always" for a tool and its arguments
+def test_a_pattern_covers_the_same_tool_with_other_arguments(w):
+    d = w.decide(run("uv run pytest -q"))
+    assert d.effect == ASK and d.parts == (("uv", "run", "pytest", "-q"),) and d.folder
+    assert w.engine.record(d, "allow_pattern", (("uv", "run", "pytest"),)).startswith("Remembered in this folder")
+    for command in ("uv run pytest", "uv run pytest tests -x", "uv run pytest 2>&1 | tail -20", "uv run pytest && ls"):
+        got = w.decide(run(command))
+        assert got.effect == ALLOW and got.step == "stored", command
+    for command in ("uv run ruff check .", "uv run pytester", "uv run pytest && rm x", "uv run pytest; python",
+                    "uv run python -c 1", "pytest", "uv run pytest > out.txt", "uv run pytest | sh"):
+        assert w.decide(run(command)).effect == ASK, command
+
+
+def test_an_exact_answer_to_a_command_the_table_knows_still_covers_only_that_command(w):
+    d = w.decide(run("uv run pytest -q"))
+    assert d.can_remember and w.engine.record(d, "allow_always") == "Remembered for exactly this call."
+    assert w.decide(run("uv run pytest -q")).step == "stored"
+    assert w.decide(run("uv run pytest")).effect == ASK
+
+
+def test_a_pattern_is_for_one_folder_and_gives_way_to_the_floor_and_a_tainted_turn(w):
+    d = w.decide(run("uv run pytest"))
+    w.engine.record(d, "allow_pattern", (("uv", "run", "pytest"),))
+    assert w.decide(run("uv run pytest", cwd="..")).effect == ASK                    # run somewhere else
+    assert w.decide(run("uv run pytest .env")).step == "floor"
+    assert w.decide(run("uv run pytest"), tainted=True).step == "tainted"
+    assert w.decide(run("uv run pytest"), trusted=False).step == "trust"
+    assert w.decide(run("uv run pytest ../../elsewhere/a.txt")).step == "stored"     # arguments are not confined
+    assert w.decide(run("uv run pytest"), plan_mode=True).step == "plan"
+
+
+def test_a_pattern_of_another_folder_does_not_apply(w):
+    w.rules.add_pattern("local_run", ("uv", "run", "pytest"), "0" * 64)
+    d = w.decide(run("uv run pytest"))
+    assert d.effect == ASK and d.parts == (("uv", "run", "pytest"),)
+
+
+def test_a_pattern_too_broad_or_for_another_command_is_not_stored(w):
+    d = w.decide(run("uv run pytest -q"))
+    for pattern in (("uv",), ("uv", "run"), ("pytest",), ("uv", "run", "ruff")):
+        assert w.engine.record(d, "allow_pattern", (pattern,)).startswith("Not remembered"), pattern
+    assert w.engine.record(d, "allow_pattern", ()).startswith("Not remembered")
+    assert w.engine.record(d, "allow_pattern", (("uv", "run", "pytest"), ("uv",))).startswith("Not remembered")  # all or nothing
+    shell = w.decide(run("sh x.sh"))
+    assert shell.parts == (("sh", "x.sh"),)
+    assert w.engine.record(shell, "allow_pattern", (("sh",),)).startswith("Not remembered")
+    assert w.rules.list() == []
+
+
+def test_a_hand_edited_rule_cannot_widen_what_a_pattern_may_cover(w):
+    folder = w.decide(run("uv run pytest")).folder
+    for pattern in (("uv",), ("uv", "run"), ("sh",), ("git", "commit"), ("rm",)):
+        w.rules.add_pattern("local_run", pattern, folder)
+    for command in ("uv run pytest", "sh x.sh", "git commit -m x", "rm x"):
+        assert w.decide(run(command)).effect == ASK, command
+
+
+def test_a_line_needs_a_rule_for_each_part_that_is_not_read_only(w):
+    d = w.decide(run("uv run ruff check . 2>&1 | head -60"))
+    assert d.effect == ASK and d.parts == (("uv", "run", "ruff", "check", "."),)     # `head` after a pipe needs nothing
+    assert not d.can_remember and "one by one" in d.why_not_remembered
+    assert w.engine.record(d, "allow_always").startswith("Not remembered")
+    w.engine.record(d, "allow_pattern", (("uv", "run", "ruff"),))
+    assert w.decide(run("uv run ruff format src | tail -3")).step == "stored"
+    two = w.decide(run("uv run ruff check . && uv run mypy"))
+    assert two.effect == ASK and two.parts == (("uv", "run", "mypy"),)
+    w.engine.record(two, "allow_pattern", (("uv", "run", "mypy"),))
+    assert w.decide(run("uv run ruff check . && uv run mypy src")).step == "stored"
+    assert [r.hits for r in w.rules.list()] == [2, 1]
+
+
+def test_a_part_that_can_never_be_remembered_offers_no_pattern_at_all(w):
+    from custom_console.core.permissions.propose import plan
+    d = w.decide(run("uv run pytest && rm -rf build"))
+    assert d.effect == ASK and d.parts == (("uv", "run", "pytest"), ("rm", "-rf", "build"))
+    assert not plan(d.parts, False).possible
+
+
+def test_a_decision_the_floor_or_a_tainted_turn_made_offers_no_pattern(w):
+    assert w.decide(run("uv run pytest .env")).parts == ()
+    assert w.decide(run("uv run pytest"), tainted=True).parts == ()
+    assert w.decide(run("uv run pytest", cwd="..")).parts == ()

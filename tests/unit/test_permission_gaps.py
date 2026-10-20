@@ -15,7 +15,7 @@ from custom_console.core.permissions.allowlist import (
 )
 from custom_console.core.permissions.engine import ALLOW, ASK, REFUSE, CallInfo, PathUse
 from custom_console.core.permissions.floor import FloorConfig, sensitive_reason
-from custom_console.core.permissions.rules import RuleKey, RuleStore
+from custom_console.core.permissions.rules import RuleKey, RuleStore, folder_id
 from custom_console.core.vfs.backend import BackendFailure, PathRefused, VfsError
 from custom_console.core.vfs.ops import Vfs
 from custom_console.core.vfs.resolver import Resolver
@@ -137,6 +137,42 @@ def test_the_rule_store_skips_entries_it_cannot_use_and_keeps_the_rest(tmp_path)
     path.write_text(json.dumps({"rules": "nope"}))
     assert RuleStore(path).list() == []
     assert RuleStore(tmp_path / "missing.json").remove(1) is False
+
+
+def test_a_pattern_rule_is_kept_listed_and_left_alone_by_exact_rules(tmp_path):
+    store = RuleStore(tmp_path / "rules.json")
+    rule = store.add_pattern("local_run", ("uv", "run", "pytest"), "abc12345xyz")
+    assert rule.describe("abc12345xyz") == "local_run 'uv run pytest:*' in this folder"
+    assert "in another folder (abc12345)" in rule.describe("other")
+    assert store.add_pattern("local_run", ("uv", "run", "pytest"), "abc12345xyz").id == rule.id and len(store.list()) == 1
+    exact = RuleKey("local_run", "uv run pytest:*")                       # the same text as the pattern's key, as an exact rule
+    store.add("refuse", exact)
+    assert [r.effect for r in store.list()] == ["allow", "refuse"]
+    assert store.match(exact, effect="allow") is None and store.match(exact, effect="refuse") is not None
+    again = RuleStore(tmp_path / "rules.json").list()[0]
+    assert again.pattern == ("uv", "run", "pytest") and again.folder == "abc12345xyz"
+    store.hit([again, again])
+    assert store.list()[0].hits == 1
+    store.add("allow", exact)                                              # replacing the opposite exact rule keeps the pattern
+    assert [r.pattern for r in store.list()] == [("uv", "run", "pytest"), ()]
+    assert store.remove(1) and [r.effect for r in store.list()] == ["allow"]
+
+
+def test_find_pattern_wants_the_folder_the_tool_and_a_command_the_pattern_may_cover(tmp_path):
+    store = RuleStore(tmp_path / "rules.json")
+    store.add_pattern("local_run", ("uv", "run", "pytest"), "here")
+    run = simple_words("uv run pytest -q", windows=False)
+    assert store.find_pattern("local_run", run, "here", False) is not None
+    assert store.find_pattern("local_run", run, "elsewhere", False) is None
+    assert store.find_pattern("local_launch_app", run, "here", False) is None
+    assert store.find_pattern("local_run", simple_words("uv run mypy", windows=False), "here", False) is None
+    assert store.list()[0].hits == 0                                       # finding is not using
+
+
+def test_a_folder_id_hides_the_path_and_ignores_case_only_where_asked():
+    one = folder_id("/home/me/work", False)
+    assert len(one) == 64 and "work" not in one and one == folder_id("/home/me/work/", False)
+    assert folder_id("/home/me/WORK", False) != one and folder_id("/home/me/WORK", True) == folder_id("/home/me/work", True)
 
 
 # ---------------------------------------------------------------------- the command allowlist
